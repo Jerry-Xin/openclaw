@@ -87,6 +87,7 @@ Docs: https://docs.openclaw.ai
 - ACP/client final-message delivery: preserve terminal assistant text snapshots before resolving `end_turn`, so ACP clients no longer drop the last visible reply when the gateway sends the final message body on the terminal chat event. (#17615) Thanks @pjeby.
 - Telegram/Discord status reactions: show a temporary compacting reaction during auto-compaction pauses and restore thinking afterward so the bot no longer appears frozen while context is being compacted. (#35474) thanks @Cypherm.
 - Agents/compaction: compare post-compaction token sanity checks against full-session pre-compaction totals and skip the check when token estimation fails, so sessions with large bootstrap context keep real token counts instead of falling back to unknown. (#28347) thanks @efe-arv.
+- Delivery dedupe: prune the completed direct-cron replay cache correctly and keep transcript mirror idempotency checks working even when transcript files contain malformed lines. (#44666) Thanks @frankekn.
 
 ## 2026.3.11
 
