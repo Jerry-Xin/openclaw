@@ -178,6 +178,7 @@ export async function searchVector(params: {
   vectorTable: string;
   providerModel: string;
   queryVec: number[];
+  queryText: string;
   limit: number;
   snippetMaxChars: number;
   ensureVectorReady: (dimensions: number) => Promise<boolean>;
