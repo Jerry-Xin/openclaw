@@ -46,15 +46,21 @@ function extractRelevantSnippet(
     }
   }
 
-  // If no match found, return the full chunk text rather than truncating to
-  // the beginning.  Semantic/vector matches often don't share literal keywords
-  // with the query, so trimming from the start would discard the relevant
-  // section when it appears later in the chunk.
+  // No keyword anchor found — semantic/vector matches may not share literal
+  // tokens with the query.  Return a tail window of the chunk capped at
+  // maxChars so the snippet stays within the payload budget while still
+  // capturing content that appears later in the chunk (the common case for
+  // purely semantic hits).
   if (matchIndex === -1) {
+    const tailStart = Math.max(0, text.length - maxChars);
+    const tailText = tailStart === 0 ? text : text.substring(tailStart);
+    const cappedSnippet = truncateUtf16Safe(tailText, maxChars);
+    const offsetLines =
+      tailStart > 0 ? (text.substring(0, tailStart).match(/\n/g) || []).length : 0;
     return {
-      snippet: text,
-      offsetLines: 0,
-      snippetLines: (text.match(/\n/g) || []).length,
+      snippet: cappedSnippet,
+      offsetLines,
+      snippetLines: (cappedSnippet.match(/\n/g) || []).length,
       anchorFound: false,
     };
   }
