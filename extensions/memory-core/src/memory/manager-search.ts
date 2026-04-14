@@ -20,6 +20,7 @@ function extractRelevantSnippet(
   text: string,
   query: string,
   maxChars: number,
+  ftsTokenizer?: "unicode61" | "trigram",
 ): { snippet: string; offsetLines: number; snippetLines: number; anchorFound: boolean } {
   if (text.length <= maxChars) {
     return {
@@ -34,6 +35,17 @@ function extractRelevantSnippet(
   // conversational queries produce correct anchor terms.
   const lowerText = text.toLowerCase();
   let queryTerms = extractKeywords(query).toSorted((a, b) => b.length - a.length);
+
+  // When the FTS index uses trigram tokenization, the full query string is a
+  // valid match token (e.g. CJK "北京市" is indexed as-is).  Prepend it so
+  // snippet anchoring tries the trigram-matched term before the shorter pieces
+  // that extractKeywords may produce.
+  if (ftsTokenizer === "trigram") {
+    const full = query.trim().toLowerCase();
+    if (full.length > 0 && !queryTerms.includes(full)) {
+      queryTerms = [full, ...queryTerms];
+    }
+  }
 
   // extractKeywords drops pure-numeric tokens (e.g. "404", "2024").
   // Fall back to raw alphanumeric tokens so numeric queries still anchor.
@@ -431,6 +443,7 @@ export async function searchKeyword(params: {
       row.text,
       params.query,
       params.snippetMaxChars,
+      params.ftsTokenizer,
     );
     // Session chunks use sparse remapped line numbers; skip offset adjustment.
     const isSessionSource = row.source === "sessions";
