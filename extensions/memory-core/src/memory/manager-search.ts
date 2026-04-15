@@ -61,9 +61,35 @@ function extractRelevantSnippet(
 
   // Normalize text for diacritic-insensitive matching (mirrors SQLite
   // unicode61 tokenizer folding: résumé → resume, café → cafe).
-  const foldDiacritics = (s: string): string =>
-    s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const foldDiacritics = (s: string): string => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   const normalizedText = foldDiacritics(lowerText);
+
+  // Build a mapping from normalized-string offsets to original-string offsets.
+  // NFD normalization + combining mark removal can make the normalized string
+  // shorter than the original (e.g. precomposed "é" [1 char] decomposes to
+  // "e\u0301" [2 chars] in NFD, then stripping the mark yields "e" [1 char]).
+  // normToOrig[i] gives the lowerText index for normalizedText[i].
+  const normToOrig: number[] = [];
+  {
+    const nfd = lowerText.normalize("NFD");
+    // First map every NFD position back to the lowerText position it came from.
+    const nfdToOrig: number[] = Array.from({ length: nfd.length });
+    let nfdIdx = 0;
+    for (let origIdx = 0; origIdx < lowerText.length; origIdx++) {
+      const decomposed = lowerText[origIdx].normalize("NFD");
+      for (let j = 0; j < decomposed.length; j++) {
+        nfdToOrig[nfdIdx++] = origIdx;
+      }
+    }
+    // Now walk the NFD string, skip combining marks (which were stripped to
+    // produce normalizedText), and carry through the original position.
+    for (let ni = 0; ni < nfd.length; ni++) {
+      if (/[\u0300-\u036f]/.test(nfd[ni])) {
+        continue;
+      }
+      normToOrig.push(nfdToOrig[ni]);
+    }
+  }
 
   // Find the first matching term — try both raw indexOf and
   // diacritic-folded indexOf so FTS unicode61 normalized matches
@@ -72,7 +98,11 @@ function extractRelevantSnippet(
   for (const term of queryTerms) {
     let idx = lowerText.indexOf(term);
     if (idx === -1) {
-      idx = normalizedText.indexOf(foldDiacritics(term));
+      const normIdx = normalizedText.indexOf(foldDiacritics(term));
+      if (normIdx !== -1) {
+        // Map the normalized-string offset back to the original string.
+        idx = normIdx < normToOrig.length ? normToOrig[normIdx] : lowerText.length;
+      }
     }
     if (idx !== -1) {
       matchIndex = idx;
