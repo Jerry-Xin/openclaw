@@ -59,9 +59,21 @@ function extractRelevantSnippet(
 
   let matchIndex = -1;
 
-  // Find the first matching term
+  // Normalize text for diacritic-insensitive matching (mirrors SQLite
+  // unicode61 tokenizer folding: résumé → resume, café → cafe).
+  const foldDiacritics = (s: string): string =>
+    s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const normalizedText = foldDiacritics(lowerText);
+
+  // Find the first matching term — try both raw indexOf and
+  // diacritic-folded indexOf so FTS unicode61 normalized matches
+  // (e.g. query "resume" matching stored "résumé") still anchor
+  // the snippet at the correct position.
   for (const term of queryTerms) {
-    const idx = lowerText.indexOf(term);
+    let idx = lowerText.indexOf(term);
+    if (idx === -1) {
+      idx = normalizedText.indexOf(foldDiacritics(term));
+    }
     if (idx !== -1) {
       matchIndex = idx;
       break;
