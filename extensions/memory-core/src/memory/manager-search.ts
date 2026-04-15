@@ -264,12 +264,14 @@ export async function searchVector(params: {
       // that are not contiguous, so applying a text-based offset can produce
       // synthetic line numbers that don't exist.  Keep original range for sessions.
       const isSessionSource = row.source === "sessions";
-      const adjustedStart = isSessionSource
-        ? row.start_line
-        : Math.min(row.start_line + offsetLines, row.end_line);
       // When no anchor was found the snippet is a fallback window; preserve
-      // the chunk's full line span so semantic matches later in the text are
-      // not excluded.  Always clamp to the chunk's original end_line to
+      // the chunk's original line span so follow-up memory_get reads don't
+      // skip earlier content that may contain the semantic match.
+      const adjustedStart =
+        isSessionSource || !anchorFound
+          ? row.start_line
+          : Math.min(row.start_line + offsetLines, row.end_line);
+      // Always clamp to the chunk's original end_line to
       // guard against synthetic newlines inflating the count.
       const endLine =
         !isSessionSource && anchorFound
@@ -309,9 +311,10 @@ export async function searchVector(params: {
       );
       // Session chunks use sparse remapped line numbers; skip offset adjustment.
       const isSessionSource = entry.chunk.source === "sessions";
-      const adjustedStart = isSessionSource
-        ? entry.chunk.startLine
-        : Math.min(entry.chunk.startLine + offsetLines, entry.chunk.endLine);
+      const adjustedStart =
+        isSessionSource || !anchorFound
+          ? entry.chunk.startLine
+          : Math.min(entry.chunk.startLine + offsetLines, entry.chunk.endLine);
       const endLine =
         !isSessionSource && anchorFound
           ? Math.min(adjustedStart + snippetLines, entry.chunk.endLine)
@@ -447,9 +450,10 @@ export async function searchKeyword(params: {
     );
     // Session chunks use sparse remapped line numbers; skip offset adjustment.
     const isSessionSource = row.source === "sessions";
-    const adjustedStart = isSessionSource
-      ? row.start_line
-      : Math.min(row.start_line + offsetLines, row.end_line);
+    const adjustedStart =
+      isSessionSource || !anchorFound
+        ? row.start_line
+        : Math.min(row.start_line + offsetLines, row.end_line);
     const endLine =
       !isSessionSource && anchorFound
         ? Math.min(adjustedStart + snippetLines, row.end_line)
