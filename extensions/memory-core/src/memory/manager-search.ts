@@ -34,6 +34,23 @@ function extractRelevantSnippet(
   // Use the same tokenizer as the search engine so CJK terms and
   // conversational queries produce correct anchor terms.
   const lowerText = text.toLowerCase();
+
+  // Build a mapping from lowerText offsets back to original text offsets.
+  // Unicode lowercasing is not always length-preserving (e.g. Turkish İ
+  // [U+0130, 1 code unit] lowercases to i̇ [U+0069 + U+0307, 2 code units]).
+  // Without this mapping, indexOf results from lowerText would drift forward
+  // when used to window the original text.
+  const lowerToOrig: number[] = [];
+  {
+    let lowerIdx = 0;
+    for (let origIdx = 0; origIdx < text.length; origIdx++) {
+      const lc = text[origIdx].toLowerCase();
+      for (let j = 0; j < lc.length; j++) {
+        lowerToOrig[lowerIdx++] = origIdx;
+      }
+    }
+  }
+
   let queryTerms = extractKeywords(query).toSorted((a, b) => b.length - a.length);
 
   // When the FTS index uses trigram tokenization, the full query string is a
@@ -97,15 +114,18 @@ function extractRelevantSnippet(
   // the snippet at the correct position.
   for (const term of queryTerms) {
     let idx = lowerText.indexOf(term);
-    if (idx === -1) {
-      const normIdx = normalizedText.indexOf(foldDiacritics(term));
-      if (normIdx !== -1) {
-        // Map the normalized-string offset back to the original string.
-        idx = normIdx < normToOrig.length ? normToOrig[normIdx] : lowerText.length;
-      }
-    }
     if (idx !== -1) {
-      matchIndex = idx;
+      // Map lowerText offset back to original text offset in case
+      // toLowerCase() changed the string length.
+      matchIndex = idx < lowerToOrig.length ? lowerToOrig[idx] : text.length;
+      break;
+    }
+    // Fallback: try diacritic-folded matching.
+    const normIdx = normalizedText.indexOf(foldDiacritics(term));
+    if (normIdx !== -1) {
+      // Map normalized-string offset → lowerText offset → original text offset.
+      const lowerIdx = normIdx < normToOrig.length ? normToOrig[normIdx] : lowerText.length;
+      matchIndex = lowerIdx < lowerToOrig.length ? lowerToOrig[lowerIdx] : text.length;
       break;
     }
   }
