@@ -62,12 +62,12 @@ function extractRelevantSnippet(
     if (full.length > 0 && !queryTerms.includes(full)) {
       queryTerms = [full, ...queryTerms];
     }
-    // For multi-term trigram queries (e.g. "成语接龙 游戏"), the full query
-    // with whitespace may not match verbatim in stored text that lacks the
-    // separator.  Add each individual segment as an anchor candidate so
-    // partial matches can still anchor the snippet.
+    // For multi-term trigram queries (e.g. "成语接龙 游戏" or "成语接龙,游戏"),
+    // the full query with separators may not match verbatim in stored text.
+    // Split on both whitespace and punctuation (matching FTS_QUERY_TOKEN_RE
+    // token boundaries) so each segment can anchor the snippet independently.
     const segments = full
-      .split(/\s+/)
+      .split(/[^\p{L}\p{N}_]+/u)
       .filter((s) => s.length > 0)
       .toSorted((a, b) => b.length - a.length);
     if (segments.length > 1) {
