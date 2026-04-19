@@ -69,7 +69,7 @@ function extractRelevantSnippet(
     const segments = full
       .split(/\s+/)
       .filter((s) => s.length > 0)
-      .sort((a, b) => b.length - a.length);
+      .toSorted((a, b) => b.length - a.length);
     if (segments.length > 1) {
       for (const seg of segments) {
         if (!queryTerms.includes(seg)) {
