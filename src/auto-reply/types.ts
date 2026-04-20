@@ -6,5 +6,15 @@ export type {
   SourceReplyDeliveryMode,
   TypingPolicy,
 } from "./get-reply-options.types.js";
-export { getReplyPayloadMetadata, setReplyPayloadMetadata } from "./reply-payload.js";
-export type { ReplyPayload, ReplyPayloadMetadata } from "./reply-payload.js";
+export {
+  getReplyPayloadMetadata,
+  resolveDroppedMediaCode,
+  sanitizeMediaDisplayName,
+  setReplyPayloadMetadata,
+} from "./reply-payload.js";
+export type {
+  DroppedMediaItem,
+  DroppedMediaReasonCode,
+  ReplyPayload,
+  ReplyPayloadMetadata,
+} from "./reply-payload.js";

@@ -2,7 +2,9 @@ import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-pay
 import type { MessagingToolSend } from "../../agents/pi-embedded-messaging.types.js";
 import type { ReplyToMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { stripHeartbeatToken } from "../heartbeat.js";
+import { sanitizeMediaDisplayName, type DroppedMediaItem } from "../reply-payload.js";
 import type { OriginatingChannelType } from "../templating.js";
 import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { ReplyPayload, ReplyThreadingPolicy } from "../types.js";
@@ -15,6 +17,8 @@ import {
 } from "./origin-routing.js";
 import { normalizeReplyPayloadDirectives } from "./reply-delivery.js";
 import { applyReplyThreading, isRenderablePayload } from "./reply-payloads-base.js";
+
+const log = createSubsystemLogger("agent-runner-payloads");
 
 let replyPayloadsDedupeRuntimePromise: Promise<
   typeof import("./reply-payloads-dedupe.runtime.js")
@@ -36,12 +40,18 @@ async function normalizeReplyPayloadMedia(params: {
   try {
     return await params.normalizeMediaPaths(params.payload);
   } catch (err) {
-    logVerbose(`reply payload media normalization failed: ${String(err)}`);
+    log.warn(`reply payload media normalization failed: ${String(err)}`);
+    const originalMediaUrls = resolveSendableOutboundReplyParts(params.payload).mediaUrls;
+    const droppedMedia: DroppedMediaItem[] = originalMediaUrls.map((media) => ({
+      displayName: sanitizeMediaDisplayName(media),
+      code: "normalization-failed" as const,
+    }));
     return {
       ...params.payload,
       mediaUrl: undefined,
       mediaUrls: undefined,
       audioAsVoice: false,
+      droppedMedia: droppedMedia.length > 0 ? droppedMedia : undefined,
     };
   }
 }
