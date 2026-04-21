@@ -1215,6 +1215,20 @@ async function deliverOutboundPayloadsCore(
           content: payloadSummary.hookContent ?? payloadSummary.text,
           messageId: delivery.messageId,
         });
+        if (droppedMediaNotice) {
+          try {
+            await sendTextChunks(droppedMediaNotice, sendOverrides);
+          } catch (noticeErr) {
+            log.warn(
+              "Failed to send dropped-media notice after successful structured payload delivery",
+              {
+                channel,
+                to,
+                error: formatErrorMessage(noticeErr),
+              },
+            );
+          }
+        }
         continue;
       }
       if (payloadSummary.mediaUrls.length === 0) {
@@ -1317,8 +1331,18 @@ async function deliverOutboundPayloadsCore(
       }
       // Send dropped-media notice as a separate text message after media
       // to avoid oversizing captions on channels with strict limits.
+      // Wrapped in its own try-catch so a transient text-send failure
+      // does not mark the already-delivered media payload as failed.
       if (droppedMediaNotice) {
-        await sendTextChunks(droppedMediaNotice, sendOverrides);
+        try {
+          await sendTextChunks(droppedMediaNotice, sendOverrides);
+        } catch (noticeErr) {
+          log.warn("Failed to send dropped-media notice after successful media delivery", {
+            channel,
+            to,
+            error: formatErrorMessage(noticeErr),
+          });
+        }
       }
       await maybePinDeliveredMessage({
         handler,
