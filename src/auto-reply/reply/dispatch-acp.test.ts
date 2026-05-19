@@ -304,6 +304,7 @@ async function runDispatch(params: {
   suppressUserDelivery?: boolean;
   suppressReplyLifecycle?: boolean;
   sourceReplyDeliveryMode?: "automatic" | "message_tool_only";
+  ttsChannel?: string;
 }) {
   const targetSessionKey = params.sessionKeyOverride ?? sessionKey;
   return tryDispatchAcpReply({
@@ -319,6 +320,7 @@ async function runDispatch(params: {
     sessionKey: targetSessionKey,
     images: params.images,
     inboundAudio: false,
+    ttsChannel: params.ttsChannel,
     suppressUserDelivery: params.suppressUserDelivery,
     suppressReplyLifecycle: params.suppressReplyLifecycle,
     sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
@@ -1918,6 +1920,7 @@ describe("tryDispatchAcpReply", () => {
       bodyForAgent: "reply",
       cfg,
       dispatcher,
+      ttsChannel: "telegram",
       ctxOverrides: { Provider: "telegram", Surface: "telegram" },
     });
 
@@ -1926,6 +1929,40 @@ describe("tryDispatchAcpReply", () => {
       "/tmp/openclaw-media/tts-order.ogg",
     );
     expect(dispatcherCall(dispatcher.sendFinalReply).text).toBe("Order test.");
+  });
+
+  it("settles visible text eagerly for non-caption voice channels even when TTS mode is final", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    let textSettledBeforeTts = false;
+    ttsMocks.maybeApplyTtsToPayload.mockImplementation(async (paramsUnknown: unknown) => {
+      if ((dispatcher.waitForIdle as ReturnType<typeof vi.fn>).mock.calls.length > 0) {
+        textSettledBeforeTts = true;
+      }
+      return {
+        ...(paramsUnknown as { payload: unknown }).payload,
+        mediaUrl: "/tmp/openclaw-media/tts-eager.ogg",
+        audioAsVoice: true,
+      };
+    });
+    mockVisibleTextTurn("Eager discord.");
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ttsChannel: "discord",
+      ctxOverrides: { Provider: "discord", Surface: "discord" },
+    });
+
+    expect(textSettledBeforeTts).toBe(true);
   });
 
   it("settles visible text as fallback when TTS final synthesis fails", async () => {

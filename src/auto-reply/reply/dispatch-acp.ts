@@ -274,10 +274,15 @@ async function finalizeAcpTurnOutput(params: {
   const canAttemptFinalTts =
     ttsStatus != null && !(ttsStatus.autoMode === "inbound" && !params.inboundAudio);
 
-  // Defer settling visible text when TTS "final" will synthesize audio: settling
-  // first would flush text to the channel before audio is ready, causing churn.
   const willAttemptFinalTts = ttsMode === "final" && hasAccumulatedBlockText && canAttemptFinalTts;
-  if (!willAttemptFinalTts) {
+
+  // Only defer settling visible text for channels that deliver text inline as a
+  // voice-message caption (e.g. Telegram). Other channels send voice and text
+  // separately, so deferral just delays visible text with no benefit.
+  const CAPTIONED_VOICE_CHANNELS = new Set(["telegram"]);
+  const shouldDeferTextForTts =
+    willAttemptFinalTts && CAPTIONED_VOICE_CHANNELS.has(params.ttsChannel ?? "");
+  if (!shouldDeferTextForTts) {
     await params.delivery.settleVisibleText();
   }
   let queuedFinal =
@@ -317,7 +322,7 @@ async function finalizeAcpTurnOutput(params: {
     } catch (err) {
       logVerbose(`dispatch-acp: accumulated ACP block TTS failed: ${formatErrorMessage(err)}`);
     }
-    if (!finalMediaDelivered) {
+    if (!finalMediaDelivered && shouldDeferTextForTts) {
       await params.delivery.settleVisibleText();
       queuedFinal =
         params.delivery.hasDeliveredVisibleText() &&
