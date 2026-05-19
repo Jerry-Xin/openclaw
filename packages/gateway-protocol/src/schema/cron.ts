@@ -349,6 +349,7 @@ export const CronJobStateSchema = Type.Object(
     lastFailureNotificationDeliveryStatus: Type.Optional(CronDeliveryStatusSchema),
     lastFailureNotificationDeliveryError: Type.Optional(Type.String()),
     lastFailureAlertAtMs: Type.Optional(Type.Integer({ minimum: 0 })),
+    lastRunWasManual: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false },
 );
@@ -372,6 +373,7 @@ const CronJobStatePatchSchema = Type.Object(
     lastFailureNotificationDeliveryStatus: Type.Optional(CronDeliveryStatusSchema),
     lastFailureNotificationDeliveryError: Type.Optional(Type.String()),
     lastFailureAlertAtMs: Type.Optional(Type.Integer({ minimum: 0 })),
+    lastRunWasManual: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false },
 );
