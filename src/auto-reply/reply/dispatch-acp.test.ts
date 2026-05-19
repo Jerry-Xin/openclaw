@@ -1889,7 +1889,8 @@ describe("tryDispatchAcpReply", () => {
     expect(finalPayload.audioAsVoice).toBe(true);
     expect(finalPayload.spokenText).toBe("WebChat ACP block reply.");
     expect(finalPayload.trustedLocalMedia).toBe(true);
-    expect(finalPayload.text).toBe("WebChat ACP block reply.");
+    expect(finalPayload.text).toBeUndefined();
+    expect(finalPayload.ttsSupplement?.visibleTextAlreadyDelivered).toBe(true);
     expect(result?.queuedFinal).toBe(true);
   });
 

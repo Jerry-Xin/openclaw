@@ -307,13 +307,14 @@ async function finalizeAcpTurnOutput(params: {
           "final",
           markReplyPayloadAsTtsSupplement(
             {
-              text: accumulatedVisibleBlockText,
+              ...(shouldDeferTextForTts ? { text: accumulatedVisibleBlockText } : {}),
               mediaUrl: ttsSyntheticReply.mediaUrl,
               audioAsVoice: ttsSyntheticReply.audioAsVoice,
               spokenText: accumulatedBlockTtsText,
               trustedLocalMedia: true,
             },
             accumulatedBlockTtsText,
+            shouldDeferTextForTts ? undefined : { visibleTextAlreadyDelivered: true },
           ),
         );
         queuedFinal = queuedFinal || delivered;
