@@ -1887,7 +1887,92 @@ describe("tryDispatchAcpReply", () => {
     expect(finalPayload.audioAsVoice).toBe(true);
     expect(finalPayload.spokenText).toBe("WebChat ACP block reply.");
     expect(finalPayload.trustedLocalMedia).toBe(true);
+    expect(finalPayload.text).toBe("WebChat ACP block reply.");
     expect(result?.queuedFinal).toBe(true);
+  });
+
+  it("does not call settleVisibleText before TTS synthesis when mode is final", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    let settleCalledBeforeTts = false;
+    ttsMocks.maybeApplyTtsToPayload.mockImplementation(async (paramsUnknown: unknown) => {
+      if ((dispatcher.waitForIdle as ReturnType<typeof vi.fn>).mock.calls.length > 0) {
+        settleCalledBeforeTts = true;
+      }
+      return {
+        ...(paramsUnknown as { payload: unknown }).payload,
+        mediaUrl: "/tmp/openclaw-media/tts-order.ogg",
+        audioAsVoice: true,
+      };
+    });
+    mockVisibleTextTurn("Order test.");
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ctxOverrides: { Provider: "telegram", Surface: "telegram" },
+    });
+
+    expect(settleCalledBeforeTts).toBe(false);
+    expect(dispatcherCall(dispatcher.sendFinalReply).mediaUrl).toBe(
+      "/tmp/openclaw-media/tts-order.ogg",
+    );
+    expect(dispatcherCall(dispatcher.sendFinalReply).text).toBe("Order test.");
+  });
+
+  it("settles visible text as fallback when TTS final synthesis fails", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    queueTtsReplies({} as MockTtsReply);
+    mockVisibleTextTurn("Fallback text.");
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    const result = await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ctxOverrides: { Provider: "webchat", Surface: "webchat" },
+    });
+
+    expect(result?.queuedFinal).toBe(true);
+    expect(dispatcherCall(dispatcher.sendFinalReply).text).toBe("Fallback text.");
+    expect(dispatcherCall(dispatcher.sendFinalReply).mediaUrl).toBeUndefined();
+  });
+
+  it("settles visible text immediately when TTS mode is not final", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "all" });
+    mockVisibleTextTurn("Eager settle.");
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ctxOverrides: { Provider: "telegram", Surface: "telegram" },
+    });
+
+    expect(dispatcher.waitForIdle).toHaveBeenCalled();
   });
 
   it("falls back to final text when a later telegram ACP block delivery fails", async () => {
