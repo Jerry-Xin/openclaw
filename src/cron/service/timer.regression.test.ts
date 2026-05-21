@@ -2617,3 +2617,76 @@ describe("cron service timer regressions", () => {
     expect(job.state.consecutiveErrors).toBe(0);
     expect(job.state.lastFailureAlertAtMs).toBeUndefined();
   });
+
+  it("#83933: manual error on every-job does NOT rewrite nextRunAtMs", () => {
+    const startedAt = Date.parse("2026-05-21T10:00:00.000Z");
+    const endedAt = startedAt + 100;
+    const originalNextRun = startedAt + 60_000;
+    const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: "/tmp/cron-83933-manual-every-error.json",
+      log,
+      nowMs: () => endedAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: createDefaultIsolatedRunner(),
+    });
+    const job = createIsolatedRegressionJob({
+      id: "manual-every-error",
+      name: "recurring report",
+      scheduledAt: startedAt,
+      schedule: { kind: "every", everyMs: 60_000 },
+      payload: { kind: "agentTurn", message: "report" },
+      state: { nextRunAtMs: originalNextRun, consecutiveErrors: 2 },
+    });
+
+    applyJobResult(
+      state,
+      job,
+      { status: "error", error: "timeout", startedAt, endedAt },
+      { isManual: true },
+    );
+
+    expect(job.state.nextRunAtMs).toBe(originalNextRun);
+    expect(job.state.consecutiveErrors).toBe(2);
+    expect(job.enabled).toBe(true);
+    expect((log as { info: ReturnType<typeof vi.fn> }).info).toHaveBeenCalledWith(
+      { jobId: "manual-every-error", jobName: "recurring report" },
+      "cron: skipping recurring-job error backoff for manual run — nextRunAtMs preserved",
+    );
+  });
+
+  it("#83933: scheduled error on every-job DOES apply backoff (control)", () => {
+    const startedAt = Date.parse("2026-05-21T10:00:00.000Z");
+    const endedAt = startedAt + 100;
+    const originalNextRun = startedAt + 60_000;
+    const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: "/tmp/cron-83933-scheduled-every-error.json",
+      log,
+      nowMs: () => endedAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: createDefaultIsolatedRunner(),
+    });
+    const job = createIsolatedRegressionJob({
+      id: "scheduled-every-error",
+      name: "recurring report",
+      scheduledAt: startedAt,
+      schedule: { kind: "every", everyMs: 60_000 },
+      payload: { kind: "agentTurn", message: "report" },
+      state: { nextRunAtMs: originalNextRun, consecutiveErrors: 2 },
+    });
+
+    applyJobResult(
+      state,
+      job,
+      { status: "error", error: "timeout", startedAt, endedAt },
+    );
+
+    // Scheduled error should apply backoff — nextRunAtMs should change
+    expect(job.state.nextRunAtMs).not.toBe(originalNextRun);
+    expect(job.state.consecutiveErrors).toBe(3);
+  });

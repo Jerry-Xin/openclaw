@@ -561,87 +561,96 @@ export function applyJobResult(
         }
       }
     } else if (result.status === "error" && isJobEnabled(job)) {
-      const retryDecision = resolveTransientCronRetryDecision({
-        cronConfig: state.deps.cronConfig,
-        error: result.error,
-        lastErrorReason: job.state.lastErrorReason,
-        consecutiveErrors: job.state.consecutiveErrors,
-      });
-      let normalNext: number | undefined;
-      let normalNextComputed = false;
-      const computeNormalNext = () => {
-        if (!normalNextComputed) {
-          try {
-            normalNext =
-              opts?.preserveSchedule && job.schedule.kind === "every"
-                ? computeNextWithPreservedLastRun(result.endedAt)
-                : (retryDecision.retryable || previousConsecutiveErrors > 0) &&
-                    job.schedule.kind === "every"
-                  ? computeNextRunAtMs(job.schedule, result.endedAt)
-                  : computeJobNextRunAtMs(job, result.endedAt);
-          } catch (err) {
-            // If the schedule expression/timezone throws (croner edge cases),
-            // record the schedule error (auto-disables after repeated failures)
-            // and fall back to backoff-only schedule so the state update is not lost.
-            recordScheduleComputeError({ state, job, err });
-          }
-          normalNextComputed = true;
-        }
-        return normalNext;
-      };
-      if (
-        !opts?.preserveSchedule &&
-        retryDecision.retryable &&
-        retryDecision.backoffMs !== undefined
-      ) {
-        normalNext = computeNormalNext();
-        const retryNextRunAtMs = result.endedAt + retryDecision.backoffMs;
-        if (normalNext === undefined) {
-          // Preserve the unresolved-cron guard (#66019): do not synthesize a
-          // retry when the schedule cannot produce a next scheduled slot.
-        } else if (retryNextRunAtMs < normalNext) {
-          job.state.nextRunAtMs = retryNextRunAtMs;
-          state.deps.log.info(
-            {
-              jobId: job.id,
-              jobName: job.name,
-              consecutiveErrors: retryDecision.consecutiveErrors,
-              backoffMs: retryDecision.backoffMs,
-              nextRunAtMs: job.state.nextRunAtMs,
-              normalNextRunAtMs: normalNext,
-              retryCategory: retryDecision.retryCategory,
-            },
-            "cron: scheduling recurring retry after transient error",
-          );
-          return shouldDelete;
-        }
-      }
-      // Apply exponential backoff for errored jobs to prevent retry storms.
-      const backoff = errorBackoffMs(job.state.consecutiveErrors ?? 1);
-      normalNext = computeNormalNext();
-      const backoffNext = result.endedAt + backoff;
-      // Use whichever is later: the natural next run or the backoff delay.
-      job.state.nextRunAtMs =
-        job.schedule.kind === "cron"
-          ? resolveCronNextRunWithLowerBound({
-              state,
-              job,
-              naturalNext: normalNext,
-              lowerBoundMs: backoffNext,
-              context: "error_backoff",
-            })
-          : normalNext !== undefined
-            ? Math.max(normalNext, backoffNext)
-            : backoffNext;
-      state.deps.log.info(
-        {
-          jobId: job.id,
+      if (opts?.isManual) {
+        // Manual runs do not participate in recurring-job error backoff.
+        // Leave nextRunAtMs unchanged so the next scheduled fire is not delayed.
+        state.deps.log.info(
+          { jobId: job.id, jobName: job.name },
+          "cron: skipping recurring-job error backoff for manual run — nextRunAtMs preserved",
+        );
+      } else {
+        const retryDecision = resolveTransientCronRetryDecision({
+          cronConfig: state.deps.cronConfig,
+          error: result.error,
+          lastErrorReason: job.state.lastErrorReason,
           consecutiveErrors: job.state.consecutiveErrors,
-          backoffMs: backoff,
-          nextRunAtMs: job.state.nextRunAtMs,
-        },
-        "cron: applying error backoff",
-      );
+        });
+        let normalNext: number | undefined;
+        let normalNextComputed = false;
+        const computeNormalNext = () => {
+          if (!normalNextComputed) {
+            try {
+              normalNext =
+                opts?.preserveSchedule && job.schedule.kind === "every"
+                  ? computeNextWithPreservedLastRun(result.endedAt)
+                  : (retryDecision.retryable || previousConsecutiveErrors > 0) &&
+                      job.schedule.kind === "every"
+                    ? computeNextRunAtMs(job.schedule, result.endedAt)
+                    : computeJobNextRunAtMs(job, result.endedAt);
+            } catch (err) {
+              // If the schedule expression/timezone throws (croner edge cases),
+              // record the schedule error (auto-disables after repeated failures)
+              // and fall back to backoff-only schedule so the state update is not lost.
+              recordScheduleComputeError({ state, job, err });
+            }
+            normalNextComputed = true;
+          }
+          return normalNext;
+        };
+        if (
+          !opts?.preserveSchedule &&
+          retryDecision.retryable &&
+          retryDecision.backoffMs !== undefined
+        ) {
+          normalNext = computeNormalNext();
+          const retryNextRunAtMs = result.endedAt + retryDecision.backoffMs;
+          if (normalNext === undefined) {
+            // Preserve the unresolved-cron guard (#66019): do not synthesize a
+            // retry when the schedule cannot produce a next scheduled slot.
+          } else if (retryNextRunAtMs < normalNext) {
+            job.state.nextRunAtMs = retryNextRunAtMs;
+            state.deps.log.info(
+              {
+                jobId: job.id,
+                jobName: job.name,
+                consecutiveErrors: retryDecision.consecutiveErrors,
+                backoffMs: retryDecision.backoffMs,
+                nextRunAtMs: job.state.nextRunAtMs,
+                normalNextRunAtMs: normalNext,
+                retryCategory: retryDecision.retryCategory,
+              },
+              "cron: scheduling recurring retry after transient error",
+            );
+            return shouldDelete;
+          }
+        }
+        // Apply exponential backoff for errored jobs to prevent retry storms.
+        const backoff = errorBackoffMs(job.state.consecutiveErrors ?? 1);
+        normalNext = computeNormalNext();
+        const backoffNext = result.endedAt + backoff;
+        // Use whichever is later: the natural next run or the backoff delay.
+        job.state.nextRunAtMs =
+          job.schedule.kind === "cron"
+            ? resolveCronNextRunWithLowerBound({
+                state,
+                job,
+                naturalNext: normalNext,
+                lowerBoundMs: backoffNext,
+                context: "error_backoff",
+              })
+            : normalNext !== undefined
+              ? Math.max(normalNext, backoffNext)
+              : backoffNext;
+        state.deps.log.info(
+          {
+            jobId: job.id,
+            consecutiveErrors: job.state.consecutiveErrors,
+            backoffMs: backoff,
+            nextRunAtMs: job.state.nextRunAtMs,
+          },
+          "cron: applying error backoff",
+        );
+      }
     } else if (isJobEnabled(job)) {
       let naturalNext: number | undefined;
       try {
