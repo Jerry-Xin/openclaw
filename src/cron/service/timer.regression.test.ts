@@ -2446,3 +2446,55 @@ describe("cron service timer regressions", () => {
     expect(job.state.consecutiveErrors).toBe(3);
   });
 });
+
+  it("#83933: manual error run does NOT trigger failure alert", () => {
+    const startedAt = Date.parse("2026-05-21T10:00:00.000Z");
+    const endedAt = startedAt + 100;
+    const sendCronFailureAlert = vi.fn(async () => undefined);
+    const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: "/tmp/cron-83933-manual-no-alert.json",
+      log,
+      nowMs: () => endedAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: createDefaultIsolatedRunner(),
+      sendCronFailureAlert,
+      cronConfig: {
+        failureAlert: {
+          enabled: true,
+          after: 1,
+        },
+      },
+    });
+    const job = createIsolatedRegressionJob({
+      id: "manual-no-alert",
+      name: "alert test job",
+      scheduledAt: startedAt,
+      schedule: { kind: "every", everyMs: 60_000 },
+      payload: { kind: "agentTurn", message: "ping" },
+      state: { nextRunAtMs: startedAt },
+    });
+
+    // Manual error run — should NOT trigger alert
+    applyJobResult(
+      state,
+      job,
+      { status: "error", error: "test error", startedAt, endedAt },
+      { isManual: true },
+    );
+
+    expect(sendCronFailureAlert).not.toHaveBeenCalled();
+    expect(job.state.consecutiveErrors ?? 0).toBe(0);
+
+    // Scheduled error run — SHOULD trigger alert (after: 1)
+    applyJobResult(
+      state,
+      job,
+      { status: "error", error: "test error", startedAt, endedAt },
+    );
+
+    expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
+    expect(job.state.consecutiveErrors).toBe(1);
+  });
