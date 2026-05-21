@@ -2498,3 +2498,122 @@ describe("cron service timer regressions", () => {
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
     expect(job.state.consecutiveErrors).toBe(1);
   });
+
+  it("#83933: manual at-job error does NOT disable job or clear nextRunAtMs", () => {
+    const startedAt = Date.parse("2026-05-21T10:00:00.000Z");
+    const endedAt = startedAt + 100;
+    const scheduledAt = startedAt + 300_000; // 5 minutes from now
+    const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: "/tmp/cron-83933-manual-atjob-error.json",
+      log,
+      nowMs: () => endedAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: createDefaultIsolatedRunner(),
+    });
+    const job = createIsolatedRegressionJob({
+      id: "manual-atjob-error",
+      name: "one-shot reminder",
+      scheduledAt,
+      schedule: { kind: "at", at: new Date(scheduledAt).toISOString() },
+      payload: { kind: "agentTurn", message: "ping" },
+      state: { nextRunAtMs: scheduledAt },
+    });
+    job.deleteAfterRun = true;
+
+    // Manual error on at-job — must NOT disable or clear nextRunAtMs
+    const shouldDelete = applyJobResult(
+      state,
+      job,
+      { status: "error", error: "temporary timeout", startedAt, endedAt },
+      { isManual: true },
+    );
+
+    expect(shouldDelete).toBe(false);
+    expect(job.enabled).toBe(true);
+    expect(job.state.nextRunAtMs).toBe(scheduledAt);
+    expect(job.state.consecutiveErrors ?? 0).toBe(0);
+    expect((log as { info: ReturnType<typeof vi.fn> }).info).toHaveBeenCalledWith(
+      { jobId: "manual-atjob-error", jobName: "one-shot reminder" },
+      "cron: skipping at-job error handling for manual run — job preserved for scheduled execution",
+    );
+  });
+
+  it("#83933: manual success does NOT clear lastFailureAlertAtMs cooldown", () => {
+    const startedAt = Date.parse("2026-05-21T10:00:00.000Z");
+    const endedAt = startedAt + 100;
+    const cooldownMs = startedAt - 30_000; // set 30s ago
+    const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: "/tmp/cron-83933-manual-cooldown.json",
+      log,
+      nowMs: () => endedAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: createDefaultIsolatedRunner(),
+    });
+    const job = createIsolatedRegressionJob({
+      id: "manual-cooldown-test",
+      name: "daily report",
+      scheduledAt: startedAt,
+      schedule: { kind: "every", everyMs: 60_000 },
+      payload: { kind: "agentTurn", message: "report" },
+      state: {
+        nextRunAtMs: startedAt + 60_000,
+        consecutiveErrors: 3,
+        lastFailureAlertAtMs: cooldownMs,
+      },
+    });
+
+    // Manual success — must NOT clear lastFailureAlertAtMs or reset counters
+    applyJobResult(
+      state,
+      job,
+      { status: "ok", delivered: true, startedAt, endedAt },
+      { isManual: true },
+    );
+
+    expect(job.state.consecutiveErrors).toBe(3);
+    expect(job.state.lastFailureAlertAtMs).toBe(cooldownMs);
+  });
+
+  it("#83933: scheduled success DOES clear lastFailureAlertAtMs (control)", () => {
+    const startedAt = Date.parse("2026-05-21T10:00:00.000Z");
+    const endedAt = startedAt + 100;
+    const cooldownMs = startedAt - 30_000;
+    const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: "/tmp/cron-83933-scheduled-cooldown.json",
+      log,
+      nowMs: () => endedAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: createDefaultIsolatedRunner(),
+    });
+    const job = createIsolatedRegressionJob({
+      id: "scheduled-cooldown-test",
+      name: "daily report",
+      scheduledAt: startedAt,
+      schedule: { kind: "every", everyMs: 60_000 },
+      payload: { kind: "agentTurn", message: "report" },
+      state: {
+        nextRunAtMs: startedAt + 60_000,
+        consecutiveErrors: 3,
+        lastFailureAlertAtMs: cooldownMs,
+      },
+    });
+
+    // Scheduled success — SHOULD clear lastFailureAlertAtMs and reset counters
+    applyJobResult(
+      state,
+      job,
+      { status: "ok", delivered: true, startedAt, endedAt },
+    );
+
+    expect(job.state.consecutiveErrors).toBe(0);
+    expect(job.state.lastFailureAlertAtMs).toBeUndefined();
+  });

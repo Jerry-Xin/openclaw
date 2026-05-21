@@ -484,7 +484,9 @@ export function applyJobResult(
       job.state.consecutiveErrors = 0;
       job.state.consecutiveSkipped = 0;
     }
-    job.state.lastFailureAlertAtMs = undefined;
+    if (!opts?.isManual) {
+      job.state.lastFailureAlertAtMs = undefined;
+    }
   }
 
   const wouldDelete =
@@ -508,44 +510,54 @@ export function applyJobResult(
           job.state.nextRunAtMs = undefined;
         }
       } else if (result.status === "error") {
-        const retryDecision = resolveTransientCronRetryDecision({
-          cronConfig: state.deps.cronConfig,
-          error: result.error,
-          lastErrorReason: job.state.lastErrorReason,
-          consecutiveErrors: job.state.consecutiveErrors,
-        });
-        if (retryDecision.retryable && retryDecision.backoffMs !== undefined) {
-          // Schedule retry with backoff (#24355).
-          job.state.nextRunAtMs = result.endedAt + retryDecision.backoffMs;
+        if (opts?.isManual) {
+          // Manual runs do not participate in at-job retry/disable state.
+          // Leave enabled, nextRunAtMs, and counters unchanged so the
+          // scheduled execution path is not affected.
           state.deps.log.info(
-            {
-              jobId: job.id,
-              jobName: job.name,
-              consecutiveErrors: retryDecision.consecutiveErrors,
-              backoffMs: retryDecision.backoffMs,
-              nextRunAtMs: job.state.nextRunAtMs,
-              retryCategory: retryDecision.retryCategory,
-            },
-            "cron: scheduling one-shot retry after transient error",
+            { jobId: job.id, jobName: job.name },
+            "cron: skipping at-job error handling for manual run — job preserved for scheduled execution",
           );
         } else {
-          // Permanent error or max retries exhausted: disable.
-          // Note: deleteAfterRun:true only triggers on ok (see shouldDelete above),
-          // so exhausted-retry jobs are disabled but intentionally kept in the store
-          // to preserve the error state for inspection.
-          job.enabled = false;
-          job.state.nextRunAtMs = undefined;
-          state.deps.log.warn(
-            {
-              jobId: job.id,
-              jobName: job.name,
-              consecutiveErrors: retryDecision.consecutiveErrors,
-              error: result.error,
-              reason: retryDecision.reason,
-              retryCategory: retryDecision.retryCategory,
-            },
-            "cron: disabling one-shot job after error",
-          );
+          const retryDecision = resolveTransientCronRetryDecision({
+            cronConfig: state.deps.cronConfig,
+            error: result.error,
+            lastErrorReason: job.state.lastErrorReason,
+            consecutiveErrors: job.state.consecutiveErrors,
+          });
+          if (retryDecision.retryable && retryDecision.backoffMs !== undefined) {
+            // Schedule retry with backoff (#24355).
+            job.state.nextRunAtMs = result.endedAt + retryDecision.backoffMs;
+            state.deps.log.info(
+              {
+                jobId: job.id,
+                jobName: job.name,
+                consecutiveErrors: retryDecision.consecutiveErrors,
+                backoffMs: retryDecision.backoffMs,
+                nextRunAtMs: job.state.nextRunAtMs,
+                retryCategory: retryDecision.retryCategory,
+              },
+              "cron: scheduling one-shot retry after transient error",
+            );
+          } else {
+            // Permanent error or max retries exhausted: disable.
+            // Note: deleteAfterRun:true only triggers on ok (see shouldDelete above),
+            // so exhausted-retry jobs are disabled but intentionally kept in the store
+            // to preserve the error state for inspection.
+            job.enabled = false;
+            job.state.nextRunAtMs = undefined;
+            state.deps.log.warn(
+              {
+                jobId: job.id,
+                jobName: job.name,
+                consecutiveErrors: retryDecision.consecutiveErrors,
+                error: result.error,
+                reason: retryDecision.reason,
+                retryCategory: retryDecision.retryCategory,
+              },
+              "cron: disabling one-shot job after error",
+            );
+          }
         }
       }
     } else if (result.status === "error" && isJobEnabled(job)) {
