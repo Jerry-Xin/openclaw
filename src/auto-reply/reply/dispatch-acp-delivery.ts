@@ -152,6 +152,7 @@ type AcpDispatchDeliveryState = {
   deliveredFinalReply: boolean;
   deliveredVisibleText: boolean;
   failedVisibleTextDelivery: boolean;
+  failedFinalDelivery: boolean;
   queuedDirectVisibleTextDeliveries: number;
   settledDirectVisibleText: boolean;
   routedCounts: Record<ReplyDispatchKind, number>;
