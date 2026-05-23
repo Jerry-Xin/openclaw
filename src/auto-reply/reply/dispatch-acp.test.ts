@@ -1994,6 +1994,51 @@ describe("tryDispatchAcpReply", () => {
     expect(dispatcherCall(dispatcher.sendFinalReply).mediaUrl).toBeUndefined();
   });
 
+  it("delivers text fallback when queued captioned-voice delivery fails asynchronously on telegram", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    ttsMocks.maybeApplyTtsToPayload
+      .mockResolvedValueOnce({
+        text: "Captioned fallback.",
+        mediaUrl: "/tmp/openclaw-media/tts-caption.ogg",
+        audioAsVoice: true,
+      })
+      .mockImplementation(async (paramsUnknown: unknown) => {
+        return (paramsUnknown as { payload: unknown }).payload;
+      });
+    mockVisibleTextTurn("Captioned fallback.");
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    (dispatcher.sendFinalReply as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true);
+    (dispatcher.getFailedCounts as ReturnType<typeof vi.fn>).mockReturnValue({
+      tool: 0,
+      block: 0,
+      final: 1,
+    });
+    const result = await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ttsChannel: "telegram",
+      ctxOverrides: { Provider: "telegram", Surface: "telegram" },
+    });
+
+    expect(result?.queuedFinal).toBe(true);
+    expect(dispatcherCall(dispatcher.sendFinalReply, 0).mediaUrl).toBe(
+      "/tmp/openclaw-media/tts-caption.ogg",
+    );
+    expect(dispatcherCall(dispatcher.sendFinalReply, 1).text).toBe("Captioned fallback.");
+    expect(dispatcherCall(dispatcher.sendFinalReply, 1).mediaUrl).toBeUndefined();
+  });
+
   it("settles visible text immediately when TTS mode is not final", async () => {
     setReadyAcpResolution();
     ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "all" });
