@@ -324,9 +324,10 @@ async function finalizeAcpTurnOutput(params: {
       // was accepted by the dispatcher — so we can detect later sendVoice
       // failures that would otherwise silently lose the caption text.
       await params.delivery.settleVisibleText();
-      if (finalMediaDelivered && params.delivery.hasFailedVisibleTextDelivery()) {
-        // The captioned voice delivery was queued but ultimately failed;
-        // reset so the text fallback below can send text standalone.
+      if (finalMediaDelivered && params.delivery.hasFailedFinalDelivery()) {
+        // The captioned voice delivery was queued as "final" but ultimately
+        // failed; check final-specific failure count so earlier block failures
+        // don't incorrectly trigger this reset.
         finalMediaDelivered = false;
       }
       queuedFinal =

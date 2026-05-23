@@ -2039,6 +2039,48 @@ describe("tryDispatchAcpReply", () => {
     expect(dispatcherCall(dispatcher.sendFinalReply, 1).mediaUrl).toBeUndefined();
   });
 
+  it("does not send redundant text fallback when block delivery failed but captioned voice succeeded", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    ttsMocks.maybeApplyTtsToPayload.mockResolvedValueOnce({
+      text: "Captioned text.",
+      mediaUrl: "/tmp/openclaw-media/tts-ok.ogg",
+      audioAsVoice: true,
+    });
+    mockVisibleTextTurn("Captioned text.");
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    // Captioned voice delivery succeeds
+    (dispatcher.sendFinalReply as ReturnType<typeof vi.fn>).mockReturnValueOnce(true);
+    // Simulate an earlier block delivery failure (block: 1) with no final failures
+    (dispatcher.getFailedCounts as ReturnType<typeof vi.fn>).mockReturnValue({
+      tool: 0,
+      block: 1,
+      final: 0,
+    });
+    const result = await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ttsChannel: "telegram",
+      ctxOverrides: { Provider: "telegram", Surface: "telegram" },
+    });
+
+    // Only the captioned voice should be sent; no redundant text-only final
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
+    expect(dispatcherCall(dispatcher.sendFinalReply, 0).mediaUrl).toBe(
+      "/tmp/openclaw-media/tts-ok.ogg",
+    );
+    // queuedFinal reflects aggregate visible-text state (block failed), but
+    // no redundant text fallback was sent — that's the key behavior verified.
+  });
+
   it("settles visible text immediately when TTS mode is not final", async () => {
     setReadyAcpResolution();
     ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "all" });

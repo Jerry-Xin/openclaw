@@ -174,6 +174,7 @@ export type AcpDispatchDeliveryCoordinator = {
   hasDeliveredFinalReply: () => boolean;
   hasDeliveredVisibleText: () => boolean;
   hasFailedVisibleTextDelivery: () => boolean;
+  hasFailedFinalDelivery: () => boolean;
   getRoutedCounts: () => Record<ReplyDispatchKind, number>;
   applyRoutedCounts: (counts: Record<ReplyDispatchKind, number>) => void;
 };
@@ -226,6 +227,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     deliveredFinalReply: false,
     deliveredVisibleText: false,
     failedVisibleTextDelivery: false,
+    failedFinalDelivery: false,
     queuedDirectVisibleTextDeliveries: 0,
     settledDirectVisibleText: false,
     routedCounts: {
@@ -257,6 +259,9 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     const failedVisibleCount = failedCounts.block + failedCounts.final;
     if (failedVisibleCount > 0) {
       state.failedVisibleTextDelivery = true;
+    }
+    if (failedCounts.final > 0) {
+      state.failedFinalDelivery = true;
     }
     if (state.queuedDirectVisibleTextDeliveries > failedVisibleCount) {
       state.deliveredVisibleText = true;
@@ -507,6 +512,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     hasDeliveredFinalReply: () => state.deliveredFinalReply,
     hasDeliveredVisibleText: () => state.deliveredVisibleText,
     hasFailedVisibleTextDelivery: () => state.failedVisibleTextDelivery,
+    hasFailedFinalDelivery: () => state.failedFinalDelivery,
     getRoutedCounts: () => ({ ...state.routedCounts }),
     applyRoutedCounts: (counts) => {
       counts.tool += state.routedCounts.tool;
