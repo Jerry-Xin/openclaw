@@ -1899,7 +1899,10 @@ describe("tryDispatchAcpReply", () => {
     ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
     let settleCalledBeforeTts = false;
     ttsMocks.maybeApplyTtsToPayload.mockImplementation(async (paramsUnknown: unknown) => {
-      if ((dispatcher.waitForIdle as ReturnType<typeof vi.fn>).mock.calls.length > 0) {
+      // Track getFailedCounts instead of waitForIdle: waitForIdle can be called
+      // by block delivery (waitForReplyDispatcherIdle) independently of settlement,
+      // but getFailedCounts is only called from settleDirectVisibleText.
+      if ((dispatcher.getFailedCounts as ReturnType<typeof vi.fn>).mock.calls.length > 0) {
         settleCalledBeforeTts = true;
       }
       return {
