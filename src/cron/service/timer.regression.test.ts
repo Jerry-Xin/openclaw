@@ -2400,7 +2400,7 @@ describe("cron service timer regressions", () => {
       id: "manual-error-83933",
       name: "manual-error-83933",
       scheduledAt: startedAt,
-      schedule: { kind: "at", atMs: startedAt },
+      schedule: { kind: "at", at: new Date(startedAt).toISOString() },
       payload: { kind: "agentTurn", message: "test" },
       state: { runningAtMs: startedAt, consecutiveErrors: 3 },
     });
@@ -2431,7 +2431,7 @@ describe("cron service timer regressions", () => {
       id: "manual-success-83933",
       name: "manual-success-83933",
       scheduledAt: startedAt,
-      schedule: { kind: "at", atMs: startedAt },
+      schedule: { kind: "at", at: new Date(startedAt).toISOString() },
       payload: { kind: "agentTurn", message: "test" },
       state: { runningAtMs: startedAt, consecutiveErrors: 3 },
     });
