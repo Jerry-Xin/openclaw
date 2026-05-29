@@ -1890,7 +1890,7 @@ describe("tryDispatchAcpReply", () => {
     expect(finalPayload.spokenText).toBe("WebChat ACP block reply.");
     expect(finalPayload.trustedLocalMedia).toBe(true);
     expect(finalPayload.text).toBeUndefined();
-    expect(finalPayload.ttsSupplement?.visibleTextAlreadyDelivered).toBe(true);
+    expect((finalPayload.ttsSupplement as Record<string, unknown>)?.visibleTextAlreadyDelivered).toBe(true);
     expect(result?.queuedFinal).toBe(true);
   });
 
@@ -1906,7 +1906,7 @@ describe("tryDispatchAcpReply", () => {
         settleCalledBeforeTts = true;
       }
       return {
-        ...(paramsUnknown as { payload: unknown }).payload,
+        ...(paramsUnknown as { payload: Record<string, unknown> }).payload,
         mediaUrl: "/tmp/openclaw-media/tts-order.ogg",
         audioAsVoice: true,
       };
@@ -1944,7 +1944,7 @@ describe("tryDispatchAcpReply", () => {
         textSettledBeforeTts = true;
       }
       return {
-        ...(paramsUnknown as { payload: unknown }).payload,
+        ...(paramsUnknown as { payload: Record<string, unknown> }).payload,
         mediaUrl: "/tmp/openclaw-media/tts-eager.ogg",
         audioAsVoice: true,
       };
