@@ -47,9 +47,9 @@ import {
   resolveFailureAlert,
 } from "./failure-alerts.js";
 import {
-  DEFAULT_ERROR_BACKOFF_SCHEDULE_MS,
-  computeJobPreviousRunAtMs,
   computeJobNextRunAtMs,
+  computeJobPreviousRunAtMs,
+  DEFAULT_ERROR_BACKOFF_SCHEDULE_MS,
   errorBackoffMs,
   hasScheduledNextRunAtMs,
   isJobEnabled,
@@ -372,7 +372,10 @@ function resolveDeliveryState(params: {
       failureNotification: { status: "not-requested" },
     };
   }
-  return { status: "unknown", failureNotification: { status: "not-requested" } };
+  return {
+    status: "unknown",
+    failureNotification: { status: "not-requested" },
+  };
 }
 
 /** Applies run outcome state, delivery state, backoff/next-run scheduling, and delete-after-run policy. */
@@ -873,7 +876,12 @@ export async function onTimer(state: CronServiceState) {
       const startedAt = state.deps.nowMs();
       job.state.runningAtMs = startedAt;
       markCronJobActive(job.id);
-      emit(state, { jobId: job.id, action: "started", job, runAtMs: startedAt });
+      emit(state, {
+        jobId: job.id,
+        action: "started",
+        job,
+        runAtMs: startedAt,
+      });
       const jobTimeoutMs = resolveCronJobTimeoutMs(job);
       const taskRunId = tryCreateCronTaskRun({ state, job, startedAt });
 
@@ -909,7 +917,9 @@ export async function onTimer(state: CronServiceState) {
     };
 
     const concurrency = Math.min(resolveRunConcurrency(state), Math.max(1, dueJobs.length));
-    const results: (TimedCronRunOutcome | undefined)[] = Array.from({ length: dueJobs.length });
+    const results: (TimedCronRunOutcome | undefined)[] = Array.from({
+      length: dueJobs.length,
+    });
     let cursor = 0;
     const workers = Array.from({ length: concurrency }, async () => {
       for (;;) {
@@ -1203,7 +1213,10 @@ async function planStartupCatchup(
     // startup is not blocked by model/tool bootstrap work.
     const deferred: StartupDeferredJob[] = [
       ...deferredOverflow.map((job) => ({ jobId: job.id })),
-      ...deferredAgentJobs.map((job) => ({ jobId: job.id, delayMs: deferredAgentDelayMs })),
+      ...deferredAgentJobs.map((job) => ({
+        jobId: job.id,
+        delayMs: deferredAgentDelayMs,
+      })),
     ];
     if (deferred.length > 0) {
       state.deps.log.info(
@@ -1227,7 +1240,10 @@ async function planStartupCatchup(
     }
     if (startupCandidates.length > 0) {
       state.deps.log.info(
-        { count: startupCandidates.length, jobIds: startupCandidates.map((j) => j.id) },
+        {
+          count: startupCandidates.length,
+          jobIds: startupCandidates.map((j) => j.id),
+        },
         "cron: running missed jobs after restart",
       );
     }
@@ -1347,7 +1363,9 @@ async function applyStartupCatchupOutcomes(
     // startup catch-up was running. They should execute on a future tick
     // instead of being silently advanced. Future repair is disabled here so
     // startup overflow deferrals survive until their staggered catch-up tick.
-    recomputeNextRunsForMaintenance(state, { repairFutureCronNextRunAtMs: false });
+    recomputeNextRunsForMaintenance(state, {
+      repairFutureCronNextRunAtMs: false,
+    });
     await persist(state);
   });
 }

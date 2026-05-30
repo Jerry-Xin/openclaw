@@ -68,7 +68,11 @@ function expectAlertFields(
 function simulateScheduledRun(
   cron: CronService,
   jobId: string,
-  result: { status: "error" | "skipped" | "ok"; error?: string },
+  result: {
+    status: "error" | "skipped" | "ok";
+    error?: string;
+    provider?: string;
+  },
 ) {
   const state = (cron as any).state;
   const job = cron.getJob(jobId);
@@ -136,10 +140,16 @@ describe("CronService failure alerts", () => {
       delivery: { mode: "announce", channel: "telegram", to: "19098680" },
     });
 
-    simulateScheduledRun(cron, job.id, { status: "error", error: "wrong model id" });
+    simulateScheduledRun(cron, job.id, {
+      status: "error",
+      error: "wrong model id",
+    });
     expect(sendCronFailureAlert).not.toHaveBeenCalled();
 
-    simulateScheduledRun(cron, job.id, { status: "error", error: "wrong model id" });
+    simulateScheduledRun(cron, job.id, {
+      status: "error",
+      error: "wrong model id",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
     const firstAlert = expectAlertFields(sendCronFailureAlert, {
       channel: "telegram",
@@ -148,11 +158,17 @@ describe("CronService failure alerts", () => {
     expect((firstAlert.job as { id?: string } | undefined)?.id).toBe(job.id);
     expectAlertTextContaining(sendCronFailureAlert, 'Cron job "daily report" failed 2 times');
 
-    simulateScheduledRun(cron, job.id, { status: "error", error: "wrong model id" });
+    simulateScheduledRun(cron, job.id, {
+      status: "error",
+      error: "wrong model id",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
 
     vi.setSystemTime(new Date(Date.now() + 60_000));
-    simulateScheduledRun(cron, job.id, { status: "error", error: "wrong model id" });
+    simulateScheduledRun(cron, job.id, {
+      status: "error",
+      error: "wrong model id",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(2);
     expectAlertTextContaining(sendCronFailureAlert, 'Cron job "daily report" failed 4 times');
 
@@ -237,8 +253,14 @@ describe("CronService failure alerts", () => {
       failureAlert: false,
     });
 
-    simulateScheduledRun(cron, job.id, { status: "error", error: "auth error" });
-    simulateScheduledRun(cron, job.id, { status: "error", error: "auth error" });
+    simulateScheduledRun(cron, job.id, {
+      status: "error",
+      error: "auth error",
+    });
+    simulateScheduledRun(cron, job.id, {
+      status: "error",
+      error: "auth error",
+    });
     expect(sendCronFailureAlert).not.toHaveBeenCalled();
 
     cron.stop();
@@ -294,7 +316,10 @@ describe("CronService failure alerts", () => {
     expect(updatedFailureAlert.to).toBe("12345");
     expect(updatedFailureAlert.includeSkipped).toBe(true);
 
-    simulateScheduledRun(cron, job.id, { status: "skipped", error: "requests-in-flight" });
+    simulateScheduledRun(cron, job.id, {
+      status: "skipped",
+      error: "requests-in-flight",
+    });
     expectAlertFields(sendCronFailureAlert, {
       channel: "telegram",
       to: "12345",
@@ -355,7 +380,10 @@ describe("CronService failure alerts", () => {
       },
     });
 
-    simulateScheduledRun(cron, normalJob.id, { status: "error", error: "temporary upstream error" });
+    simulateScheduledRun(cron, normalJob.id, {
+      status: "error",
+      error: "temporary upstream error",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
     expectAlertFields(sendCronFailureAlert, {
       mode: "webhook",
@@ -363,7 +391,10 @@ describe("CronService failure alerts", () => {
       to: undefined,
     });
 
-    simulateScheduledRun(cron, bestEffortJob.id, { status: "error", error: "temporary upstream error" });
+    simulateScheduledRun(cron, bestEffortJob.id, {
+      status: "error",
+      error: "temporary upstream error",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
 
     cron.stop();
@@ -403,10 +434,16 @@ describe("CronService failure alerts", () => {
       delivery: { mode: "announce", channel: "telegram", to: "19098680" },
     });
 
-    simulateScheduledRun(cron, job.id, { status: "skipped", error: "disabled" });
+    simulateScheduledRun(cron, job.id, {
+      status: "skipped",
+      error: "disabled",
+    });
     expect(sendCronFailureAlert).not.toHaveBeenCalled();
 
-    simulateScheduledRun(cron, job.id, { status: "skipped", error: "disabled" });
+    simulateScheduledRun(cron, job.id, {
+      status: "skipped",
+      error: "disabled",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
     expectAlertFields(sendCronFailureAlert, {
       channel: "telegram",
@@ -458,7 +495,10 @@ describe("CronService failure alerts", () => {
       delivery: { mode: "announce", channel: "telegram", to: "19098680" },
     });
 
-    await cron.run(job.id, "force");
+    simulateScheduledRun(cron, job.id, {
+      status: "error",
+      error: "cron: job execution timed out",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
     const alertText = alertCallArg(sendCronFailureAlert).text;
     expect(alertText).toBe(
@@ -503,7 +543,11 @@ describe("CronService failure alerts", () => {
       delivery: { mode: "announce", channel: "telegram", to: "19098680" },
     });
 
-    await cron.run(job.id, "force");
+    simulateScheduledRun(cron, job.id, {
+      status: "error",
+      error: "403 Key limit exceeded (monthly limit)",
+      provider: "openrouter",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
     const alertText = alertCallArg(sendCronFailureAlert).text;
     expect(alertText).toBe(
@@ -548,7 +592,10 @@ describe("CronService failure alerts", () => {
       delivery: { mode: "announce", channel: "telegram", to: "19098680" },
     });
 
-    await cron.run(job.id, "force");
+    simulateScheduledRun(cron, job.id, {
+      status: "skipped",
+      error: "cron: job execution timed out",
+    });
     expect(sendCronFailureAlert).toHaveBeenCalledTimes(1);
     const alertText = alertCallArg(sendCronFailureAlert).text;
     expect(alertText).toBe(
@@ -590,8 +637,14 @@ describe("CronService failure alerts", () => {
       delivery: { mode: "announce", channel: "telegram", to: "19098680" },
     });
 
-    simulateScheduledRun(cron, job.id, { status: "skipped", error: "requests-in-flight" });
-    simulateScheduledRun(cron, job.id, { status: "skipped", error: "requests-in-flight" });
+    simulateScheduledRun(cron, job.id, {
+      status: "skipped",
+      error: "requests-in-flight",
+    });
+    simulateScheduledRun(cron, job.id, {
+      status: "skipped",
+      error: "requests-in-flight",
+    });
 
     expect(sendCronFailureAlert).not.toHaveBeenCalled();
     const skippedJob = cron.getJob(job.id);
