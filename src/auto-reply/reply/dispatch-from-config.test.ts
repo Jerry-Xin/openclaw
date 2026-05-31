@@ -188,6 +188,12 @@ const ttsMocks = vi.hoisted(() => {
       typeof value === "string" ? value : undefined,
     ),
     resolveTtsConfig: vi.fn((_cfg: OpenClawConfig) => ({ mode: "final" })),
+    resolveStatusTtsSnapshot: vi.fn(() => ({
+      autoMode: "always",
+      provider: "auto",
+      maxLength: 1500,
+      summarize: true,
+    })),
   };
 });
 const transcriptMocks = vi.hoisted(() => ({
@@ -545,6 +551,7 @@ vi.mock("./dispatch-acp-session.runtime.js", () => ({
 vi.mock("../../tts/tts-config.js", () => ({
   normalizeTtsAutoMode: (value: unknown) => ttsMocks.normalizeTtsAutoMode(value),
   resolveConfiguredTtsMode: (cfg: OpenClawConfig) => ttsMocks.resolveTtsConfig(cfg).mode,
+  resolveStatusTtsSnapshot: () => ttsMocks.resolveStatusTtsSnapshot(),
   shouldCleanTtsDirectiveText: () => true,
   shouldAttemptTtsPayload: () => true,
 }));
@@ -993,6 +1000,13 @@ describe("dispatchReplyFromConfig", () => {
     ttsMocks.resolveTtsConfig.mockClear();
     ttsMocks.resolveTtsConfig.mockReturnValue({
       mode: "final",
+    });
+    ttsMocks.resolveStatusTtsSnapshot.mockClear();
+    ttsMocks.resolveStatusTtsSnapshot.mockReturnValue({
+      autoMode: "always",
+      provider: "auto",
+      maxLength: 1500,
+      summarize: true,
     });
     transcriptMocks.persistAcpDispatchTranscript.mockClear();
     transcriptMocks.appendAssistantMessageToSessionTranscript.mockClear();
@@ -6178,6 +6192,354 @@ describe("dispatchReplyFromConfig", () => {
     const finalPayload = (dispatcher.sendFinalReply as ReturnType<typeof vi.fn>).mock
       .calls[0]?.[0] as ReplyPayload | undefined;
     expect(finalPayload?.mediaUrl).toBe("https://example.com/tts-synth.opus");
+  });
+
+  it("defers streamed block text into captioned final TTS voice payloads", async () => {
+    setNoAbort();
+    ttsMocks.state.synthesizeFinalAudio = true;
+    const telegramTestPlugin = createChannelTestPluginBase({
+      id: "telegram",
+      capabilities: {
+        chatTypes: ["direct"],
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            captionedFinalText: true,
+          },
+        },
+        blockStreaming: true,
+      },
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: telegramTestPlugin,
+        },
+      ]),
+    );
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({ Provider: "telegram", Surface: "telegram" });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload | undefined> => {
+      await opts?.onBlockReply?.({ text: "Hello captioned voice." });
+      return undefined;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    const finalPayload = firstFinalReplyPayload(dispatcher);
+    expect(finalPayload?.text).toBe("Hello captioned voice.");
+    expect(finalPayload?.mediaUrl).toBe("https://example.com/tts-synth.opus");
+    expect(finalPayload?.ttsSupplement?.visibleTextAlreadyDelivered).toBeUndefined();
+  });
+
+  it("merges deferred block text into captioned final payloads with resolver text", async () => {
+    setNoAbort();
+    ttsMocks.state.synthesizeFinalAudio = true;
+    const telegramTestPlugin = createChannelTestPluginBase({
+      id: "telegram",
+      capabilities: {
+        chatTypes: ["direct"],
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            captionedFinalText: true,
+          },
+        },
+        blockStreaming: true,
+      },
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: telegramTestPlugin,
+        },
+      ]),
+    );
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({ Provider: "telegram", Surface: "telegram" });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload> => {
+      await opts?.onBlockReply?.({ text: "First visible block." });
+      await opts?.onBlockReply?.({ text: "Second visible block." });
+      return { text: "Resolver final text." };
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    const finalPayload = firstFinalReplyPayload(dispatcher);
+    expect(finalPayload?.text).toBe("First visible block.\nSecond visible block.");
+    expect(finalPayload?.mediaUrl).toBe("https://example.com/tts-synth.opus");
+  });
+
+  it("keeps split block text and final TTS audio for non-captioned voice channels", async () => {
+    setNoAbort();
+    ttsMocks.state.synthesizeFinalAudio = true;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({ Provider: "discord", Surface: "discord" });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload | undefined> => {
+      await opts?.onBlockReply?.({ text: "Hello split voice." });
+      return undefined;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+    expect(dispatcher.sendBlockReply).toHaveBeenCalledWith({ text: "Hello split voice." });
+    const finalPayload = firstFinalReplyPayload(dispatcher);
+    expect(finalPayload?.text).toBeUndefined();
+    expect(finalPayload?.mediaUrl).toBe("https://example.com/tts-synth.opus");
+    expect(finalPayload?.spokenText).toBe("Hello split voice.");
+    expect(finalPayload?.ttsSupplement?.visibleTextAlreadyDelivered).toBe(true);
+  });
+
+  it("delivers deferred caption text as plain final text when final TTS has no media", async () => {
+    setNoAbort();
+    ttsMocks.state.synthesizeFinalAudio = false;
+    const telegramTestPlugin = createChannelTestPluginBase({
+      id: "telegram",
+      capabilities: {
+        chatTypes: ["direct"],
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            captionedFinalText: true,
+          },
+        },
+      },
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: telegramTestPlugin,
+        },
+      ]),
+    );
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({ Provider: "telegram", Surface: "telegram" });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload | undefined> => {
+      await opts?.onBlockReply?.({ text: "Fallback caption text." });
+      return undefined;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
+    const finalPayload = firstFinalReplyPayload(dispatcher);
+    expect(finalPayload).toEqual({ text: "Fallback caption text." });
+  });
+
+  it("delivers deferred caption text when queued captioned voice delivery fails asynchronously", async () => {
+    setNoAbort();
+    ttsMocks.state.synthesizeFinalAudio = true;
+    const telegramTestPlugin = createChannelTestPluginBase({
+      id: "telegram",
+      capabilities: {
+        chatTypes: ["direct"],
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            captionedFinalText: true,
+          },
+        },
+      },
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: telegramTestPlugin,
+        },
+      ]),
+    );
+    const dispatcher = createDispatcher();
+    (dispatcher.getFailedCounts as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({ tool: 0, block: 0, final: 0 })
+      .mockReturnValueOnce({ tool: 0, block: 0, final: 1 });
+    const ctx = buildTestCtx({ Provider: "telegram", Surface: "telegram" });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload | undefined> => {
+      await opts?.onBlockReply?.({ text: "Async failed caption." });
+      return undefined;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    expect(dispatcher.waitForIdle).toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(2);
+    expect(firstFinalReplyPayload(dispatcher)?.text).toBe("Async failed caption.");
+    expect(firstFinalReplyPayload(dispatcher)?.mediaUrl).toBe(
+      "https://example.com/tts-synth.opus",
+    );
+    const fallbackPayload = firstMockArg(
+      dispatcher.sendFinalReply as ReturnType<typeof vi.fn>,
+      "final reply",
+      1,
+    ) as ReplyPayload;
+    expect(fallbackPayload).toEqual({ text: "Async failed caption." });
+  });
+
+  it("recovers deferred caption text when the dispatch is aborted after block text", async () => {
+    setNoAbort();
+    const telegramTestPlugin = createChannelTestPluginBase({
+      id: "telegram",
+      capabilities: {
+        chatTypes: ["direct"],
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            captionedFinalText: true,
+          },
+        },
+      },
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: telegramTestPlugin,
+        },
+      ]),
+    );
+    const abortController = new AbortController();
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({ Provider: "telegram", Surface: "telegram" });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload | undefined> => {
+      await opts?.onBlockReply?.({ text: "Deferred before abort." });
+      abortController.abort();
+      return new Promise<ReplyPayload | undefined>(() => undefined);
+    };
+
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg: emptyConfig,
+      dispatcher,
+      replyResolver,
+      replyOptions: { abortSignal: abortController.signal },
+    });
+
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
+    expect(firstFinalReplyPayload(dispatcher)).toEqual({ text: "Deferred before abort." });
+  });
+
+  it("delivers deferred caption text when the resolver throws after block text", async () => {
+    setNoAbort();
+    const telegramTestPlugin = createChannelTestPluginBase({
+      id: "telegram",
+      capabilities: {
+        chatTypes: ["direct"],
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            captionedFinalText: true,
+          },
+        },
+      },
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: telegramTestPlugin,
+        },
+      ]),
+    );
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({ Provider: "telegram", Surface: "telegram" });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload | undefined> => {
+      await opts?.onBlockReply?.({ text: "Deferred before error." });
+      throw new Error("resolver failed after deferred text");
+    };
+
+    await expect(
+      dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver }),
+    ).rejects.toThrow("resolver failed after deferred text");
+
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
+    expect(firstFinalReplyPayload(dispatcher)).toEqual({ text: "Deferred before error." });
+  });
+
+  it("routes deferred caption text recovery when a routed resolver throws after block text", async () => {
+    setNoAbort();
+    const telegramTestPlugin = createChannelTestPluginBase({
+      id: "telegram",
+      capabilities: {
+        chatTypes: ["direct"],
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            captionedFinalText: true,
+          },
+        },
+      },
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: telegramTestPlugin,
+        },
+      ]),
+    );
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "slack",
+      Surface: "slack",
+      OriginatingChannel: "telegram",
+      OriginatingTo: "telegram:999",
+      SessionKey: "agent:main:slack:channel:CHAN1",
+    });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload | undefined> => {
+      await opts?.onBlockReply?.({ text: "Routed deferred before error." });
+      throw new Error("routed resolver failed after deferred text");
+    };
+
+    await expect(
+      dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver }),
+    ).rejects.toThrow("routed resolver failed after deferred text");
+
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(mocks.routeReply).toHaveBeenCalledTimes(1);
+    const routeCall = firstRouteReplyCall() as { channel?: unknown; payload?: ReplyPayload };
+    expect(routeCall.channel).toBe("telegram");
+    expect(routeCall.payload).toEqual({ text: "Routed deferred before error." });
   });
 
   it("forwards generated-media block replies in WhatsApp group sessions", async () => {

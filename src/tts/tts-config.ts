@@ -210,3 +210,5 @@ export function shouldCleanTtsDirectiveText(params: {
   }
   return resolveEffectiveTtsConfig(params.cfg, params).modelOverrides?.enabled !== false;
 }
+
+export { resolveStatusTtsSnapshot } from "./status-config.js";
