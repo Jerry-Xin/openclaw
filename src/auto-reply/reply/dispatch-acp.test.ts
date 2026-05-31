@@ -318,6 +318,7 @@ async function runDispatch(params: {
   suppressReplyLifecycle?: boolean;
   sourceReplyDeliveryMode?: "automatic" | "message_tool_only";
   ttsChannel?: string;
+  abortSignal?: AbortSignal;
 }) {
   const targetSessionKey = params.sessionKeyOverride ?? sessionKey;
   return tryDispatchAcpReply({
@@ -334,6 +335,7 @@ async function runDispatch(params: {
     images: params.images,
     inboundAudio: false,
     ttsChannel: params.ttsChannel,
+    abortSignal: params.abortSignal,
     suppressUserDelivery: params.suppressUserDelivery,
     suppressReplyLifecycle: params.suppressReplyLifecycle,
     sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
@@ -2016,6 +2018,76 @@ describe("tryDispatchAcpReply", () => {
 
     expect(textSettledBeforeTts).toBe(true);
     expect(dispatcher.sendBlockReply).toHaveBeenCalledWith({ text: "Eager discord." });
+  });
+
+  it("delivers suppressed telegram block text as a final fallback on abort", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    const abortController = new AbortController();
+    managerMocks.runTurn.mockImplementation(
+      async ({ onEvent }: { onEvent: (event: unknown) => Promise<void> }) => {
+        await onEvent({ type: "text_delta", text: "Abort fallback.", tag: "agent_message_chunk" });
+        abortController.abort();
+      },
+    );
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    const result = await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ttsChannel: "telegram",
+      abortSignal: abortController.signal,
+      ctxOverrides: { Provider: "telegram", Surface: "telegram" },
+    });
+
+    expect(result?.queuedFinal).toBe(true);
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    expect(ttsMocks.maybeApplyTtsToPayload).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
+    expect(dispatcherCall(dispatcher.sendFinalReply).text).toBe("Abort fallback.");
+    expect(dispatcherCall(dispatcher.sendFinalReply).mediaUrl).toBeUndefined();
+  });
+
+  it("delivers suppressed telegram block text before the final error reply", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    managerMocks.runTurn.mockImplementation(
+      async ({ onEvent }: { onEvent: (event: unknown) => Promise<void> }) => {
+        await onEvent({ type: "text_delta", text: "Error fallback.", tag: "agent_message_chunk" });
+        throw new Error("turn exploded");
+      },
+    );
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    const result = await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ttsChannel: "telegram",
+      ctxOverrides: { Provider: "telegram", Surface: "telegram" },
+    });
+
+    expect(result?.queuedFinal).toBe(true);
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    expect(ttsMocks.maybeApplyTtsToPayload).toHaveBeenCalledTimes(1);
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(2);
+    expect(dispatcherCall(dispatcher.sendFinalReply, 0).text).toBe("Error fallback.");
+    expect(dispatcherCall(dispatcher.sendFinalReply, 0).mediaUrl).toBeUndefined();
+    expect(dispatcherCall(dispatcher.sendFinalReply, 1).isError).toBe(true);
+    expect(dispatcherCall(dispatcher.sendFinalReply, 1).text).toContain("turn exploded");
   });
 
   it("settles visible text as fallback when TTS final synthesis fails", async () => {

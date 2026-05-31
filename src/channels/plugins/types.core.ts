@@ -311,7 +311,14 @@ export type ChannelTtsVoiceDeliveryCapabilities = {
   synthesisTarget: "audio-file" | "voice-note";
   transcodesAudio?: boolean;
   audioFileFormats?: readonly string[];
-  /** Channel can carry final TTS text as a caption on the voice note. */
+  /**
+   * Channel can carry deferred final TTS text as a voice-note caption.
+   * When set, core suppresses live ACP block delivery and attaches the
+   * accumulated visible text to the final voice-note payload instead.
+   * Use only for channels whose voice-note send path supports captions.
+   * Core owns text-only fallback delivery when suppressed blocks abort or
+   * error before final TTS; incorrect opt-in suppresses live block messages.
+   */
   captionedFinalText?: boolean;
   /**
    * Optional preferred audio container the channel wants for voice-memo

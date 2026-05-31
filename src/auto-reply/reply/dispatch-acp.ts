@@ -495,6 +495,22 @@ export async function tryDispatchAcpReply(params: {
     abortSignal: params.abortSignal,
     runId: params.runId,
   });
+  const deliverSuppressedBlockTextFallback = async (): Promise<boolean> => {
+    if (!willUseCaptionedFinalTts) {
+      return false;
+    }
+    const text = delivery.getAccumulatedVisibleBlockText();
+    if (!text.trim()) {
+      return false;
+    }
+    if (delivery.hasDeliveredFinalReply()) {
+      return false;
+    }
+    if (delivery.hasDeliveredVisibleText() && !delivery.hasFailedVisibleTextDelivery()) {
+      return false;
+    }
+    return await delivery.deliver("final", { text }, { skipTts: true });
+  };
 
   const identityPendingBeforeTurn = isSessionIdentityPending(
     resolveSessionIdentityFromMeta(acpResolution.kind === "ready" ? acpResolution.meta : undefined),
@@ -638,6 +654,7 @@ export async function tryDispatchAcpReply(params: {
 
     await projector.flush(true);
     if (params.abortSignal?.aborted) {
+      queuedFinal = (await deliverSuppressedBlockTextFallback()) || queuedFinal;
       const counts = params.dispatcher.getQueuedCounts();
       delivery.applyRoutedCounts(counts);
       params.recordProcessed("completed", { reason: "acp_aborted" });
@@ -682,6 +699,7 @@ export async function tryDispatchAcpReply(params: {
     });
   } catch (err) {
     await projector.flush(true);
+    queuedFinal = (await deliverSuppressedBlockTextFallback()) || queuedFinal;
     const acpError = toAcpRuntimeError({
       error: err,
       fallbackCode: "ACP_TURN_FAILED",
