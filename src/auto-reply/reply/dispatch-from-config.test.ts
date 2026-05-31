@@ -6238,6 +6238,58 @@ describe("dispatchReplyFromConfig", () => {
     expect(finalPayload?.ttsSupplement?.visibleTextAlreadyDelivered).toBeUndefined();
   });
 
+  it("suppresses draft partial replies while deferring captioned final TTS voice payloads", async () => {
+    setNoAbort();
+    ttsMocks.state.synthesizeFinalAudio = true;
+    const telegramTestPlugin = createChannelTestPluginBase({
+      id: "telegram",
+      capabilities: {
+        chatTypes: ["direct"],
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            captionedFinalText: true,
+          },
+        },
+        blockStreaming: true,
+      },
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: telegramTestPlugin,
+        },
+      ]),
+    );
+    const dispatcher = createDispatcher();
+    const onPartialReply = vi.fn();
+    const ctx = buildTestCtx({ Provider: "telegram", Surface: "telegram" });
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+    ): Promise<ReplyPayload | undefined> => {
+      await opts?.onPartialReply?.({ text: "draft should not leak" });
+      await opts?.onBlockReply?.({ text: "Hello captioned voice." });
+      return undefined;
+    };
+
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg: emptyConfig,
+      dispatcher,
+      replyResolver,
+      replyOptions: { onPartialReply },
+    });
+
+    expect(onPartialReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+    const finalPayload = firstFinalReplyPayload(dispatcher);
+    expect(finalPayload?.text).toBe("Hello captioned voice.");
+    expect(finalPayload?.mediaUrl).toBe("https://example.com/tts-synth.opus");
+  });
+
   it("merges deferred block text into captioned final payloads with resolver text", async () => {
     setNoAbort();
     ttsMocks.state.synthesizeFinalAudio = true;

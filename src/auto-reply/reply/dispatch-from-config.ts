@@ -2469,7 +2469,9 @@ export async function dispatchReplyFromConfig(
             shouldSuppressToolErrorWarnings,
             typingPolicy: typing.typingPolicy,
             suppressTyping: typing.suppressTyping,
-            onPartialReply: wrapProgressCallback(params.replyOptions?.onPartialReply),
+            onPartialReply: shouldDeferTextForCaptionedFinalTts
+              ? undefined
+              : wrapProgressCallback(params.replyOptions?.onPartialReply),
             onReasoningStream: wrapProgressCallback(params.replyOptions?.onReasoningStream),
             onReasoningEnd: wrapProgressCallback(params.replyOptions?.onReasoningEnd),
             onAssistantMessageStart: wrapProgressCallback(
