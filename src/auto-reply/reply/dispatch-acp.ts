@@ -12,6 +12,7 @@ import {
   resolveSessionIdentityFromMeta,
 } from "../../acp/runtime/session-identity.js";
 import { resolveAgentDir, resolveAgentWorkspaceDir } from "../../agents/agent-scope.js";
+import { resolveChannelTtsVoiceDelivery } from "../../channels/plugins/index.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { TtsAutoMode } from "../../config/types.tts.js";
 import { logVerbose } from "../../globals.js";
@@ -436,6 +437,44 @@ export async function tryDispatchAcpReply(params: {
         }
       : undefined;
 
+  const normalizedDispatchChannel = normalizeOptionalLowercaseString(
+    params.ctx.OriginatingChannel ?? params.ctx.Surface ?? params.ctx.Provider,
+  );
+  const explicitDispatchAccountId = normalizeOptionalString(params.ctx.AccountId);
+  const dispatchChannels = params.cfg.channels as
+    | Record<string, { defaultAccount?: unknown } | undefined>
+    | undefined;
+  const defaultDispatchAccount =
+    normalizedDispatchChannel == null
+      ? undefined
+      : dispatchChannels?.[normalizedDispatchChannel]?.defaultAccount;
+  const effectiveDispatchAccountId =
+    explicitDispatchAccountId ?? normalizeOptionalString(defaultDispatchAccount);
+  const supportsCaptionedVoice =
+    resolveChannelTtsVoiceDelivery(params.ttsChannel)?.captionedFinalText ?? false;
+  const willUseCaptionedFinalTts = (() => {
+    const ttsMode = resolveConfiguredTtsMode(params.cfg, {
+      agentId: acpAgentId,
+      channelId: params.ttsChannel,
+      accountId: effectiveDispatchAccountId,
+    });
+    if (ttsMode !== "final") {
+      return false;
+    }
+    const ttsStatus = resolveStatusTtsSnapshot({
+      cfg: params.cfg,
+      sessionAuto: params.sessionTtsAuto,
+      agentId: acpAgentId,
+      channelId: params.ttsChannel,
+      accountId: effectiveDispatchAccountId,
+    });
+    const canAttemptFinalTts =
+      ttsStatus != null &&
+      ttsStatus.autoMode !== "off" &&
+      !(ttsStatus.autoMode === "inbound" && !params.inboundAudio);
+    return supportsCaptionedVoice && canAttemptFinalTts;
+  })();
+
   let queuedFinal = false;
   const delivery = createAcpDispatchDeliveryCoordinator({
     cfg: params.cfg,
@@ -447,6 +486,7 @@ export async function tryDispatchAcpReply(params: {
     sessionTtsAuto: params.sessionTtsAuto,
     ttsChannel: params.ttsChannel,
     suppressUserDelivery: params.suppressUserDelivery,
+    suppressBlockUserDelivery: willUseCaptionedFinalTts,
     suppressReplyLifecycle: params.suppressReplyLifecycle,
     shouldRouteToOriginating: params.shouldRouteToOriginating,
     originatingChannel: params.originatingChannel,
@@ -479,19 +519,6 @@ export async function tryDispatchAcpReply(params: {
         normalizeOptionalString(params.cfg.acp?.defaultAgent) ??
         resolveAgentIdFromSessionKey(canonicalSessionKey))
       : resolveAgentIdFromSessionKey(canonicalSessionKey);
-  const normalizedDispatchChannel = normalizeOptionalLowercaseString(
-    params.ctx.OriginatingChannel ?? params.ctx.Surface ?? params.ctx.Provider,
-  );
-  const explicitDispatchAccountId = normalizeOptionalString(params.ctx.AccountId);
-  const dispatchChannels = params.cfg.channels as
-    | Record<string, { defaultAccount?: unknown } | undefined>
-    | undefined;
-  const defaultDispatchAccount =
-    normalizedDispatchChannel == null
-      ? undefined
-      : dispatchChannels?.[normalizedDispatchChannel]?.defaultAccount;
-  const effectiveDispatchAccountId =
-    explicitDispatchAccountId ?? normalizeOptionalString(defaultDispatchAccount);
   const projector = createAcpReplyProjector({
     cfg: params.cfg,
     shouldSendToolSummaries: params.shouldSendToolSummaries,
@@ -644,7 +671,7 @@ export async function tryDispatchAcpReply(params: {
         sessionTtsAuto: params.sessionTtsAuto,
         ttsChannel: params.ttsChannel,
         ttsAccountId: effectiveDispatchAccountId,
-        supportsCaptionedVoice: params.ttsChannel === "telegram",
+        supportsCaptionedVoice,
         shouldEmitResolvedIdentityNotice,
       })) || queuedFinal;
 

@@ -190,6 +190,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
   sessionTtsAuto?: TtsAutoMode;
   ttsChannel?: string;
   suppressUserDelivery?: boolean;
+  suppressBlockUserDelivery?: boolean;
   suppressReplyLifecycle?: boolean;
   shouldRouteToOriginating: boolean;
   originatingChannel?: string;
@@ -379,6 +380,11 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     }
 
     if (params.suppressUserDelivery) {
+      return false;
+    }
+    if (kind === "block" && params.suppressBlockUserDelivery) {
+      // Captioned final TTS still needs block text accumulation, but live
+      // block delivery would duplicate the final voice-note caption.
       return false;
     }
 

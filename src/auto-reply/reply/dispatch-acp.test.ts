@@ -50,6 +50,14 @@ const channelPluginMocks = vi.hoisted(() => ({
       return undefined;
     }
     return {
+      capabilities: {
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+            ...(channelId === "telegram" ? { captionedFinalText: true } : {}),
+          },
+        },
+      },
       outbound: {
         shouldTreatDeliveredTextAsVisible: ({
           kind,
@@ -73,6 +81,12 @@ const ttsMocks = vi.hoisted(() => ({
     return params.payload;
   }),
   resolveTtsConfig: vi.fn((_cfg: OpenClawConfig) => ({ mode: "final" })),
+  resolveStatusTtsSnapshot: vi.fn(() => ({
+    autoMode: "always",
+    provider: "auto",
+    maxLength: 1500,
+    summarize: true,
+  })),
 }));
 
 const mediaUnderstandingMocks = vi.hoisted(() => ({
@@ -124,6 +138,10 @@ vi.mock("../../channels/plugins/index.js", () => ({
   getChannelPlugin: (channelId: string) => channelPluginMocks.getChannelPlugin(channelId),
   getLoadedChannelPlugin: (channelId: string) => channelPluginMocks.getChannelPlugin(channelId),
   normalizeChannelId: (channelId?: string | null) => channelId?.trim().toLowerCase() || null,
+  resolveChannelTtsVoiceDelivery: (channelId?: string | null) =>
+    channelId
+      ? channelPluginMocks.getChannelPlugin(channelId.trim().toLowerCase())?.capabilities.tts?.voice
+      : undefined,
 }));
 
 vi.mock("../../infra/outbound/message-action-runner.js", () => ({
@@ -135,12 +153,7 @@ vi.mock("./dispatch-acp-tts.runtime.js", () => ({
 }));
 
 vi.mock("../../tts/status-config.js", () => ({
-  resolveStatusTtsSnapshot: () => ({
-    autoMode: "always",
-    provider: "auto",
-    maxLength: 1500,
-    summarize: true,
-  }),
+  resolveStatusTtsSnapshot: () => ttsMocks.resolveStatusTtsSnapshot(),
 }));
 
 vi.mock("./dispatch-acp-media.runtime.js", () => ({
@@ -450,6 +463,13 @@ describe("tryDispatchAcpReply", () => {
     });
     ttsMocks.resolveTtsConfig.mockReset();
     ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    ttsMocks.resolveStatusTtsSnapshot.mockReset();
+    ttsMocks.resolveStatusTtsSnapshot.mockReturnValue({
+      autoMode: "always",
+      provider: "auto",
+      maxLength: 1500,
+      summarize: true,
+    });
     mediaUnderstandingMocks.applyMediaUnderstanding.mockReset();
     mediaUnderstandingMocks.applyMediaUnderstanding.mockResolvedValue(undefined);
     acpAttachmentBuffers.clear();
@@ -1890,7 +1910,9 @@ describe("tryDispatchAcpReply", () => {
     expect(finalPayload.spokenText).toBe("WebChat ACP block reply.");
     expect(finalPayload.trustedLocalMedia).toBe(true);
     expect(finalPayload.text).toBeUndefined();
-    expect((finalPayload.ttsSupplement as Record<string, unknown>)?.visibleTextAlreadyDelivered).toBe(true);
+    expect(
+      (finalPayload.ttsSupplement as Record<string, unknown>)?.visibleTextAlreadyDelivered,
+    ).toBe(true);
     expect(result?.queuedFinal).toBe(true);
   });
 
@@ -1929,10 +1951,36 @@ describe("tryDispatchAcpReply", () => {
     });
 
     expect(settleCalledBeforeTts).toBe(false);
+    expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
     expect(dispatcherCall(dispatcher.sendFinalReply).mediaUrl).toBe(
       "/tmp/openclaw-media/tts-order.ogg",
     );
     expect(dispatcherCall(dispatcher.sendFinalReply).text).toBe("Order test.");
+  });
+
+  it("delivers telegram blocks when final TTS mode is configured but TTS auto is off", async () => {
+    setReadyAcpResolution();
+    ttsMocks.resolveTtsConfig.mockReturnValue({ mode: "final" });
+    ttsMocks.resolveStatusTtsSnapshot.mockReturnValue(null);
+    mockVisibleTextTurn("Auto off text.");
+    const cfg = createAcpTestConfig({
+      acp: {
+        enabled: true,
+        stream: { deliveryMode: "live", coalesceIdleMs: 0, maxChunkChars: 64 },
+      },
+    });
+
+    const { dispatcher } = createDispatcher();
+    await runDispatch({
+      bodyForAgent: "reply",
+      cfg,
+      dispatcher,
+      ttsChannel: "telegram",
+      ctxOverrides: { Provider: "telegram", Surface: "telegram" },
+    });
+
+    expect(dispatcher.sendBlockReply).toHaveBeenCalledWith({ text: "Auto off text." });
+    expect(ttsMocks.maybeApplyTtsToPayload).not.toHaveBeenCalled();
   });
 
   it("settles visible text eagerly for non-caption voice channels even when TTS mode is final", async () => {
@@ -1967,6 +2015,7 @@ describe("tryDispatchAcpReply", () => {
     });
 
     expect(textSettledBeforeTts).toBe(true);
+    expect(dispatcher.sendBlockReply).toHaveBeenCalledWith({ text: "Eager discord." });
   });
 
   it("settles visible text as fallback when TTS final synthesis fails", async () => {
