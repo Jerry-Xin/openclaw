@@ -475,6 +475,23 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
       !lane.finalized &&
       text.trim().length > 0
     ) {
+      const ttsSupplement = getReplyPayloadTtsSupplement(payload);
+      if (
+        payload.audioAsVoice === true &&
+        ttsSupplement &&
+        ttsSupplement.visibleTextAlreadyDelivered !== true
+      ) {
+        await clearUnfinalizedStream(lane);
+        const delivered = await params.sendPayload(params.applyTextToPayload(payload, text), {
+          durable: true,
+        });
+        if (delivered) {
+          lane.finalized = true;
+          params.markDelivered();
+        }
+        return delivered ? result("sent") : result("skipped");
+      }
+
       const finalizedPreview = await streamText(
         laneName,
         lane,

@@ -514,6 +514,74 @@ describe("createLaneTextDeliverer", () => {
     );
   });
 
+  it("sends captioned TTS voice media as one final payload after clearing the stream", async () => {
+    const harness = createHarness({ answerMessageId: 999 });
+    harness.lanes.answer.hasStreamedMessage = true;
+
+    const result = await harness.deliverLaneText({
+      laneName: "answer",
+      text: "resolved caption",
+      payload: {
+        text: "stale caption",
+        mediaUrl: "https://example.com/tts.ogg",
+        audioAsVoice: true,
+        ttsSupplement: { spokenText: "resolved caption" },
+      },
+      infoKind: "final",
+    });
+
+    expect(result.kind).toBe("sent");
+    expect(harness.clearDraftLane).toHaveBeenCalledTimes(1);
+    expect(harness.stopDraftLane).not.toHaveBeenCalled();
+    expect(harness.sendPayload).toHaveBeenCalledTimes(1);
+    expect(harness.sendPayload).toHaveBeenCalledWith(
+      {
+        text: "resolved caption",
+        mediaUrl: "https://example.com/tts.ogg",
+        audioAsVoice: true,
+        ttsSupplement: { spokenText: "resolved caption" },
+      },
+      { durable: true },
+    );
+    expect(harness.markDelivered).toHaveBeenCalledTimes(1);
+    expect(harness.lanes.answer.finalized).toBe(true);
+  });
+
+  it("keeps split delivery when TTS voice text was already delivered", async () => {
+    const harness = createHarness({ answerMessageId: 999 });
+    harness.lanes.answer.hasStreamedMessage = true;
+
+    const result = await harness.deliverLaneText({
+      laneName: "answer",
+      text: "resolved caption",
+      payload: {
+        text: "resolved caption",
+        mediaUrl: "https://example.com/tts.ogg",
+        audioAsVoice: true,
+        ttsSupplement: {
+          spokenText: "resolved caption",
+          visibleTextAlreadyDelivered: true,
+        },
+      },
+      infoKind: "final",
+    });
+
+    expectPreviewFinalized(result);
+    expect(harness.clearDraftLane).not.toHaveBeenCalled();
+    expect(harness.sendPayload).toHaveBeenCalledWith(
+      {
+        mediaUrl: "https://example.com/tts.ogg",
+        audioAsVoice: true,
+        spokenText: "resolved caption",
+        ttsSupplement: {
+          spokenText: "resolved caption",
+          visibleTextAlreadyDelivered: true,
+        },
+      },
+      { durable: true },
+    );
+  });
+
   it("uses retained final preview text for late voice media fallback", async () => {
     const fullAnswer =
       "A longer transcript-backed answer that has enough continuation text to avoid falling back to the truncated snapshot.";
