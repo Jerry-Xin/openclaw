@@ -1593,6 +1593,57 @@ describe("initSessionState reset policy", () => {
     expect(persisted[sessionKey]?.runtimeMs).toBe(9_000);
   });
 
+  it("recovers failed group sessions without rotating the transcript", async () => {
+    vi.setSystemTime(new Date(2026, 0, 18, 5, 30, 0));
+    const root = await makeCaseDir("openclaw-reset-failed-entry-");
+    const storePath = path.join(root, "sessions.json");
+    const sessionKey = "agent:main:telegram:group:-1001";
+    const existingSessionId = "failed-entry-old";
+    await writeSessionStoreFast(storePath, {
+      [sessionKey]: {
+        sessionId: existingSessionId,
+        updatedAt: Date.now(),
+        startedAt: Date.now() - 10_000,
+        endedAt: Date.now() - 1_000,
+        runtimeMs: 9_000,
+        status: "failed",
+        abortedLastRun: true,
+        chatType: "group",
+      },
+    });
+
+    const cfg = { session: { store: storePath } } as OpenClawConfig;
+    const result = await initSessionState({
+      ctx: {
+        Body: "@openclaw hello",
+        RawBody: "@openclaw hello",
+        CommandBody: "@openclaw hello",
+        SessionKey: sessionKey,
+        ChatType: "group",
+        Provider: "telegram",
+        BotUsername: "openclaw",
+      },
+      cfg,
+      commandAuthorized: true,
+    });
+
+    expect(result.isNewSession).toBe(false);
+    expect(result.sessionId).toBe(existingSessionId);
+    expect(result.abortedLastRun).toBe(false);
+    expect(result.sessionEntry.abortedLastRun).toBeUndefined();
+
+    const persisted = JSON.parse(await fs.readFile(storePath, "utf-8")) as Record<
+      string,
+      SessionEntry
+    >;
+    expect(persisted[sessionKey]?.sessionId).toBe(existingSessionId);
+    expect(persisted[sessionKey]?.status).toBeUndefined();
+    expect(persisted[sessionKey]?.startedAt).toBeUndefined();
+    expect(persisted[sessionKey]?.endedAt).toBeUndefined();
+    expect(persisted[sessionKey]?.runtimeMs).toBeUndefined();
+    expect(persisted[sessionKey]?.abortedLastRun).toBeUndefined();
+  });
+
   it("keeps the existing stale session for /reset soft", async () => {
     vi.setSystemTime(new Date(2026, 0, 18, 5, 30, 0));
     const root = await makeCaseDir("openclaw-reset-soft-stale-");

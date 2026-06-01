@@ -433,7 +433,7 @@ export type ChannelTurnStage =
 /** Structured channel turn log event. */
 export type ChannelTurnLogEvent = {
   stage: ChannelTurnStage;
-  event: "start" | "done" | "drop" | "handled" | "error";
+  event: "start" | "done" | "drop" | "handled" | "error" | "warning";
   channel: string;
   accountId?: string;
   messageId?: string;

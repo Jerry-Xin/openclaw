@@ -153,6 +153,21 @@ function hasProviderOwnedSession(entry: SessionEntry | undefined): boolean {
   return Boolean(provider && getCliSessionBinding(entry, provider));
 }
 
+function isRecoverableTerminalSessionStatus(status: SessionEntry["status"] | undefined): boolean {
+  return status === "failed" || status === "timeout" || status === "killed";
+}
+
+function recoverTerminalSessionEntryForVisibleTurn(entry: SessionEntry): SessionEntry {
+  return {
+    ...entry,
+    status: undefined,
+    startedAt: undefined,
+    endedAt: undefined,
+    runtimeMs: undefined,
+    abortedLastRun: undefined,
+  };
+}
+
 export type SessionInitResult = {
   sessionCtx: TemplateContext;
   sessionEntry: SessionEntry;
@@ -466,7 +481,14 @@ export async function initSessionState(params: {
         skipConfiguredFallbackWhenActiveSessionNonAcp: false,
       }) ?? "",
     );
+  const recoverTerminalVisibleEntry =
+    canReuseExistingEntry &&
+    !isSystemEvent &&
+    !resetTriggered &&
+    (entryFreshness?.fresh ?? false) &&
+    isRecoverableTerminalSessionStatus(entry?.status);
   const freshEntry =
+    recoverTerminalVisibleEntry ||
     (isSystemEvent && canReuseExistingEntry) ||
     (entryFreshness?.fresh ?? false) ||
     (softResetAllowed && canReuseExistingEntry);
@@ -489,22 +511,28 @@ export async function initSessionState(params: {
     clearSessionResetRuntimeState([sessionKey, previousSessionEntry.sessionId]);
   }
 
-  if (!isNewSession && freshEntry && canReuseExistingEntry) {
-    sessionId = entry.sessionId;
-    systemSent = entry.systemSent ?? false;
-    abortedLastRun = entry.abortedLastRun ?? false;
-    persistedThinking = entry.thinkingLevel;
-    persistedVerbose = entry.verboseLevel;
-    persistedTrace = entry.traceLevel;
-    persistedReasoning = entry.reasoningLevel;
-    persistedTtsAuto = entry.ttsAuto;
-    persistedModelOverride = entry.modelOverride;
-    persistedProviderOverride = entry.providerOverride;
-    persistedModelOverrideSource = entry.modelOverrideSource;
-    persistedAuthProfileOverride = entry.authProfileOverride;
-    persistedAuthProfileOverrideSource = entry.authProfileOverrideSource;
-    persistedAuthProfileOverrideCompactionCount = entry.authProfileOverrideCompactionCount;
-    persistedLabel = entry.label;
+  const recoveredTerminalEntry =
+    entry && recoverTerminalVisibleEntry
+      ? recoverTerminalSessionEntryForVisibleTurn(entry)
+      : undefined;
+  const reusableEntry = recoveredTerminalEntry ?? entry;
+
+  if (!isNewSession && freshEntry && canReuseExistingEntry && reusableEntry) {
+    sessionId = reusableEntry.sessionId;
+    systemSent = reusableEntry.systemSent ?? false;
+    abortedLastRun = reusableEntry.abortedLastRun ?? false;
+    persistedThinking = reusableEntry.thinkingLevel;
+    persistedVerbose = reusableEntry.verboseLevel;
+    persistedTrace = reusableEntry.traceLevel;
+    persistedReasoning = reusableEntry.reasoningLevel;
+    persistedTtsAuto = reusableEntry.ttsAuto;
+    persistedModelOverride = reusableEntry.modelOverride;
+    persistedProviderOverride = reusableEntry.providerOverride;
+    persistedModelOverrideSource = reusableEntry.modelOverrideSource;
+    persistedAuthProfileOverride = reusableEntry.authProfileOverride;
+    persistedAuthProfileOverrideSource = reusableEntry.authProfileOverrideSource;
+    persistedAuthProfileOverrideCompactionCount = reusableEntry.authProfileOverrideCompactionCount;
+    persistedLabel = reusableEntry.label;
   } else {
     sessionId = crypto.randomUUID();
     isNewSession = true;
@@ -547,7 +575,7 @@ export async function initSessionState(params: {
     }
   }
 
-  const baseEntry = !isNewSession && freshEntry ? entry : undefined;
+  const baseEntry = !isNewSession && freshEntry ? reusableEntry : undefined;
   const usageFamilyKey = previousSessionEntry
     ? (previousSessionEntry.usageFamilyKey ?? sessionKey)
     : baseEntry?.usageFamilyKey;
@@ -637,7 +665,7 @@ export async function initSessionState(params: {
       : (baseEntry?.sessionStartedAt ?? lifecycleTimestamps.sessionStartedAt),
     lastInteractionAt: isSystemEvent ? baseEntry?.lastInteractionAt : now,
     systemSent,
-    abortedLastRun,
+    abortedLastRun: recoveredTerminalEntry ? undefined : abortedLastRun,
     // Persist previously stored thinking/verbose levels when present.
     thinkingLevel: persistedThinking ?? baseEntry?.thinkingLevel,
     verboseLevel: persistedVerbose ?? baseEntry?.verboseLevel,

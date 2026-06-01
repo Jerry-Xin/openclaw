@@ -160,6 +160,10 @@ import type {
 
 const RESET_COMMAND_RE = /^\/(new|reset)(?:\s+([\s\S]*))?$/i;
 
+function isRecoverableTerminalSessionStatus(status: SessionEntry["status"] | undefined): boolean {
+  return status === "failed" || status === "timeout" || status === "killed";
+}
+
 type AgentSendSessionLifecycleTransition = {
   cfg: OpenClawConfig;
   sessionKey: string;
@@ -1640,6 +1644,10 @@ export const agentHandlers: GatewayRequestHandlers = {
               policy: resetPolicy,
             })
           : undefined;
+        const visibleRequest =
+          request.bootstrapContextRunKind !== "cron" &&
+          request.bootstrapContextRunKind !== "heartbeat" &&
+          !request.internalEvents?.length;
         let failedSessionTranscriptMissing = false;
         if (entry?.status === "failed" && entry.sessionId?.trim()) {
           try {
@@ -1658,6 +1666,8 @@ export const agentHandlers: GatewayRequestHandlers = {
           Boolean(entry?.sessionId) &&
           (freshness?.fresh ?? false) &&
           !failedSessionTranscriptMissing;
+        const recoverTerminalSession =
+          canReuseSession && visibleRequest && isRecoverableTerminalSessionStatus(entry?.status);
         const usableRequestedSessionId =
           requestedSessionId && (!entry?.sessionId || canReuseSession)
             ? requestedSessionId
@@ -1670,10 +1680,7 @@ export const agentHandlers: GatewayRequestHandlers = {
           (!canReuseSession && !usableRequestedSessionId) ||
           Boolean(usableRequestedSessionId && entry?.sessionId !== usableRequestedSessionId);
         const rotatedSessionId = Boolean(entry?.sessionId && entry.sessionId !== sessionId);
-        const touchInteraction =
-          request.bootstrapContextRunKind !== "cron" &&
-          request.bootstrapContextRunKind !== "heartbeat" &&
-          !request.internalEvents?.length;
+        const touchInteraction = visibleRequest;
         const sessionAgent = canonicalSessionAgentId;
         type AgentSessionPatchBuild = {
           patch: Partial<SessionEntry>;
@@ -1776,6 +1783,10 @@ export const agentHandlers: GatewayRequestHandlers = {
           );
           const patchSessionId = freshSessionRotatedSinceLoad ? freshEntry?.sessionId : sessionId;
           const shouldClearRotatedState = rotatedSessionId && !freshSessionRotatedSinceLoad;
+          const shouldClearTerminalState =
+            recoverTerminalSession &&
+            !freshSessionRotatedSinceLoad &&
+            patchSessionId === entry?.sessionId;
           const patch: Partial<SessionEntry> = {
             sessionId: patchSessionId,
             updatedAt: now,
@@ -1802,14 +1813,14 @@ export const agentHandlers: GatewayRequestHandlers = {
             groupChannel: nextGroup.groupChannel,
             space: nextGroup.groupSpace,
             ...(pluginOwnerId ? { pluginOwnerId } : {}),
-            ...(shouldClearRotatedState
+            ...(shouldClearRotatedState || shouldClearTerminalState
               ? {
                   status: undefined,
                   startedAt: undefined,
                   endedAt: undefined,
                   runtimeMs: undefined,
                   abortedLastRun: undefined,
-                  sessionFile: undefined,
+                  ...(shouldClearRotatedState ? { sessionFile: undefined } : {}),
                 }
               : {}),
           };
