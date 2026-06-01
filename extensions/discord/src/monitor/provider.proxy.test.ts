@@ -383,6 +383,8 @@ describe("createDiscordGatewayPlugin", () => {
     expect(webSocketSpy).toHaveBeenCalledWith("wss://gateway.discord.gg", {
       agent: getLastAgent(),
       handshakeTimeout: 30_000,
+      maxBufferedChunks: 0,
+      maxFragments: 0,
     });
     expect(wsProxyAgentSpy).not.toHaveBeenCalled();
   });
@@ -500,6 +502,8 @@ describe("createDiscordGatewayPlugin", () => {
     expect(webSocketSpy).toHaveBeenCalledWith("wss://gateway.discord.gg", {
       agent: getLastProxyAgent(),
       handshakeTimeout: 30_000,
+      maxBufferedChunks: 0,
+      maxFragments: 0,
     });
     expect(runtime.log).toHaveBeenCalledWith("discord: gateway proxy enabled");
     expect(runtime.error).not.toHaveBeenCalled();
