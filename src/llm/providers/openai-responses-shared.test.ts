@@ -1,7 +1,13 @@
 import type { Tool as OpenAIResponsesTool } from "openai/resources/responses/responses.js";
+import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
 import { describe, expect, it } from "vitest";
 import type { Context, Model, Tool } from "../types.js";
-import { convertResponsesMessages } from "./openai-responses-shared.js";
+import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import {
+  convertResponsesMessages,
+  createResponsesAssistantOutput,
+  runResponsesStreamLifecycle,
+} from "./openai-responses-shared.js";
 import { convertResponsesTools } from "./openai-responses-tools.js";
 
 type ResponsesFunctionTool = Extract<OpenAIResponsesTool, { type: "function" }>;
@@ -30,6 +36,44 @@ const proxyOpenAIModel = {
   name: "Custom Model",
   baseUrl: "https://proxy.example.com/v1",
 } satisfies Model<"openai-responses">;
+
+describe("runResponsesStreamLifecycle", () => {
+  it("disables OpenAI SDK retries for streaming requests by default", async () => {
+    const capturedOptions: unknown[] = [];
+    async function* emptyStream(): AsyncIterable<ResponseStreamEvent> {}
+    const stream = new AssistantMessageEventStream();
+    const output = createResponsesAssistantOutput(nativeOpenAIModel);
+
+    await runResponsesStreamLifecycle({
+      stream,
+      model: nativeOpenAIModel,
+      output,
+      createClient: () => ({
+        responses: {
+          create: (_params, options) => {
+            capturedOptions.push(options);
+            return {
+              withResponse: async () => ({
+                data: emptyStream(),
+                response: new Response(null, { status: 200 }),
+              }),
+            };
+          },
+        },
+      }),
+      buildParams: () => ({
+        model: nativeOpenAIModel.id,
+        input: "hello",
+        stream: true,
+      }),
+      formatError: (error) => (error instanceof Error ? error.message : String(error)),
+    });
+    const result = await stream.result();
+
+    expect(result.stopReason).toBe("stop");
+    expect(capturedOptions).toEqual([{ maxRetries: 0 }]);
+  });
+});
 
 describe("convertResponsesTools", () => {
   it("enables native strict OpenAI Responses tools and normalizes schemas", () => {

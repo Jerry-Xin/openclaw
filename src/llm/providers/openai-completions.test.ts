@@ -14,13 +14,15 @@ type OpenAICompatibleChatCompletionChunk = Omit<DeepPartial<ChatCompletionChunk>
 };
 
 const mockChunksRef: { chunks: OpenAICompatibleChatCompletionChunk[] } = { chunks: [] };
+const mockRequestOptionsRef: { options: unknown[] } = { options: [] };
 
 vi.mock("openai", () => {
   class MockOpenAI {
     chat = {
       completions: {
-        create: () => ({
+        create: (_params: unknown, options: unknown) => ({
           withResponse: async () => {
+            mockRequestOptionsRef.options.push(options);
             async function* generate() {
               for (const chunk of mockChunksRef.chunks) {
                 yield chunk;
@@ -111,6 +113,20 @@ function makeFinishChunk(
 }
 
 describe("OpenAI-compatible completions params", () => {
+  it("disables OpenAI SDK retries for streaming requests by default", async () => {
+    mockChunksRef.chunks = [makeTextChunk("Hello"), makeFinishChunk("stop")];
+    mockRequestOptionsRef.options = [];
+
+    const stream = streamOpenAICompletions(model, context, {
+      apiKey: "sk-test",
+    });
+    const result = await stream.result();
+
+    expect(result.stopReason).toBe("stop");
+    expect(mockRequestOptionsRef.options).toHaveLength(1);
+    expect(mockRequestOptionsRef.options[0]).toMatchObject({ maxRetries: 0 });
+  });
+
   it("clamps requested max tokens to the model output cap", async () => {
     let capturedMaxTokens: unknown;
     const stream = streamOpenAICompletions(createModel(32_000), context, {
