@@ -177,6 +177,7 @@ export function createAcpReplyProjector(params: {
   onProgress?: () => void;
   provider?: string;
   accountId?: string;
+  deferLiveTextUntilFinalFlush?: boolean;
 }): AcpReplyProjector {
   const settings = resolveAcpProjectionSettings(params.cfg);
   const streaming = resolveAcpStreamingConfig({
@@ -467,11 +468,13 @@ export function createAcpReplyProjector(params: {
         lastVisibleOutputTail = accepted.slice(-1);
         if (settings.deliveryMode === "live") {
           liveBufferText += accepted;
-          if (shouldFlushLiveBufferOnBoundary(liveBufferText)) {
-            clearLiveIdleTimer();
-            flushLiveBuffer({ force: true });
-          } else {
-            scheduleLiveIdleFlush();
+          if (!params.deferLiveTextUntilFinalFlush) {
+            if (shouldFlushLiveBufferOnBoundary(liveBufferText)) {
+              clearLiveIdleTimer();
+              flushLiveBuffer({ force: true });
+            } else {
+              scheduleLiveIdleFlush();
+            }
           }
         } else {
           finalOnlyOutputText += accepted;

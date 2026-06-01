@@ -749,6 +749,13 @@ When `messages.tts.auto` is enabled, OpenClaw:
   after the text stream completes; the generated media goes through the same
   channel media normalization as normal reply attachments.
 
+Channels that declare captioned final TTS delivery can send the final reply as
+one voice note with the visible text attached as a caption. In that path,
+OpenClaw holds back live text blocks and partial streaming while synthesis runs.
+If synthesis fails, it sends the held-back text as a normal message. In
+`auto: "tagged"` mode, directive-only replies can use the same voice plus
+caption delivery; plain replies without directives still stream text normally.
+
 If the reply exceeds `maxLength` and summary is off (or no API key for the
 summary model), audio is skipped and the normal text reply is sent.
 

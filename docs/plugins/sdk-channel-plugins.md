@@ -40,6 +40,16 @@ adapter declares which durable final-send capabilities the native transport
 actually supports and points text/media sends at the same transport functions as
 the legacy `outbound` adapter. Only declare a capability when a contract test
 proves the native side effect and returned receipt.
+For TTS voice delivery, declare
+`capabilities.tts.voice.captionedFinalText: true` only when the native voice or
+audio send API can attach visible text as a caption on the same voice message,
+such as Telegram `sendVoice` with `caption`. This capability lets final-mode
+TTS deliver one voice note with a caption instead of a text message followed by
+audio. While synthesis is pending, core suppresses live block text and partial
+streaming so the text does not flash before the voice note arrives. If synthesis
+fails, core sends the suppressed text as a regular message so content is not
+lost. Do not declare this capability for transports that cannot send captioned
+voice messages; users would see delayed text and no voice.
 For the full API contract, examples, capability matrix, receipt rules, live
 preview finalization, receive ack policy, tests, and migration table, see
 [Channel outbound API](/plugins/sdk-channel-outbound).
