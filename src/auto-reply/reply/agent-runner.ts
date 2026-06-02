@@ -2087,6 +2087,7 @@ export async function runReplyAgent(params: {
     // Prepend verbose operational notices. Model fallback notices are prepared
     // earlier so they pass through normal reply threading and stream-dedupe.
     let finalPayloads = guardedReplyPayloads;
+    const assistantPayloadCount = guardedReplyPayloads.length;
     const prefixNotices: ReplyPayload[] = [];
 
     if (verboseEnabled && activeIsNewSession) {
@@ -2321,14 +2322,22 @@ export async function runReplyAgent(params: {
             activeSessionEntry?.channel,
           finalTextLength: assistantFinalText.trim().length,
         });
-        // #85714: Mark final payloads for delivery despite source reply suppression,
-        // so dispatch-from-config delivers the stranded reply in this turn.
-        for (const payload of finalPayloads) {
-          markReplyPayloadForSourceSuppressionDelivery(payload);
+        // #85714: Only mark assistant-content payloads for delivery bypass.
+        // Skip prefix notices (verbose/compaction) and trailing diagnostics
+        // (plugin status, raw trace, usage) to prevent diagnostic leakage.
+        const assistantStartIdx = prefixPayloads.length;
+        for (let i = assistantStartIdx; i < assistantStartIdx + assistantPayloadCount; i++) {
+          if (finalPayloads[i]) {
+            markReplyPayloadForSourceSuppressionDelivery(finalPayloads[i]);
+          }
         }
       }
       const pendingText =
-        sourceReplyPolicy.suppressDelivery && !isStrandedReply ? "" : finalDeliveryText;
+        sourceReplyPolicy.suppressDelivery && !isStrandedReply
+          ? ""
+          : isStrandedReply
+            ? assistantFinalText
+            : finalDeliveryText;
       const agentId = followupRun.run.agentId;
       const heartbeatAgentCfg = agentId ? resolveAgentConfig(cfg, agentId)?.heartbeat : undefined;
       const heartbeatAckMaxChars = Math.max(

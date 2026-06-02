@@ -24,11 +24,11 @@ import {
   registerMemoryCapability,
   type MemoryFlushPlanResolver,
 } from "../../plugins/memory-state.js";
+import { getReplyPayloadMetadata } from "../reply-payload.js";
 import type { TemplateContext } from "../templating.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
 import { scheduleFollowupDrain } from "./queue.js";
 import { testing as replyRunRegistryTesting, replyRunRegistry } from "./reply-run-registry.js";
-import { getReplyPayloadMetadata } from "../reply-payload.js";
 import { createMockTypingController } from "./test-helpers.js";
 
 function createCliBackendTestConfig() {
@@ -3005,6 +3005,8 @@ describe("runReplyAgent private message_tool_only final warning (#85714)", () =>
     finalAssistantText?: string;
     payloadText?: string;
     successfulCronAdds?: number;
+    resolvedVerboseLevel?: string;
+    isNewSession?: boolean;
   }) {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-stranded-"));
     const storePath = path.join(tmp, "sessions.json");
@@ -3082,8 +3084,8 @@ describe("runReplyAgent private message_tool_only final warning (#85714)", () =>
       storePath,
       defaultModel: "anthropic/claude-opus-4-6",
       agentCfgContextTokens: 200_000,
-      resolvedVerboseLevel: "off",
-      isNewSession: false,
+      resolvedVerboseLevel: params.resolvedVerboseLevel ?? "off",
+      isNewSession: params.isNewSession ?? false,
       blockStreamingEnabled: false,
       resolvedBlockStreamingBreak: "message_end",
       shouldInjectGroupIntro: false,
@@ -3149,13 +3151,37 @@ describe("runReplyAgent private message_tool_only final warning (#85714)", () =>
     expect(getReplyPayloadMetadata(payload!)?.deliverDespiteSourceReplySuppression).toBe(true);
   });
 
+  it("does not mark trailing diagnostic payloads for delivery despite source suppression (#85714)", async () => {
+    // Verbose + new session produces a prefix notice ("🧭 New session: …")
+    // prepended before the assistant payload. Only assistant content should
+    // carry deliverDespiteSourceReplySuppression; the prefix notice must not.
+    const { result, storePath, sessionKey } = await runPrivateFinalCase({
+      resolvedVerboseLevel: "on",
+      isNewSession: true,
+    });
+    const payloads = Array.isArray(result) ? result : [result];
+    expect(payloads.length).toBeGreaterThanOrEqual(2);
+    // First payload is the verbose prefix notice — must NOT be marked.
+    const prefixPayload = payloads[0];
+    expect(
+      getReplyPayloadMetadata(prefixPayload as object)?.deliverDespiteSourceReplySuppression,
+    ).not.toBe(true);
+    // Second payload is the assistant content — MUST be marked.
+    const assistantPayload = payloads[1];
+    expect(
+      getReplyPayloadMetadata(assistantPayload as object)?.deliverDespiteSourceReplySuppression,
+    ).toBe(true);
+    // pendingFinalDeliveryText stores only the assistant answer, not diagnostics.
+    const store = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(store[sessionKey]?.pendingFinalDeliveryText).toContain("Here is the answer");
+    expect(store[sessionKey]?.pendingFinalDeliveryText).not.toContain("🧭");
+  });
+
   it("does not mark short replies for delivery despite source suppression", async () => {
     const { result } = await runPrivateFinalCase({ finalAssistantText: "Short." });
     const payload = result && typeof result === "object" ? result : undefined;
     if (payload) {
-      expect(
-        getReplyPayloadMetadata(payload)?.deliverDespiteSourceReplySuppression,
-      ).not.toBe(true);
+      expect(getReplyPayloadMetadata(payload)?.deliverDespiteSourceReplySuppression).not.toBe(true);
     }
   });
 
