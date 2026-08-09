@@ -1,5 +1,5 @@
 import { Value } from "typebox/value";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ConversationListResultSchema,
   ConversationSendResultSchema,
@@ -25,6 +25,33 @@ import { resetTurnSendLedgerForTest } from "./turn-send-ledger.js";
 afterEach(() => {
   resetTurnSendLedgerForTest();
   resetPluginRuntimeStateForTest();
+});
+
+// buildTurnSendTargetKey canonicalizes the target through the channel plugin's
+// provider normalizer. Register the reef fixture as a loaded plugin so that read
+// resolves from the loaded registry instead of falling through to bundled channel
+// runtime materialization, which would cold-load every bundled channel under tsx.
+function registerReefTestPlugin() {
+  const plugin = {
+    id: "reef",
+    meta: {
+      id: "reef",
+      label: "Reef",
+      selectionLabel: "Reef",
+      docsPath: "/channels/reef",
+      blurb: "reef test plugin",
+    },
+    capabilities: { chatTypes: ["direct", "group"], media: true },
+    config: { listAccountIds: () => ["default"], resolveAccount: () => ({}) },
+    actions: {
+      describeMessageTool: () => ({ actions: ["send"], capabilities: [] }),
+    },
+  } as unknown as ChannelPlugin;
+  setActivePluginRegistry(createTestRegistry([{ pluginId: "reef", source: "test", plugin }]));
+}
+
+beforeEach(() => {
+  registerReefTestPlugin();
 });
 
 const conversation = {
@@ -333,19 +360,58 @@ describe("conversations_send per-turn send budget", () => {
     expect(second.details).toMatchObject({ status: "sent" });
   });
 
-  it("does not count a suppressed Gateway result", async () => {
+  it.each(["suppressed", "queued", "unknown"] as const)(
+    "does not count a %s (unconfirmed) Gateway result",
+    async (status) => {
+      const deps = createDeps();
+      deps.callGatewayMock.mockResolvedValueOnce({
+        status,
+        conversationRef: conversation.conversationRef,
+        channel: "reef",
+      } as never);
+      const tool = createConversationsSendTool(budgetOptions, deps);
+      const args = { conversationRef: conversation.conversationRef, message: "hi" };
+      await tool.execute("c1", args);
+      const second = await tool.execute("c2", args);
+      // Only a confirmed "sent" counts. This first send was not confirmed delivered
+      // (queued is enqueue-only; suppressed/unknown never reached the peer), so the
+      // following send is the first success and draws no nudge.
+      expect(softNotice(second)).toBeUndefined();
+    },
+  );
+
+  it("counts a queued-then-sent pair as a single first delivery under the hard cap", async () => {
     const deps = createDeps();
+    // First send is only enqueued (unconfirmed): it must not consume the cap.
     deps.callGatewayMock.mockResolvedValueOnce({
-      status: "suppressed",
+      status: "queued",
       conversationRef: conversation.conversationRef,
       channel: "reef",
+      queueId: "queue-1",
     } as never);
-    const tool = createConversationsSendTool(budgetOptions, deps);
+    const tool = createConversationsSendTool(
+      { ...budgetOptions, config: { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } } },
+      deps,
+    );
     const args = { conversationRef: conversation.conversationRef, message: "hi" };
-    await tool.execute("c1", args);
-    const second = await tool.execute("c2", args);
-    // The suppressed first send did not reach the peer, so this is the first success.
-    expect(softNotice(second)).toBeUndefined();
+    const queued = await tool.execute("c1", args);
+    // Queued does not count, so the cap is untouched and the Gateway was still reached.
+    expect(queued.details).toMatchObject({ status: "queued" });
+    expect(softNotice(queued)).toBeUndefined();
+    expect(deps.callGatewayMock).toHaveBeenCalledTimes(1);
+    // The subsequent confirmed "sent" is the first counted delivery, so it is admitted.
+    const sent = await tool.execute("c2", args);
+    expect(sent.details).toMatchObject({ status: "sent" });
+    expect(softNotice(sent)).toBeUndefined();
+    expect(deps.callGatewayMock).toHaveBeenCalledTimes(2);
+    // With the cap now reached by that one confirmed delivery, a third send is blocked
+    // before the Gateway call.
+    const blocked = await tool.execute("c3", args);
+    expect(blocked.details).toMatchObject({
+      status: "suppressed",
+      reason: "turn_send_budget_exhausted",
+    });
+    expect(deps.callGatewayMock).toHaveBeenCalledTimes(2);
   });
 
   it("resets the count for a new turn (new runId)", async () => {
@@ -427,27 +493,7 @@ describe("message and conversations_send share the per-turn budget", () => {
       .find((text) => text.includes("already sent"));
   }
 
-  function registerReefPlugin() {
-    const plugin = {
-      id: "reef",
-      meta: {
-        id: "reef",
-        label: "Reef",
-        selectionLabel: "Reef",
-        docsPath: "/channels/reef",
-        blurb: "reef test plugin",
-      },
-      capabilities: { chatTypes: ["direct", "group"], media: true },
-      config: { listAccountIds: () => ["default"], resolveAccount: () => ({}) },
-      actions: {
-        describeMessageTool: () => ({ actions: ["send"], capabilities: [] }),
-      },
-    } as unknown as ChannelPlugin;
-    setActivePluginRegistry(createTestRegistry([{ pluginId: "reef", source: "test", plugin }]));
-  }
-
   function createMixedMessageTool(config: Record<string, unknown>) {
-    registerReefPlugin();
     return createMessageTool({
       currentChannelProvider: "reef",
       currentChannelId: "reef:operator",
@@ -518,7 +564,6 @@ describe("message and conversations_send share the per-turn budget", () => {
   // ref's target. Its ledger key must equal the one conversations_send builds for
   // the same peer, or alternating them evades the cap.
   function createSourceReplyMessageTool(config: Record<string, unknown>) {
-    registerReefPlugin();
     return createMessageTool({
       currentChannelProvider: "reef",
       currentChannelId: "reef:operator",
