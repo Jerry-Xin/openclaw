@@ -238,6 +238,8 @@ export type RunCliAgentParams = {
   /** Capabilities declared by the gateway client that originated this run. */
   clientCaps?: string[];
   currentChannelId?: string;
+  /** Trusted routable delivery target for send-ledger keying; distinct from the native channel id. */
+  currentMessagingTarget?: string;
   chatId?: string;
   channelContext?: PluginHookChannelContext;
   currentThreadTs?: string;

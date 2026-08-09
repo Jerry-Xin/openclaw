@@ -340,4 +340,49 @@ describe("resolveGatewayScopedTools per-turn send ledger wiring", () => {
       reason: "turn_send_budget_exhausted",
     });
   });
+
+  // The current-source send must key the ledger on the routable messaging target
+  // (what conversations_send uses), not the native channel id. Seed the budget for
+  // the routable target only, then send with no explicit target while native and
+  // routable differ. This blocks only if currentMessagingTarget threads through
+  // resolveGatewayScopedTools -> createOpenClawTools -> the message tool; without it
+  // the no-target send falls back to the native id and misses the seeded slot.
+  it("threads the routable currentMessagingTarget so a current-source send shares the ledger slot", async () => {
+    const sessionKey = "agent:main:slack:dm:U123";
+    const runId = "gw-run-2";
+    const targetKey = buildTurnSendTargetKey({ channel: "slack", target: "user:U123" });
+    recordTurnSend({ sessionKey, runId, targetKey });
+
+    const result = resolveGatewayScopedTools({
+      cfg: {
+        tools: { profile: "minimal", message: { maxMessagesPerTurnPerTarget: 1 } },
+      } as OpenClawConfig,
+      sessionKey,
+      runId,
+      messageProvider: "slack",
+      // Native channel id and routable target intentionally differ, and agentTo is
+      // left unset exactly as the production loopback resolve leaves it. That keeps
+      // the seeded slot reachable only via currentMessagingTarget: were the routable
+      // target dropped, the resolver's `?? agentTo` fallback would be undefined and
+      // the no-target send would key on the native "D123" instead, missing the slot.
+      currentChannelId: "D123",
+      currentMessagingTarget: "user:U123",
+      inboundEventKind: "room_event",
+      surface: "loopback",
+    });
+    const messageTool = result.tools.find((tool) => tool.name === "message");
+    if (!messageTool) {
+      throw new Error("expected message tool");
+    }
+
+    const blocked = await messageTool.execute("gw-msg-2", {
+      action: "send",
+      channel: "slack",
+      message: "second variant to current source",
+    });
+    expect(blocked.details).toMatchObject({
+      status: "suppressed",
+      reason: "turn_send_budget_exhausted",
+    });
+  });
 });
