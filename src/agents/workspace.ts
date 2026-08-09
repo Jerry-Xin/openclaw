@@ -38,7 +38,6 @@ import {
 import { DEFAULT_AGENT_WORKSPACE_DIR } from "./workspace-default.js";
 import {
   hasGlobPattern,
-  patternHasUnsupportedParentTraversal,
   patternWalkRootStaysInWorkspace,
   resolveExtraBootstrapPatternPaths,
   unescapeWorkspacePatternLiteral,
@@ -288,7 +287,6 @@ export type ExtraBootstrapLoadDiagnosticCode =
   | "invalid-bootstrap-filename"
   | "missing"
   | "security"
-  | "unsupported-pattern"
   | "io";
 
 export type ExtraBootstrapLoadDiagnostic = {
@@ -1439,18 +1437,6 @@ export async function loadWorkspacePatternFilesWithDiagnostics(
     }
     try {
       if (hasGlobPattern(pattern)) {
-        // A glob whose `..` parent traversal survives Minimatch optimization
-        // (a globstar parent like `**/../AGENTS.md`) cannot be walked downward,
-        // so the walker would silently return []. Record an explicit diagnostic
-        // instead of dropping the configured pattern without a trace.
-        if (patternHasUnsupportedParentTraversal(pattern)) {
-          diagnostics.push({
-            path: path.resolve(resolvedDir, pattern),
-            reason: "unsupported-pattern",
-            detail: `glob pattern with an unsupported '..' parent traversal: ${pattern}`,
-          });
-          continue;
-        }
         const matches = await resolveExtraBootstrapPatternPaths(
           resolvedDir,
           pattern,
