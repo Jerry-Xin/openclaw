@@ -4,7 +4,12 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  buildTurnSendTargetKey,
+  recordTurnSend,
+  resetTurnSendLedgerForTest,
+} from "../agents/tools/turn-send-ledger.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveGatewayScopedTools } from "./tool-resolution.js";
 
@@ -289,5 +294,50 @@ describe("resolveGatewayScopedTools", () => {
     } finally {
       markRequesterTurnYielded.mockRestore();
     }
+  });
+});
+
+describe("resolveGatewayScopedTools per-turn send ledger wiring", () => {
+  afterEach(() => {
+    resetTurnSendLedgerForTest();
+  });
+
+  // The per-turn send budget only activates when runId reaches the message tool
+  // (message-tool.ts builds its budget context only for a defined runId). The Gateway
+  // loopback path must forward runId, or the ledger is silently inert for every
+  // ordinary Gateway turn. Pre-seed one send for this turn/target, then prove the
+  // opt-in cap of 1 blocks the tool the resolver produced — impossible unless runId
+  // is wired through.
+  it("forwards runId so the message tool per-turn cap engages on the loopback surface", async () => {
+    const sessionKey = "agent:main:telegram:group:-100123";
+    const runId = "gw-run-1";
+    const targetKey = buildTurnSendTargetKey({ channel: "telegram", target: "peer-1" });
+    recordTurnSend({ sessionKey, runId, targetKey });
+
+    const result = resolveGatewayScopedTools({
+      cfg: {
+        tools: { profile: "minimal", message: { maxMessagesPerTurnPerTarget: 1 } },
+      } as OpenClawConfig,
+      sessionKey,
+      runId,
+      messageProvider: "telegram",
+      inboundEventKind: "room_event",
+      surface: "loopback",
+    });
+    const messageTool = result.tools.find((tool) => tool.name === "message");
+    if (!messageTool) {
+      throw new Error("expected message tool");
+    }
+
+    const blocked = await messageTool.execute("gw-msg-1", {
+      action: "send",
+      channel: "telegram",
+      to: "peer-1",
+      message: "second variant",
+    });
+    expect(blocked.details).toMatchObject({
+      status: "suppressed",
+      reason: "turn_send_budget_exhausted",
+    });
   });
 });

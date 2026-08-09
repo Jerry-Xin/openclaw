@@ -115,10 +115,10 @@ const recentPollVoteBySession = new Map<
 >();
 
 // Canonical, stable route string for one outbound action: `${channel}\0${account}\0${target}`,
-// with the current source folded to a sentinel and multi-target sends bailing to
+// with the current source resolved to its concrete target and multi-target sends bailing to
 // undefined. Shared by the poll-vote-echo guard and the per-turn send ledger so both
-// key on the same normalized destination. Returns undefined when the route cannot be
-// resolved to a single destination.
+// key on the same normalized destination as conversations_send does for the same peer.
+// Returns undefined when the route cannot be resolved to a single destination.
 function resolveOutboundActionRoute(params: {
   action: ChannelMessageActionName;
   args: Record<string, unknown>;
@@ -154,9 +154,15 @@ function resolveOutboundActionRoute(params: {
       Boolean(value),
     ),
   );
-  // Plugin-declared aliases keep owner-specific target fields out of core.
-  // A route mismatch fails open; provider/account keys prevent cross-send suppression.
-  const routeTarget = !target || currentTargets.has(target) ? "<current-source>" : target;
+  // Plugin-declared aliases keep owner-specific target fields out of core. A no-target
+  // or current-source send resolves to the concrete current target so it shares one
+  // ledger slot with conversations_send to the same peer; fail open when that target is
+  // unknown, mirroring the multi-target bail. Provider/account keys prevent cross-send suppression.
+  const currentSourceTarget = params.currentMessagingTarget ?? params.currentChannelId;
+  const routeTarget = !target || currentTargets.has(target) ? currentSourceTarget : target;
+  if (!routeTarget) {
+    return undefined;
+  }
   return buildTurnSendTargetKey({ channel, accountId: params.accountId, target: routeTarget });
 }
 

@@ -512,4 +512,66 @@ describe("message and conversations_send share the per-turn budget", () => {
     // The blocked send never reached the runner-backed gateway path.
     expect(deps.callGatewayMock).toHaveBeenCalledTimes(1);
   });
+
+  // A no-target source reply must resolve to the concrete current target, not a
+  // sentinel: the operator is replying to reef:peer-agent, which is also the conv
+  // ref's target. Its ledger key must equal the one conversations_send builds for
+  // the same peer, or alternating them evades the cap.
+  function createSourceReplyMessageTool(config: Record<string, unknown>) {
+    registerReefPlugin();
+    return createMessageTool({
+      currentChannelProvider: "reef",
+      currentChannelId: "reef:operator",
+      // The current source's real target is the peer the conv ref also points at.
+      currentMessagingTarget: peerTarget,
+      agentAccountId: "default",
+      agentSessionKey: sessionKey,
+      runId,
+      sourceReplyDeliveryMode: "message_tool_only",
+      config: config as never,
+      runMessageAction: (async () =>
+        ({
+          kind: "send",
+          action: "send",
+          channel: "reef",
+          to: peerTarget,
+          handledBy: "plugin",
+          payload: {},
+          dryRun: false,
+        }) satisfies MessageActionRunResult) as never,
+      resolveCommandSecretRefsViaGateway: (async ({ config: cfg }: { config: unknown }) => ({
+        resolvedConfig: cfg,
+        diagnostics: [],
+      })) as never,
+      getScopedChannelsCommandSecretTargets: (() => ({ targetIds: new Set<string>() })) as never,
+    });
+  }
+
+  it("caps a conversations_send that follows a no-target source reply to the same peer", async () => {
+    const config = { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } };
+    const deps = createDeps();
+    const messageTool = createSourceReplyMessageTool(config);
+    const conversationTool = createConversationsSendTool(
+      { agentId: "main", agentSessionKey: sessionKey, runId, config: config as never },
+      deps,
+    );
+
+    // 1st send (message tool, NO explicit target): resolves to the current source's
+    // concrete target and consumes the single-send budget for that peer.
+    const first = await messageTool.execute("msg-source", { action: "send", message: "hello" });
+    expect(first.details).not.toMatchObject({ status: "suppressed" });
+
+    // 2nd send (conversations_send, same peer): blocked by the shared cap of 1, so the
+    // no-target source key and the conv-ref key must be one and the same slot.
+    const blocked = await conversationTool.execute("conv-1", {
+      conversationRef: conversation.conversationRef,
+      message: "hello again",
+    });
+    expect(blocked.details).toMatchObject({
+      status: "suppressed",
+      reason: "turn_send_budget_exhausted",
+    });
+    // The blocked send never reached the Gateway.
+    expect(deps.callGatewayMock).not.toHaveBeenCalled();
+  });
 });

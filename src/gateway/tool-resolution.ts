@@ -332,6 +332,7 @@ export function resolveGatewayScopedTools(params: {
     replyToMode: params.replyToMode,
     currentInboundAudio: params.currentInboundAudio,
     sessionId: params.sessionId,
+    runId: params.runId,
     onYield: params.onYield,
     requireExplicitMessageTarget: params.requireExplicitMessageTarget,
     senderIsOwner: params.senderIsOwner,
