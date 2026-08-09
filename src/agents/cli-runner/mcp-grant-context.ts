@@ -125,6 +125,9 @@ export function buildCliMcpGrantContext(params: {
     params.run.messageChannel ?? params.run.messageProvider,
   );
   const currentChannelId = normalizeOptionalMcpContextValue(params.run.currentChannelId);
+  const currentMessagingTarget = normalizeOptionalMcpContextValue(
+    params.run.currentMessagingTarget,
+  );
   const grantedToolsAllow = params.run.cliToolAvailability?.openClaw ?? params.toolsAllow;
   // Trusted message-only completions stay restricted even when source routing
   // is missing; the message tool must fail closed instead of widening authority.
@@ -161,6 +164,7 @@ export function buildCliMcpGrantContext(params: {
     messageProvider,
     clientCaps: clientCaps.length > 0 ? clientCaps : undefined,
     currentChannelId,
+    currentMessagingTarget,
     currentThreadTs: normalizeOptionalMcpContextValue(params.run.currentThreadTs),
     currentMessageId:
       params.run.currentMessageId == null

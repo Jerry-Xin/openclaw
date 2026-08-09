@@ -333,6 +333,7 @@ async function startMcpLoopbackServer(port = 0): Promise<{
           messageProvider: requestContext.messageProvider,
           clientCaps: requestContext.clientCaps,
           currentChannelId: requestContext.currentChannelId,
+          currentMessagingTarget: requestContext.currentMessagingTarget,
           currentThreadTs: requestContext.currentThreadTs,
           currentMessageId: requestContext.currentMessageId,
           replyToMode: requestContext.replyToMode,
@@ -397,7 +398,8 @@ async function startMcpLoopbackServer(port = 0): Promise<{
                   approvalReviewerDeviceId: requestContext.approvalReviewerDeviceId,
                   channelId: requestContext.currentChannelId,
                   turnSourceChannel: requestContext.messageProvider,
-                  turnSourceTo: requestContext.currentChannelId,
+                  turnSourceTo:
+                    requestContext.currentMessagingTarget ?? requestContext.currentChannelId,
                   turnSourceAccountId: requestContext.accountId,
                   turnSourceThreadId: requestContext.currentThreadTs,
                   loopDetection: resolveToolLoopDetectionConfig({
