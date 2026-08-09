@@ -245,6 +245,8 @@ export type RunCliAgentParams = {
   /** Trusted run-local capability to author pinned widgets without inline presentation. */
   pinnedWidgetAuthoring?: boolean;
   currentChannelId?: string;
+  /** Trusted routable delivery target for send-ledger keying; distinct from the native channel id. */
+  currentMessagingTarget?: string;
   chatId?: string;
   channelContext?: PluginHookChannelContext;
   currentThreadTs?: string;
