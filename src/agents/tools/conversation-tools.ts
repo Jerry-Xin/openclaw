@@ -250,10 +250,13 @@ export function createConversationsSendTool(
         ...(signal ? { signal } : {}),
       });
       const base = jsonResult(result);
-      // Only actual delivery/enqueue counts; a suppressed or unknown status did not
-      // reach the peer. Counting always happens; the soft reminder is appended from
-      // the second send onward unless turnSendNudge is explicitly disabled.
-      if (budgetContext && (result.status === "sent" || result.status === "queued")) {
+      // Only confirmed delivery counts; a "queued" (enqueue-only, unconfirmed)
+      // status has not reached the peer yet, and neither has "suppressed"/"unknown".
+      // This matches the delivery owner's confirmed-delivery definition and the
+      // message tool (which has no "queued" concept). Counting always happens; the
+      // soft reminder is appended from the second send onward unless turnSendNudge is
+      // explicitly disabled.
+      if (budgetContext && result.status === "sent") {
         const sendCount = recordTurnSend(budgetContext);
         const nudgeEnabled =
           !options.config ||

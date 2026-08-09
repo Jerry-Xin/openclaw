@@ -7,6 +7,24 @@ import {
   TURN_SEND_LEDGER_TTL_MS,
 } from "./turn-send-ledger.js";
 
+// Stand-in for a provider target normalizer: case-fold and strip a leading "tg:"
+// prefix, mirroring what a real telegram plugin normalizer does. Any other target
+// (e.g. "reef:peer-agent") passes through unchanged, matching the real no-plugin
+// fallback so the canonical-key test below stays valid.
+vi.mock("../../infra/outbound/target-normalization.js", () => ({
+  normalizeTargetForProvider: (_channel: string, raw?: string): string | undefined => {
+    if (raw === undefined) {
+      return undefined;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const lowered = trimmed.toLowerCase();
+    return lowered.startsWith("tg:") ? lowered.slice("tg:".length) : lowered;
+  },
+}));
+
 afterEach(() => {
   resetTurnSendLedgerForTest();
   vi.useRealTimers();
@@ -84,5 +102,14 @@ describe("turn-send-ledger", () => {
     expect(
       buildTurnSendTargetKey({ channel: "reef", accountId: "primary", target: "reef:peer-agent" }),
     ).toBe("reef\u0000primary\u0000reef:peer-agent");
+  });
+
+  it("canonicalizes the target so equivalent spellings share one ledger slot", () => {
+    // Both spellings of one peer must produce a byte-identical key, otherwise
+    // "TG:12345" and "12345" would occupy separate slots and bypass the nudge/cap.
+    const prefixed = buildTurnSendTargetKey({ channel: "telegram", target: "TG:12345" });
+    const bare = buildTurnSendTargetKey({ channel: "telegram", target: "12345" });
+    expect(prefixed).toBe(bare);
+    expect(prefixed).toBe("telegram\u0000default\u000012345");
   });
 });
