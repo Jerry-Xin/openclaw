@@ -16,6 +16,7 @@
  * (`runId`); a slot resets when its `runId` changes, which bounds the counts to a
  * single turn without any explicit cleanup.
  */
+import { normalizeTargetForProvider } from "../../infra/outbound/target-normalization.js";
 import { normalizeAccountId } from "../../routing/account-id.js";
 import { normalizeMessageChannel } from "../../utils/message-channel-normalize.js";
 
@@ -51,7 +52,17 @@ export function buildTurnSendTargetKey(params: {
   accountId?: string;
   target: string;
 }): string {
-  return `${normalizeMessageChannel(params.channel)}\0${normalizeAccountId(params.accountId)}\0${params.target}`;
+  const channel = normalizeMessageChannel(params.channel);
+  // Canonicalize the target the same way delivery does (case-fold, prefix strip,
+  // phone normalization) so equivalent spellings of one peer ("TG:12345" vs
+  // "12345") land in one ledger slot instead of bypassing the nudge/cap. This is
+  // synchronous, idempotent, and provider-bound, so re-applying it to a route the
+  // caller already canonicalized (conversations_send's record.target) is a no-op.
+  // Out of scope by design: async directory-alias resolution (@username -> id) is
+  // not resolved here; it stays off the cap hot path (accepted limitation).
+  const target =
+    normalizeTargetForProvider(channel ?? params.channel, params.target) ?? params.target;
+  return `${channel}\0${normalizeAccountId(params.accountId)}\0${target}`;
 }
 
 // A slot is live only within the TTL window measured from its last write. Peek and
