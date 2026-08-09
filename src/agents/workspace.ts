@@ -38,7 +38,6 @@ import {
 import { DEFAULT_AGENT_WORKSPACE_DIR } from "./workspace-default.js";
 import {
   hasGlobPattern,
-  patternHasUnsupportedParentTraversal,
   patternWalkRootStaysInWorkspace,
   resolveExtraBootstrapPatternPaths,
   unescapeWorkspacePatternLiteral,
@@ -286,7 +285,6 @@ export type WorkspaceBootstrapFile = {
 
 export type ExtraBootstrapLoadDiagnosticCode =
   | "invalid-bootstrap-filename"
-  | "unsupported-pattern"
   | "missing"
   | "security"
   | "io";
@@ -1429,7 +1427,7 @@ export async function loadWorkspacePatternFilesWithDiagnostics(
   const diagnostics: ExtraBootstrapLoadDiagnostic[] = [];
   const resolvedPaths = new Set<string>();
   for (const pattern of extraPatterns) {
-    if (!patternWalkRootStaysInWorkspace(resolvedDir, pattern)) {
+    if (!(await patternWalkRootStaysInWorkspace(resolvedDir, pattern))) {
       diagnostics.push({
         path: path.resolve(resolvedDir, pattern),
         reason: "security",
@@ -1446,20 +1444,6 @@ export async function loadWorkspacePatternFilesWithDiagnostics(
         );
         for (const match of matches) {
           resolvedPaths.add(match);
-        }
-        // A globstar followed by two or more consecutive `..` (`**/../../AGENTS.md`)
-        // is a degenerate fs.glob shape the walker refuses to resolve: Node's
-        // repeated-parent semantics are depth-dependent, and the old recursive walk
-        // returned a superset that injected bootstrap files fs.glob never matched.
-        // The walker drops only that alternative (still resolving any other brace
-        // alternatives above), so surface why the pattern produced fewer files
-        // instead of dead-ending the operator with a silent drop.
-        if (patternHasUnsupportedParentTraversal(pattern)) {
-          diagnostics.push({
-            path: path.resolve(resolvedDir, pattern),
-            reason: "unsupported-pattern",
-            detail: `globstar with repeated ".." parent traversal is not supported: ${pattern}`,
-          });
         }
       } else {
         // A magic-free pattern is a literal path. Reverse any glob-escape wraps
