@@ -145,6 +145,7 @@ import {
   hasToolErrorOutput,
   extractSessionStatusSessionKey,
   resolveHeartbeatPromptReply,
+  extractPerTurnSendBudgetDirective,
 } from "./mock-openai-directives.js";
 import {
   buildRemoteCompactionV2Events,
@@ -1055,6 +1056,29 @@ async function buildResponsesPayload(
     )
       ? extractLatestToolOutput(input)
       : "");
+  // Per-turn send-budget fixture (QA-PTSB-SEND): emit one `message`/`conversations_send`
+  // per continuation round to the same target until `count` sends have been planned this
+  // turn, then finalize with text. Placed before the scenario chain so the unique marker
+  // wins outright; counting prior planned calls in `input` is how one turn fans out into
+  // several sequential sends that all charge the same run-scoped ledger slot.
+  const perTurnSendBudget = extractPerTurnSendBudgetDirective(allInputText);
+  if (perTurnSendBudget && hasDeclaredTool(body, perTurnSendBudget.tool)) {
+    const priorPlannedSends = input.filter(
+      (item) => item.type === "function_call" && item.name === perTurnSendBudget.tool,
+    ).length;
+    if (priorPlannedSends < perTurnSendBudget.count) {
+      const sequence = priorPlannedSends + 1;
+      const sendArgs =
+        perTurnSendBudget.tool === "conversations_send"
+          ? {
+              conversationRef: perTurnSendBudget.ref,
+              message: `${perTurnSendBudget.marker}-${sequence}`,
+            }
+          : { action: "send", message: `${perTurnSendBudget.marker}-${sequence}` };
+      return buildToolCallEventsWithArgs(perTurnSendBudget.tool, sendArgs);
+    }
+    return buildAssistantEvents(`${perTurnSendBudget.marker}-FINAL`);
+  }
   // The queued followup carries the stalled prompt in transcript history, so
   // current-turn dispatch must win before the persistent recovery fixture.
   if (QA_REPEATED_REQUEST_QUEUED_REPLY_PROMPT_RE.test(prompt)) {

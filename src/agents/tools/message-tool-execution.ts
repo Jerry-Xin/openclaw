@@ -797,7 +797,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       // carry kind:"send" with no sendResult (deliveryStatus undefined) — those still
       // count because delivery happened remotely.
       const deliveryStatus = result.kind === "send" ? result.sendResult?.deliveryStatus : undefined;
-      const deliveredNothing = deliveryStatus === "suppressed";
+      const deliveredNothing = deliveryStatus === "suppressed" || deliveryStatus === "failed";
       let turnSendNotice: string | undefined;
       if (
         budgetContext &&

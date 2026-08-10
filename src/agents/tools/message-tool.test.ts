@@ -5447,7 +5447,7 @@ describe("per-turn send budget", () => {
   function stubSend(overrides?: {
     dryRun?: boolean;
     kind?: "send" | "broadcast";
-    suppressed?: boolean;
+    deliveryStatus?: "suppressed" | "failed" | "partial_failed";
   }) {
     mocks.runMessageAction.mockReset();
     if (overrides?.kind === "broadcast") {
@@ -5461,24 +5461,26 @@ describe("per-turn send budget", () => {
       } as MessageActionRunResult);
       return;
     }
-    // A core send can report deliveryStatus "suppressed" (e.g. no_visible_payload)
-    // without reaching the peer; the ledger must not count it.
+    // A core send reports its outcome via sendResult.deliveryStatus. A best-effort
+    // send never throws, so "suppressed" (no_visible_payload) and "failed" both reach
+    // the tool as a returned status and must not count; "partial_failed" still counts.
+    const deliveryStatus = overrides?.deliveryStatus;
     mocks.runMessageAction.mockResolvedValue({
       kind: "send",
       action: "send",
       channel: "imessage",
       to: currentChat,
-      handledBy: overrides?.suppressed ? "core" : "plugin",
+      handledBy: deliveryStatus ? "core" : "plugin",
       payload: {},
       dryRun: overrides?.dryRun ?? false,
-      ...(overrides?.suppressed
+      ...(deliveryStatus
         ? {
             sendResult: {
               channel: "imessage",
               to: currentChat,
               via: "direct",
               mediaUrl: null,
-              deliveryStatus: "suppressed",
+              deliveryStatus,
             },
           }
         : {}),
@@ -5528,7 +5530,7 @@ describe("per-turn send budget", () => {
   });
 
   it("does not count a suppressed core send", async () => {
-    stubSend({ suppressed: true });
+    stubSend({ deliveryStatus: "suppressed" });
     const tool = createBudgetTool({ maxPerTurn: 1 });
     const first = await send(tool, "first");
     // A suppressed delivery reached the runner but not the peer, so no nudge.
@@ -5539,6 +5541,62 @@ describe("per-turn send budget", () => {
     const second = await send(tool, "second");
     expect(second.details).not.toMatchObject({ status: "suppressed" });
     expect(softNotice(second)).toBeUndefined();
+    expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not count a failed best-effort send", async () => {
+    // Current-source replies are forced bestEffort=true, so a failed send returns
+    // deliveryStatus "failed" instead of throwing; nothing reached the peer.
+    stubSend({ deliveryStatus: "failed" });
+    const tool = createBudgetTool();
+    const first = await send(tool, "first");
+    expect(softNotice(first)).toBeUndefined();
+    // The next confirmed delivery is the first counted send and stays silent; a
+    // second confirmed delivery then nudges at count 2, not 3.
+    stubSend();
+    const second = await send(tool, "second");
+    expect(softNotice(second)).toBeUndefined();
+    const third = await send(tool, "third");
+    expect(softNotice(third)).toContain("already sent 2 messages");
+  });
+
+  it("does not let a failed best-effort send block the next send under the hard cap", async () => {
+    stubSend({ deliveryStatus: "failed" });
+    const tool = createBudgetTool({ maxPerTurn: 1 });
+    const first = await send(tool, "first");
+    // The failed send never consumed the cap slot, so it did not block anything.
+    expect(first.details).not.toMatchObject({ status: "suppressed" });
+    // stubSend resets the mock; if the failed send had counted, the cap would block the
+    // next send before dispatch and the runner would never be reached (0 calls). It is
+    // admitted instead, so the runner is called once.
+    stubSend();
+    const second = await send(tool, "second");
+    expect(second.details).not.toMatchObject({ status: "suppressed" });
+    expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts a partial_failed send (a visible partial message reached the peer)", async () => {
+    stubSend({ deliveryStatus: "partial_failed" });
+    const tool = createBudgetTool();
+    const first = await send(tool, "first");
+    expect(softNotice(first)).toBeUndefined();
+    // partial_failed counts, so the second send to the same target nudges at count 2.
+    stubSend({ deliveryStatus: "partial_failed" });
+    const second = await send(tool, "second");
+    expect(softNotice(second)).toContain("already sent 2 messages");
+  });
+
+  it("blocks the next send after a partial_failed send reaches the hard cap", async () => {
+    stubSend({ deliveryStatus: "partial_failed" });
+    const tool = createBudgetTool({ maxPerTurn: 1 });
+    await send(tool, "first");
+    expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
+    const blocked = await send(tool, "second");
+    // The partial_failed send consumed the single-send budget, so this is blocked.
+    expect(blocked.details).toMatchObject({
+      status: "suppressed",
+      reason: "turn_send_budget_exhausted",
+    });
     expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
   });
 
