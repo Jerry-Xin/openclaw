@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildTurnSendTargetKey,
+  hasRecordedTurnSendOperation,
   peekTurnSendCount,
   recordTurnSend,
+  recordTurnSendOnce,
   resetTurnSendLedgerForTest,
   TURN_SEND_LEDGER_TTL_MS,
 } from "./turn-send-ledger.js";
@@ -111,5 +113,51 @@ describe("turn-send-ledger", () => {
     const bare = buildTurnSendTargetKey({ channel: "telegram", target: "12345" });
     expect(prefixed).toBe(bare);
     expect(prefixed).toBe("telegram\u0000default\u000012345");
+  });
+});
+
+describe("turn-send-ledger operation identity", () => {
+  const key = { sessionKey: "s1", runId: "run-1", targetKey: "tg:a" };
+
+  it("counts an operationId once and reports it as recorded afterwards", () => {
+    expect(hasRecordedTurnSendOperation(key, "op-1")).toBe(false);
+    expect(recordTurnSendOnce(key, "op-1")).toBe(1);
+    // The same operationId is now recorded and a replay must not re-increment it.
+    expect(hasRecordedTurnSendOperation(key, "op-1")).toBe(true);
+    expect(recordTurnSendOnce(key, "op-1")).toBeUndefined();
+    // The per-target count stayed at 1 despite the replay.
+    expect(peekTurnSendCount(key)).toBe(1);
+  });
+
+  it("increments per distinct operationId to the same target", () => {
+    expect(recordTurnSendOnce(key, "op-1")).toBe(1);
+    expect(recordTurnSendOnce(key, "op-2")).toBe(2);
+    expect(peekTurnSendCount(key)).toBe(2);
+  });
+
+  it("shares one slot with recordTurnSend so both counters agree", () => {
+    // The message tool's recordTurnSend and conversations_send's recordTurnSendOnce
+    // write the same per-turn slot; a mixed sequence increments one shared count.
+    expect(recordTurnSend(key)).toBe(1);
+    expect(recordTurnSendOnce(key, "op-1")).toBe(2);
+    expect(peekTurnSendCount(key)).toBe(2);
+  });
+
+  it("resets seen operations when the runId changes (new turn)", () => {
+    recordTurnSendOnce(key, "op-1");
+    expect(hasRecordedTurnSendOperation(key, "op-1")).toBe(true);
+    const nextTurn = { ...key, runId: "run-2" };
+    // A new turn has no memory of the prior operationId, so it counts fresh.
+    expect(hasRecordedTurnSendOperation(nextTurn, "op-1")).toBe(false);
+    expect(recordTurnSendOnce(nextTurn, "op-1")).toBe(1);
+  });
+
+  it("forgets seen operations once the slot expires past the TTL", () => {
+    expect(recordTurnSendOnce(key, "op-1", 0)).toBe(1);
+    expect(hasRecordedTurnSendOperation(key, "op-1", 0)).toBe(true);
+    // Past the TTL the slot is treated as gone, so the id reads as unseen and the
+    // next record restarts the turn's budget.
+    expect(hasRecordedTurnSendOperation(key, "op-1", TURN_SEND_LEDGER_TTL_MS + 1)).toBe(false);
+    expect(recordTurnSendOnce(key, "op-1", TURN_SEND_LEDGER_TTL_MS + 2)).toBe(1);
   });
 });

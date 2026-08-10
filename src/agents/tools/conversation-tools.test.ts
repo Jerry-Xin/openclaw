@@ -15,6 +15,12 @@ import {
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { compactToolOutputHint } from "../tool-schema-hints.js";
 import {
+  createToolSearchCatalogRef,
+  registerHeadlessToolSearchCatalog,
+  resolveToolSearchConfig,
+  ToolSearchRuntime,
+} from "../tool-search.js";
+import {
   createConversationsListTool,
   createConversationsSendTool,
   createConversationsTurnTool,
@@ -349,6 +355,69 @@ describe("conversations_send per-turn send budget", () => {
       .find((text) => text.includes("already sent"));
   }
 
+  function blockedNotice(result: { content: Array<{ type: string; text?: string }> }) {
+    return result.content
+      .filter((entry): entry is { type: "text"; text: string } => entry.type === "text")
+      .map((entry) => entry.text)
+      .find((text) => text.startsWith("Blocked:"));
+  }
+
+  // conversations_send declares the closed ConversationSendResultSchema, so a capped
+  // send must return schema-valid details (status/conversationRef/channel only) and
+  // carry the human-readable block reason in text content, not details.
+  function expectSchemaValidCappedResult(result: {
+    content: Array<{ type: string; text?: string }>;
+    details: unknown;
+  }) {
+    expect(Value.Check(ConversationSendResultSchema, result.details)).toBe(true);
+    expect(result.details).toEqual({
+      status: "suppressed",
+      conversationRef: conversation.conversationRef,
+      channel: "reef",
+    });
+    expect(blockedNotice(result)).toContain("already sent");
+  }
+
+  it("returns a schema-valid capped result with the block reason in text, not details", async () => {
+    const deps = createDeps();
+    const tool = createConversationsSendTool(
+      { ...budgetOptions, config: { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } } },
+      deps,
+    );
+    const args = { conversationRef: conversation.conversationRef, message: "hi" };
+    await tool.execute("c1", args);
+    const blocked = await tool.execute("c2", args);
+    expectSchemaValidCappedResult(blocked);
+    // No extra fields leaked into details that would fail the closed output schema.
+    expect(blocked.details).not.toHaveProperty("reason");
+    expect(blocked.details).not.toHaveProperty("message");
+    expect(deps.callGatewayMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes the Code Mode output-schema check on the capped path", async () => {
+    // In Code Mode the runtime validates the returned details against the tool's
+    // declared outputSchema (assertCatalogOutputMatchesSchema). A capped result with
+    // extra details fields would throw there; the schema-valid shape must not.
+    const deps = createDeps();
+    const tool = createConversationsSendTool(
+      { ...budgetOptions, config: { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } } },
+      deps,
+    );
+    const catalogRef = createToolSearchCatalogRef();
+    registerHeadlessToolSearchCatalog({ catalogRef, tools: [tool] });
+    const runtime = new ToolSearchRuntime(
+      { catalogRef },
+      resolveToolSearchConfig({ tools: { toolSearch: { enabled: true, mode: "code" } } } as never),
+    );
+    const args = { conversationRef: conversation.conversationRef, message: "hi" };
+    // First send is admitted; the second is capped and returns the schema-valid
+    // suppressed shape, so the output-schema check must accept it instead of throwing.
+    await runtime.call("conversations_send", args);
+    await expect(runtime.call("conversations_send", args)).resolves.toMatchObject({
+      result: { details: { status: "suppressed", channel: "reef" } },
+    });
+  });
+
   it("appends a soft reminder from the second send to the same conversation this turn", async () => {
     const deps = createDeps();
     const tool = createConversationsSendTool(budgetOptions, deps);
@@ -407,10 +476,35 @@ describe("conversations_send per-turn send budget", () => {
     // With the cap now reached by that one confirmed delivery, a third send is blocked
     // before the Gateway call.
     const blocked = await tool.execute("c3", args);
-    expect(blocked.details).toMatchObject({
-      status: "suppressed",
-      reason: "turn_send_budget_exhausted",
-    });
+    expectSchemaValidCappedResult(blocked);
+    expect(deps.callGatewayMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets an idempotent replay through the cap without double-counting or a fresh nudge", async () => {
+    const deps = createDeps();
+    const tool = createConversationsSendTool(
+      { ...budgetOptions, config: { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } } },
+      deps,
+    );
+    const args = { conversationRef: conversation.conversationRef, message: "hi" };
+    // 1st send consumes the single-send budget.
+    const first = await tool.execute("call-1", args);
+    expect(first.details).toMatchObject({ status: "sent" });
+    expect(softNotice(first)).toBeUndefined();
+    expect(deps.callGatewayMock).toHaveBeenCalledTimes(1);
+
+    // Same toolCallId again -> same operationId. The Gateway resolves it to the
+    // completed operation and returns "sent" without re-delivering, so it must not be
+    // capped, must reach the Gateway, and must neither double-count nor nudge afresh.
+    const replay = await tool.execute("call-1", args);
+    expect(replay.details).toMatchObject({ status: "sent" });
+    expect(softNotice(replay)).toBeUndefined();
+    expect(deps.callGatewayMock).toHaveBeenCalledTimes(2);
+
+    // A THIRD, distinct toolCallId is a genuinely new send and is blocked by the cap
+    // that the single counted delivery already reached.
+    const blocked = await tool.execute("call-2", args);
+    expectSchemaValidCappedResult(blocked);
     expect(deps.callGatewayMock).toHaveBeenCalledTimes(2);
   });
 
@@ -433,10 +527,7 @@ describe("conversations_send per-turn send budget", () => {
     await tool.execute("c1", args);
     expect(deps.callGatewayMock).toHaveBeenCalledTimes(1);
     const blocked = await tool.execute("c2", args);
-    expect(blocked.details).toMatchObject({
-      status: "suppressed",
-      reason: "turn_send_budget_exhausted",
-    });
+    expectSchemaValidCappedResult(blocked);
     // The blocked send never reached the Gateway.
     expect(deps.callGatewayMock).toHaveBeenCalledTimes(1);
   });
@@ -469,10 +560,7 @@ describe("conversations_send per-turn send budget", () => {
     expect(deps.callGatewayMock).toHaveBeenCalledTimes(1);
     const blocked = await tool.execute("c2", args);
     // Counting still ran past the first send, so the cap blocks the second.
-    expect(blocked.details).toMatchObject({
-      status: "suppressed",
-      reason: "turn_send_budget_exhausted",
-    });
+    expectSchemaValidCappedResult(blocked);
     expect(deps.callGatewayMock).toHaveBeenCalledTimes(1);
   });
 });
@@ -612,9 +700,12 @@ describe("message and conversations_send share the per-turn budget", () => {
       conversationRef: conversation.conversationRef,
       message: "hello again",
     });
-    expect(blocked.details).toMatchObject({
+    // conversations_send returns the closed-schema suppressed shape (no reason field);
+    // the block reason rides in the text content.
+    expect(blocked.details).toEqual({
       status: "suppressed",
-      reason: "turn_send_budget_exhausted",
+      conversationRef: conversation.conversationRef,
+      channel: "reef",
     });
     // The blocked send never reached the Gateway.
     expect(deps.callGatewayMock).not.toHaveBeenCalled();

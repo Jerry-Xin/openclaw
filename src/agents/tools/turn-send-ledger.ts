@@ -28,6 +28,12 @@ export const TURN_SEND_LEDGER_TTL_MS = 10 * 60_000;
 type TurnSendSlot = {
   runId: string;
   counts: Map<string, number>;
+  // Operation identities already counted this turn. conversations_send derives a
+  // stable operationId per (toolCallId, conversationRef); the Gateway resolves a
+  // repeated one to the completed operation and returns "sent" without
+  // re-delivering. Tracking seen ids lets a replay through the cap and keeps it
+  // from double-counting. The message tool has no operationId and never touches this.
+  seenOperations: Set<string>;
   recordedAt: number;
 };
 
@@ -75,6 +81,23 @@ function isLiveSlot(slot: TurnSendSlot, now: number): boolean {
   return now - slot.recordedAt <= TURN_SEND_LEDGER_TTL_MS;
 }
 
+// The current turn's slot for `sessionKey`, or a fresh one when the session has no
+// slot, its slot belongs to a prior turn (runId differs), or the TTL window has
+// elapsed. Shared by every recorder so counts and seen-operation ids reset together
+// on a turn boundary. Callers mutate the returned slot and reseat it via the map.
+function liveSlotForTurn(sessionKey: string, runId: string, now: number): TurnSendSlot {
+  const existing = turnSendBySession.get(sessionKey);
+  if (existing && existing.runId === runId && isLiveSlot(existing, now)) {
+    return existing;
+  }
+  return {
+    runId,
+    counts: new Map<string, number>(),
+    seenOperations: new Set<string>(),
+    recordedAt: now,
+  };
+}
+
 /**
  * Records one successful send to `targetKey` in the current turn and returns the
  * running count (>= 1). A slot whose `runId` differs, or whose window has expired,
@@ -86,15 +109,55 @@ export function recordTurnSend(
   now: number = Date.now(),
 ): number {
   pruneExpired(now);
-  const existing = turnSendBySession.get(sessionKey);
-  const slot: TurnSendSlot =
-    existing && existing.runId === runId && isLiveSlot(existing, now)
-      ? existing
-      : { runId, counts: new Map<string, number>(), recordedAt: now };
+  const slot = liveSlotForTurn(sessionKey, runId, now);
   const next = (slot.counts.get(targetKey) ?? 0) + 1;
   slot.counts.set(targetKey, next);
   slot.recordedAt = now;
   turnSendBySession.set(sessionKey, slot);
+  return next;
+}
+
+/**
+ * Whether `operationId` has already been counted in the current live turn slot.
+ * conversations_send checks this before the hard cap so an idempotent Gateway
+ * replay (a repeated toolCallId resolved to the same completed operation without
+ * re-delivery) is admitted instead of blocked. Returns false when the session has
+ * no live slot for this turn. `now` is injectable for deterministic tests.
+ */
+export function hasRecordedTurnSendOperation(
+  { sessionKey, runId }: TurnSendKey,
+  operationId: string,
+  now: number = Date.now(),
+): boolean {
+  const slot = turnSendBySession.get(sessionKey);
+  if (!slot || slot.runId !== runId || !isLiveSlot(slot, now)) {
+    return false;
+  }
+  return slot.seenOperations.has(operationId);
+}
+
+/**
+ * Counts one successful send for `operationId` at most once per turn. The first
+ * call for a given operationId increments the per-target count and returns it; a
+ * repeated call for the same operationId (an idempotent Gateway replay) leaves the
+ * count untouched and returns undefined, so a replay neither re-increments the
+ * budget nor fires a second nudge. `now` is injectable for deterministic tests.
+ */
+export function recordTurnSendOnce(
+  { sessionKey, runId, targetKey }: TurnSendKey,
+  operationId: string,
+  now: number = Date.now(),
+): number | undefined {
+  pruneExpired(now);
+  const slot = liveSlotForTurn(sessionKey, runId, now);
+  slot.recordedAt = now;
+  turnSendBySession.set(sessionKey, slot);
+  if (slot.seenOperations.has(operationId)) {
+    return undefined;
+  }
+  slot.seenOperations.add(operationId);
+  const next = (slot.counts.get(targetKey) ?? 0) + 1;
+  slot.counts.set(targetKey, next);
   return next;
 }
 

@@ -24,6 +24,7 @@ import {
   jsonResult,
   readPositiveIntegerParam,
   readToolStringParam,
+  textResult,
   ToolAuthorizationError,
   ToolInputError,
 } from "./common.js";
@@ -31,7 +32,12 @@ import {
   callAgentToolGatewayRequest,
   type AgentToolGatewayRequestCaller,
 } from "./in-process-gateway.js";
-import { buildTurnSendTargetKey, peekTurnSendCount, recordTurnSend } from "./turn-send-ledger.js";
+import {
+  buildTurnSendTargetKey,
+  hasRecordedTurnSendOperation,
+  peekTurnSendCount,
+  recordTurnSendOnce,
+} from "./turn-send-ledger.js";
 
 const CONVERSATION_REF_PATTERN = /^conv_[a-f0-9]{32}$/u;
 
@@ -154,7 +160,7 @@ function resolveConversationBudgetContext(
   options: ConversationToolOptions,
   deps: ConversationToolDeps,
   conversationRef: string,
-): { sessionKey: string; runId: string; targetKey: string } | undefined {
+): { sessionKey: string; runId: string; targetKey: string; channel: string } | undefined {
   const sessionKey = options.agentSessionKey?.trim() || undefined;
   if (!sessionKey || !options.runId || !options.config) {
     return undefined;
@@ -187,6 +193,9 @@ function resolveConversationBudgetContext(
       accountId: record.accountId,
       target: record.target,
     }),
+    // The resolved channel, reused for a schema-valid suppressed result below so the
+    // capped path does not have to re-read the registry to satisfy the send contract.
+    channel: record.channel,
   };
 }
 
@@ -222,19 +231,34 @@ export function createConversationsSendTool(
       // The ref is resolved to its (channel, account, target) route so the ledger key
       // is identical to the message tool's for the same recipient.
       const budgetContext = resolveConversationBudgetContext(options, deps, conversationRef);
+      // An idempotent replay (the same toolCallId retried) resolves to the same
+      // operationId; the Gateway returns the completed operation as "sent" without
+      // re-delivering (conversation-send.ts resultForCompletedOperation). Such a
+      // replay must reach the Gateway even at the cap, and must not count twice — so
+      // it bypasses the hard cap and recordTurnSendOnce ignores the second "sent".
+      const alreadyRecorded = budgetContext
+        ? hasRecordedTurnSendOperation(budgetContext, operationId)
+        : false;
       // Optional hard cap (opt-in via tools.message.maxMessagesPerTurnPerTarget):
       // block before the Gateway call once the cap is reached this turn.
-      if (budgetContext && options.config) {
+      if (budgetContext && options.config && !alreadyRecorded) {
         const maxPerTurn = resolveEffectiveMessageToolsConfig({
           cfg: options.config,
           agentId: resolveToolAgentId(options),
         })?.maxMessagesPerTurnPerTarget;
         if (maxPerTurn !== undefined && peekTurnSendCount(budgetContext) >= maxPerTurn) {
-          return jsonResult({
-            status: "suppressed",
-            reason: "turn_send_budget_exhausted",
-            message: `Blocked: already sent ${maxPerTurn} message(s) to this conversation this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
-          });
+          // conversations_send declares the closed ConversationSendResultSchema, so
+          // the details must stay within it (status/conversationRef/channel). The
+          // human-readable block reason rides in the text content, not details, or
+          // Code Mode's output-schema check (assertCatalogOutputMatchesSchema) throws.
+          return textResult(
+            `Blocked: already sent ${maxPerTurn} message(s) to this conversation this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
+            {
+              status: "suppressed" as const,
+              conversationRef,
+              channel: budgetContext.channel,
+            },
+          );
         }
       }
       const result = await deps.callGateway<ConversationSendResult>({
@@ -253,18 +277,19 @@ export function createConversationsSendTool(
       // Only confirmed delivery counts; a "queued" (enqueue-only, unconfirmed)
       // status has not reached the peer yet, and neither has "suppressed"/"unknown".
       // This matches the delivery owner's confirmed-delivery definition and the
-      // message tool (which has no "queued" concept). Counting always happens; the
-      // soft reminder is appended from the second send onward unless turnSendNudge is
-      // explicitly disabled.
+      // message tool (which has no "queued" concept). recordTurnSendOnce counts a
+      // given operationId at most once, so an idempotent replay returns undefined and
+      // draws no fresh nudge; the soft reminder is appended from the second distinct
+      // send onward unless turnSendNudge is explicitly disabled.
       if (budgetContext && result.status === "sent") {
-        const sendCount = recordTurnSend(budgetContext);
+        const sendCount = recordTurnSendOnce(budgetContext, operationId);
         const nudgeEnabled =
           !options.config ||
           resolveEffectiveMessageToolsConfig({
             cfg: options.config,
             agentId: resolveToolAgentId(options),
           })?.turnSendNudge !== false;
-        if (sendCount >= 2 && nudgeEnabled) {
+        if (sendCount !== undefined && sendCount >= 2 && nudgeEnabled) {
           return {
             ...base,
             content: [
