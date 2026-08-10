@@ -248,6 +248,41 @@ export function isQaToolSearchFixture(text: string) {
   return QA_TOOL_SEARCH_PROMPT_RE.test(text) || QA_TOOL_SEARCH_FAILURE_PROMPT_RE.test(text);
 }
 
+// Per-turn send-budget fixture: keep emitting `message`/`conversations_send` to one
+// target across continuation rounds until `count` sends have been planned this turn,
+// then finalize with plain text. Lets an e2e prove the per-turn send ledger (nudge +
+// hard cap) at the real delivery boundary, since the ledger keys on the agent run.
+// Marker `QA-PTSB-SEND` is unique to that fixture, so this never affects other prompts.
+export function extractPerTurnSendBudgetDirective(text: string): {
+  tool: "message" | "conversations_send";
+  count: number;
+  marker: string;
+  ref?: string;
+} | null {
+  const match =
+    /QA-PTSB-SEND\s+tool=(message|conversations_send)\s+count=(\d+)\s+marker=([A-Za-z0-9._-]+)(?:\s+ref=(conv_[a-f0-9]{32}))?/u.exec(
+      text,
+    );
+  if (!match) {
+    return null;
+  }
+  const count = Number.parseInt(match[2] ?? "", 10);
+  if (!Number.isFinite(count) || count < 1) {
+    return null;
+  }
+  const tool = match[1] as "message" | "conversations_send";
+  // conversations_send cannot be planned without a concrete conversationRef to target.
+  if (tool === "conversations_send" && !match[4]) {
+    return null;
+  }
+  return {
+    tool,
+    count,
+    marker: match[3] ?? "QA-PTSB",
+    ...(match[4] ? { ref: match[4] } : {}),
+  };
+}
+
 export function buildExplicitSessionsSpawnArgs(text: string): Record<string, unknown> | null {
   if (!/\bsessions_spawn\b/i.test(text)) {
     return null;
