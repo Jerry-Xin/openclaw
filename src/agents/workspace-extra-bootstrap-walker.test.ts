@@ -1,22 +1,16 @@
-// Parity tests for the cooperative extra-bootstrap glob walker. These pin the
-// walker to Node fs.glob's platform case rules and symlink-descent semantics,
-// the two spots where a hand-rolled walker most easily drifts from fs.glob and
-// silently drops a configured bootstrap file. Symlink cases compare the walker's
-// match set directly against `fs.glob` over the same real tree so the fixtures
-// stay anchored to actual Node behavior rather than a transcribed expectation.
+// Behavior tests for fs.glob-backed extra-bootstrap pattern resolution. The
+// resolver delegates matching to Node fs.glob and only adds a workspace
+// realpath-containment filter, so these cases compare the resolver's match set
+// directly against `fs.glob` over the same real tree (the parity oracle) and pin
+// the two places the containment filter must diverge from fs.glob: a match whose
+// realpath escapes the workspace, and a literal-named symlink pointing outside.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { isPathInside } from "../infra/path-guards.js";
 import { resolveExtraBootstrapPatternPaths } from "./workspace-extra-bootstrap-walker.js";
 import { loadExtraBootstrapFilesWithDiagnostics } from "./workspace.js";
-
-const realPlatform = process.platform;
-
-function setPlatform(platform: NodeJS.Platform): void {
-  Object.defineProperty(process, "platform", { value: platform, configurable: true });
-}
 
 async function nodeGlobRelative(workspaceDir: string, pattern: string): Promise<string[]> {
   const matches: string[] = [];
@@ -26,7 +20,7 @@ async function nodeGlobRelative(workspaceDir: string, pattern: string): Promise<
   return matches.toSorted();
 }
 
-describe("resolveExtraBootstrapPatternPaths platform case parity", () => {
+describe("resolveExtraBootstrapPatternPaths glob semantics", () => {
   let fixtureRoot = "";
   let fixtureCount = 0;
 
@@ -46,71 +40,17 @@ describe("resolveExtraBootstrapPatternPaths platform case parity", () => {
     }
   });
 
-  afterEach(() => {
-    setPlatform(realPlatform);
-  });
-
-  // Node fs.glob builds its Minimatch with `nocase: isWindows || isMacOS` plus
-  // `nocaseMagicOnly`, so a case-differing MAGIC segment like `**/*.MD` still
-  // matches `AGENTS.md` on macOS/Windows but not on Linux. Without this the
-  // walker would silently drop the file on mac/win where fs.glob would have
-  // matched it.
-  for (const platform of ["darwin", "win32"] as const) {
-    it(`matches a case-differing magic segment on ${platform}`, async () => {
-      const workspaceDir = await createWorkspaceDir(`nocase-${platform}`);
-      await fs.writeFile(path.join(workspaceDir, "AGENTS.md"), "agents", "utf-8");
-
-      setPlatform(platform);
-      const matches = await resolveExtraBootstrapPatternPaths(workspaceDir, "**/*.MD", false);
-
-      expect(matches).toStrictEqual(["AGENTS.md"]);
-    });
-  }
-
-  it("does not match a case-differing magic segment on linux", async () => {
-    const workspaceDir = await createWorkspaceDir("nocase-linux");
-    await fs.writeFile(path.join(workspaceDir, "AGENTS.md"), "agents", "utf-8");
-
-    setPlatform("linux");
-    const matches = await resolveExtraBootstrapPatternPaths(workspaceDir, "**/*.MD", false);
-
-    expect(matches).toStrictEqual([]);
-  });
-
-  it("keeps literal path segments case-sensitive even on macOS (nocaseMagicOnly)", async () => {
-    // nocase applies only to the magic portion of the pattern; a literal segment
-    // must still match byte-for-byte, matching Node. `**/AGENTS.MD` carries a
-    // magic `**` (so it routes through the walker) but the literal `AGENTS.MD`
-    // must not match the on-disk `AGENTS.md` even where nocase is on, while the
-    // fully-magic `**/*.MD` must.
-    const workspaceDir = await createWorkspaceDir("literal-case");
-    await fs.writeFile(path.join(workspaceDir, "AGENTS.md"), "agents", "utf-8");
-
-    setPlatform("darwin");
-    const literalSegment = await resolveExtraBootstrapPatternPaths(
-      workspaceDir,
-      "**/AGENTS.MD",
-      false,
-    );
-    const magicSegment = await resolveExtraBootstrapPatternPaths(workspaceDir, "**/*.MD", false);
-
-    expect(literalSegment).toStrictEqual([]);
-    expect(magicSegment).toStrictEqual(["AGENTS.md"]);
-  });
-
   it("matches Node fs.glob for optimized globstar parent traversal", async () => {
-    // Regression: without optimizationLevel: 2 (which Node fs.glob's createMatcher
-    // sets) the walk matcher classifies `*/**/../b/AGENTS.md` such that it matches
-    // nothing, while real fs.glob returns `a/x/b/AGENTS.md`. Mirroring the option
-    // realigns the matcher with fs.glob so a configured bootstrap file is not
-    // silently dropped.
+    // `*/**/../b/AGENTS.md` is a reducible parent-traversal shape fs.glob resolves
+    // to `a/x/b/AGENTS.md`; delegating to fs.glob returns the same set with no
+    // matcher plumbing to keep in sync.
     const workspaceDir = await createWorkspaceDir("optimized-parent");
     await fs.mkdir(path.join(workspaceDir, "a", "x", "b"), { recursive: true });
     await fs.writeFile(path.join(workspaceDir, "a", "x", "b", "AGENTS.md"), "agents", "utf-8");
 
     const pattern = "*/**/../b/AGENTS.md";
     const matches = (
-      await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+      await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
     ).toSorted();
 
     expect(matches).toStrictEqual(["a/x/b/AGENTS.md"]);
@@ -203,7 +143,7 @@ describe("resolveExtraBootstrapPatternPaths parent-traversal parity", () => {
       await fs.writeFile(path.join(workspaceDir, "a", "x", "AGENTS.md"), "ax", "utf-8");
 
       const walkerMatches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
       const contained = await nodeGlobContained(workspaceDir, pattern);
 
@@ -227,7 +167,7 @@ describe("resolveExtraBootstrapPatternPaths parent-traversal parity", () => {
     await fs.writeFile(path.join(treeA, "AGENTS.md"), "root", "utf-8");
     await fs.writeFile(path.join(treeA, "leaf", "AGENTS.md"), "leaf", "utf-8");
     const walkerA = (
-      await resolveExtraBootstrapPatternPaths(treeA, "**/../AGENTS.md", false)
+      await resolveExtraBootstrapPatternPaths(treeA, "**/../AGENTS.md")
     ).toSorted();
     expect(walkerA).toStrictEqual(["AGENTS.md"]);
     expect(walkerA).toStrictEqual(await nodeGlobContained(treeA, "**/../AGENTS.md"));
@@ -238,7 +178,7 @@ describe("resolveExtraBootstrapPatternPaths parent-traversal parity", () => {
     await fs.mkdir(path.join(treeB, "leaf"), { recursive: true });
     await fs.writeFile(path.join(treeB, "leaf", "AGENTS.md"), "leaf", "utf-8");
     const walkerB = (
-      await resolveExtraBootstrapPatternPaths(treeB, "**/../AGENTS.md", false)
+      await resolveExtraBootstrapPatternPaths(treeB, "**/../AGENTS.md")
     ).toSorted();
     expect(walkerB).toStrictEqual([]);
     expect(walkerB).toStrictEqual(await nodeGlobContained(treeB, "**/../AGENTS.md"));
@@ -253,7 +193,7 @@ describe("resolveExtraBootstrapPatternPaths parent-traversal parity", () => {
     await fs.writeFile(path.join(treeC, "sub", "AGENTS.md"), "sub", "utf-8");
     await fs.writeFile(path.join(treeC, "sub", "child", "AGENTS.md"), "child", "utf-8");
     const walkerC = (
-      await resolveExtraBootstrapPatternPaths(treeC, "**/../AGENTS.md", false)
+      await resolveExtraBootstrapPatternPaths(treeC, "**/../AGENTS.md")
     ).toSorted();
     expect(walkerC).toStrictEqual(["AGENTS.md", "sub/AGENTS.md"]);
     expect(walkerC).toStrictEqual(await nodeGlobContained(treeC, "**/../AGENTS.md"));
@@ -272,7 +212,7 @@ describe("resolveExtraBootstrapPatternPaths parent-traversal parity", () => {
     // the escaping parent pop, so both must be empty.
     await fs.writeFile(path.join(rootDir, "AGENTS.md"), "outside", "utf-8");
 
-    const matches = await resolveExtraBootstrapPatternPaths(workspaceDir, "**/../AGENTS.md", false);
+    const matches = await resolveExtraBootstrapPatternPaths(workspaceDir, "**/../AGENTS.md");
 
     expect(matches).toStrictEqual([]);
     // fs.glob would surface the escaping parent match; the walker must not.
@@ -334,7 +274,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "**/pkg/linked/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual(["pkg/linked/AGENTS.md", "pkg/linked/nested/AGENTS.md"]);
@@ -367,7 +307,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "**/pkg/lnkA/lnkB/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual(["pkg/lnkA/lnkB/AGENTS.md", "pkg/lnkA/lnkB/nested/AGENTS.md"]);
@@ -394,7 +334,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "**/wl/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual([]);
@@ -419,7 +359,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "base/*/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual([]);
@@ -445,7 +385,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "*/loop/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual(["pkg/loop/AGENTS.md"]);
@@ -469,7 +409,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "self/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual(["self/AGENTS.md", "self/sub/AGENTS.md"]);
@@ -496,13 +436,13 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const recursive = "**/AGENTS.md";
       expect(
-        (await resolveExtraBootstrapPatternPaths(workspaceDir, recursive, false)).toSorted(),
+        (await resolveExtraBootstrapPatternPaths(workspaceDir, recursive)).toSorted(),
       ).toStrictEqual(await nodeGlobRelative(workspaceDir, recursive));
 
       // A literal chain naming the loop repeatedly must also terminate; completing
       // is the assertion (the deleted guard existed only to force termination).
       await expect(
-        resolveExtraBootstrapPatternPaths(workspaceDir, "loop/loop/loop/**/AGENTS.md", false),
+        resolveExtraBootstrapPatternPaths(workspaceDir, "loop/loop/loop/**/AGENTS.md"),
       ).resolves.toBeDefined();
     },
     15000,
@@ -528,7 +468,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "**/a/link/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual(["a/link/AGENTS.md", "a/link/a/AGENTS.md"]);
@@ -557,7 +497,6 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
       const matches = await resolveExtraBootstrapPatternPaths(
         workspaceDir,
         "**/pkg/linked/**/AGENTS.md",
-        false,
       );
 
       expect(matches).toStrictEqual([]);
@@ -567,10 +506,12 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
   it.runIf(process.platform !== "win32")(
     "refuses an initial walk root that is a directory symlink escaping the workspace",
     async () => {
-      // Containment guard for the seed/initial root (P1-E): when a pattern's
-      // literal prefix is itself a directory symlink pointing outside the
-      // workspace, the seed frame never passes through resolveSymlinkDescent, so
-      // the walker must reject the external initial root before any readdir.
+      // Containment guard for a pattern whose literal prefix is itself a directory
+      // symlink pointing outside the workspace: fs.glob would follow the link, but
+      // the realpath filter drops every match whose canonical path escapes the
+      // workspace, so the resolver returns nothing. (The loader additionally
+      // rejects this pattern up front via patternWalkRootStaysInWorkspace, surfacing
+      // a security diagnostic — see workspace.load-extra-bootstrap-files.test.ts.)
       const rootDir = await createWorkspaceDir("escape-initial-root");
       const workspaceDir = path.join(rootDir, "workspace");
       const outsideDir = path.join(rootDir, "outside");
@@ -581,28 +522,13 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
       if (!(await trySymlink(path.join("..", "outside"), linkPath))) {
         return;
       }
-      const outsideRealpath = await fs.realpath(outsideDir);
 
-      const readdirSpy = vi.spyOn(fs, "readdir");
-      try {
-        const matches = await resolveExtraBootstrapPatternPaths(
-          workspaceDir,
-          "outside-link/**/AGENTS.md",
-          false,
-        );
+      const matches = await resolveExtraBootstrapPatternPaths(
+        workspaceDir,
+        "outside-link/**/AGENTS.md",
+      );
 
-        expect(matches).toStrictEqual([]);
-        // The reject must happen before any readdir of the escaped root, not as a
-        // later per-file guard: prove readdir never touched the link or its target.
-        for (const call of readdirSpy.mock.calls) {
-          const readPath = call[0] as string;
-          expect(readPath).not.toBe(linkPath);
-          expect(readPath).not.toBe(outsideDir);
-          expect(readPath).not.toBe(outsideRealpath);
-        }
-      } finally {
-        readdirSpy.mockRestore();
-      }
+      expect(matches).toStrictEqual([]);
     },
   );
 
@@ -630,7 +556,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "pkg/{linked,other}/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual([
@@ -660,7 +586,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "pkg/{*,other}/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual([]);
@@ -689,7 +615,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "{**/linked,pkg/linked}/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual(["pkg/linked/AGENTS.md", "pkg/linked/nested/AGENTS.md"]);
@@ -716,7 +642,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "{**/linked,other}/**/AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual([]);
@@ -741,7 +667,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "*/**/../AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual(await nodeGlobRelative(workspaceDir, pattern));
@@ -769,7 +695,6 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
       const matches = await resolveExtraBootstrapPatternPaths(
         workspaceDir,
         "link/**/../AGENTS.md",
-        false,
       );
 
       expect(matches).toStrictEqual([]);
@@ -802,7 +727,7 @@ describe("resolveExtraBootstrapPatternPaths symlink descent parity", () => {
 
       const pattern = "link/**/../AGENTS.md";
       const matches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(matches).toStrictEqual(["link/AGENTS.md"]);
@@ -852,7 +777,7 @@ describe("resolveExtraBootstrapPatternPaths matching-directory parity", () => {
 
     for (const pattern of ["**/AGENTS.md", "*/AGENTS.md"]) {
       const walkerMatches = (
-        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern, false)
+        await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
       ).toSorted();
 
       expect(walkerMatches).toStrictEqual(await nodeGlobRelative(workspaceDir, pattern));

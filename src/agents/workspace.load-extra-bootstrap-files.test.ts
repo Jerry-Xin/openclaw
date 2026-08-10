@@ -453,6 +453,70 @@ describe("loadExtraBootstrapFilesWithDiagnostics", () => {
     ]);
   });
 
+  it("loads a literal-bracket directory via the transparent no-match fallback", async () => {
+    // A pattern like `pkg[ab]/AGENTS.md`, written before the resolver adopted
+    // Node glob grammar to name a real directory literally called `pkg[ab]`, now
+    // parses `[ab]` as a character class and the glob matches nothing. The
+    // empty-set literal fallback opens the real `pkg[ab]` directory's file with
+    // zero operator action — no `openclaw doctor --fix` step.
+    const workspaceDir = await createWorkspaceDir("literal-fallback-brackets");
+    const packageDir = path.join(workspaceDir, "pkg[ab]");
+    await fs.mkdir(packageDir, { recursive: true });
+    await fs.writeFile(path.join(packageDir, "AGENTS.md"), "literal bracket agents", "utf-8");
+
+    const files = await loadExtraBootstrapFileList(workspaceDir, ["pkg[ab]/AGENTS.md"]);
+
+    expect(files).toStrictEqual([
+      {
+        name: "AGENTS.md",
+        path: path.join(packageDir, "AGENTS.md"),
+        content: "literal bracket agents",
+        missing: false,
+      },
+    ]);
+  });
+
+  it("keeps the literal fallback dormant when the bracket pattern is a live glob", async () => {
+    // Accepted edge case (i): a pattern simultaneously a live glob AND a literal
+    // path. Dirs `a`/`b` make `[ab]/AGENTS.md` a live glob, so the match set is
+    // non-empty and the fallback never fires — the literal `[ab]` directory's own
+    // file is intentionally NOT added. Extremely unlikely in practice; the glob
+    // interpretation wins.
+    const workspaceDir = await createWorkspaceDir("literal-fallback-dormant");
+    for (const name of ["a", "b", "[ab]"]) {
+      const dir = path.join(workspaceDir, name);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "AGENTS.md"), `${name} agents`, "utf-8");
+    }
+
+    const files = await loadExtraBootstrapFileList(workspaceDir, ["[ab]/AGENTS.md"]);
+
+    expect(files.map((file: { path: string }) => file.path).toSorted()).toStrictEqual(
+      [
+        path.join(workspaceDir, "a", "AGENTS.md"),
+        path.join(workspaceDir, "b", "AGENTS.md"),
+      ].toSorted(),
+    );
+  });
+
+  it("does not open a literal-bracket parent when a child glob follows it", async () => {
+    // Accepted edge case (ii): a literal-bracket parent with a live child glob
+    // (`pkg[ab]/**/AGENTS.md`). The glob matches nothing (no `pkga`/`pkgb`), and
+    // the raw pattern is not itself an on-disk path (the `**` segment does not
+    // exist), so the existence-gated fallback rejects it and nothing loads.
+    const workspaceDir = await createWorkspaceDir("literal-fallback-child-glob");
+    const nested = path.join(workspaceDir, "pkg[ab]", "nested");
+    await fs.mkdir(nested, { recursive: true });
+    await fs.writeFile(path.join(nested, "AGENTS.md"), "nested", "utf-8");
+
+    const { files, diagnostics } = await loadExtraBootstrapFilesWithDiagnostics(workspaceDir, [
+      "pkg[ab]/**/AGENTS.md",
+    ]);
+
+    expect(files).toHaveLength(0);
+    expect(diagnostics).toHaveLength(0);
+  });
+
   it("resolves a bracket-class pattern through the glob walker", async () => {
     // Node glob grammar: `[ab]` is a character class, so it must route through
     // the walker and match sibling directories `a` and `b` but not `c`.
@@ -841,9 +905,38 @@ describe("loadExtraBootstrapFilesWithDiagnostics", () => {
   });
 
   it.runIf(process.platform !== "win32")(
-    "falls back to a shallow scan without entering unrelated unreadable branches",
+    "skips an unreadable glob branch and still loads readable matches",
     async () => {
-      const workspaceDir = await createWorkspaceDir("shallow-pattern");
+      // Node fs.glob walks past a subtree it cannot read (EACCES) rather than
+      // throwing, so an unreadable sibling package must not abort loading of the
+      // readable one — the readable match still loads and no diagnostic is
+      // surfaced for the skipped branch.
+      const workspaceDir = await createWorkspaceDir("unreadable-branch");
+      const blockedDir = path.join(workspaceDir, "packages", "blocked");
+      const readableDir = path.join(workspaceDir, "packages", "readable");
+      await fs.mkdir(blockedDir, { recursive: true });
+      await fs.mkdir(readableDir, { recursive: true });
+      await fs.writeFile(path.join(blockedDir, "AGENTS.md"), "blocked", "utf-8");
+      await fs.writeFile(path.join(readableDir, "AGENTS.md"), "readable", "utf-8");
+      await fs.chmod(blockedDir, 0o000);
+      try {
+        const result = await loadExtraBootstrapFilesWithDiagnostics(workspaceDir, [
+          "packages/*/AGENTS.md",
+        ]);
+        expect(result.files).toEqual([
+          expect.objectContaining({ path: path.join(readableDir, "AGENTS.md") }),
+        ]);
+        expect(result.diagnostics).toEqual([]);
+      } finally {
+        await fs.chmod(blockedDir, 0o700);
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "does not descend into unreadable branches that cannot satisfy a shallow pattern",
+    async () => {
+      const workspaceDir = await createWorkspaceDir("strict-pruned");
       const privateDir = path.join(workspaceDir, "packages", "blocked", "node_modules", "private");
       const readableDir = path.join(workspaceDir, "packages", "readable");
       await fs.mkdir(privateDir, { recursive: true });
