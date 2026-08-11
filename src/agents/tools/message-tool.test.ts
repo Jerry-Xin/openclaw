@@ -5458,7 +5458,7 @@ describe("per-turn send budget", () => {
         handledBy: "core",
         payload: { results: [] },
         dryRun: false,
-      } as MessageActionRunResult);
+      } as MessageActionResult);
       return;
     }
     // A core send reports its outcome via sendResult.deliveryStatus. A best-effort
@@ -5484,7 +5484,7 @@ describe("per-turn send budget", () => {
             },
           }
         : {}),
-    } as MessageActionRunResult);
+    } as MessageActionResult);
   }
 
   function softNotice(result: { content: Array<{ type: string; text?: string }> }) {
