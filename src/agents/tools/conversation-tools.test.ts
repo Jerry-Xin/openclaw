@@ -6,7 +6,7 @@ import {
   ConversationTurnResultSchema,
 } from "../../../packages/gateway-protocol/src/schema/agent.js";
 import type { ChannelPlugin } from "../../channels/plugins/types.js";
-import type { MessageActionRunResult } from "../../infra/outbound/message-action-runner.js";
+import type { MessageActionResult } from "../../infra/outbound/message-action-contracts.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
 import {
   DEFAULT_GATEWAY_HTTP_TOOL_DENY,
@@ -599,7 +599,7 @@ describe("message and conversations_send share the per-turn budget", () => {
           handledBy: "plugin",
           payload: {},
           dryRun: false,
-        }) satisfies MessageActionRunResult) as never,
+        }) satisfies MessageActionResult) as never,
       resolveCommandSecretRefsViaGateway: (async ({ config: cfg }: { config: unknown }) => ({
         resolvedConfig: cfg,
         diagnostics: [],
@@ -671,7 +671,7 @@ describe("message and conversations_send share the per-turn budget", () => {
           handledBy: "plugin",
           payload: {},
           dryRun: false,
-        }) satisfies MessageActionRunResult) as never,
+        }) satisfies MessageActionResult) as never,
       resolveCommandSecretRefsViaGateway: (async ({ config: cfg }: { config: unknown }) => ({
         resolvedConfig: cfg,
         diagnostics: [],
