@@ -9,24 +9,27 @@
  * operator opts in, cap the fan-out — independently of the loop detector and its
  * default-off switch.
  *
- * State is module-level and keyed by agent session, mirroring the reviewed
+ * State is module-level and keyed by (agent session, run), mirroring the reviewed
  * `recentPollVoteBySession` precedent in message-tool.ts: a per-tool-instance
  * counter would be lost across the run boundary that separates the tool calls in
  * one turn, so the count must outlive the instance. A "turn" is one agent run
- * (`runId`); a slot resets when its `runId` changes, which bounds the counts to a
- * single turn without any explicit cleanup.
+ * (`runId`), so each entry is scoped to one (session, run) pair; a run that has no
+ * entry starts fresh, which bounds the counts to a single turn without any
+ * explicit cleanup. Concurrent foreground runs can share one sessionKey (see
+ * src/auto-reply/dispatch.freshness.test.ts), so the runId is part of the key
+ * rather than a field that resets a shared slot — otherwise a later run would
+ * evict an earlier still-live run's counts.
  */
 import { normalizeTargetForProvider } from "../../infra/outbound/target-normalization.js";
 import { normalizeAccountId } from "../../routing/account-id.js";
 import { normalizeMessageChannel } from "../../utils/message-channel-normalize.js";
 
 // A turn can span more tool round-trips than a poll echo, so this TTL is longer
-// than POLL_VOTE_ECHO_TTL_MS; it only prunes sessions that went fully idle and
-// keeps the single-slot map bounded in a long-lived gateway.
+// than POLL_VOTE_ECHO_TTL_MS; it only prunes (session, run) entries that went fully
+// idle and keeps the map bounded in a long-lived gateway.
 export const TURN_SEND_LEDGER_TTL_MS = 10 * 60_000;
 
 type TurnSendSlot = {
-  runId: string;
   counts: Map<string, number>;
   // Operation identities already counted this turn. conversations_send derives a
   // stable operationId per (toolCallId, conversationRef); the Gateway resolves a
@@ -37,8 +40,17 @@ type TurnSendSlot = {
   recordedAt: number;
 };
 
-// Single slot per session: the current turn's per-target counts.
+// One entry per (session, run): the turn's per-target counts. Concurrent turns can
+// share a sessionKey but carry distinct runIds, so runId is folded into the key —
+// keying by sessionKey alone would let a later run's record() evict an earlier
+// still-live run's counts.
 const turnSendBySession = new Map<string, TurnSendSlot>();
+
+// The map key `${sessionKey}\0${runId}`. The NUL separator can't appear in either
+// component, so distinct (session, run) pairs never collide.
+function ledgerKey(sessionKey: string, runId: string): string {
+  return `${sessionKey}\0${runId}`;
+}
 
 type TurnSendKey = {
   sessionKey: string;
@@ -81,17 +93,17 @@ function isLiveSlot(slot: TurnSendSlot, now: number): boolean {
   return now - slot.recordedAt <= TURN_SEND_LEDGER_TTL_MS;
 }
 
-// The current turn's slot for `sessionKey`, or a fresh one when the session has no
-// slot, its slot belongs to a prior turn (runId differs), or the TTL window has
-// elapsed. Shared by every recorder so counts and seen-operation ids reset together
-// on a turn boundary. Callers mutate the returned slot and reseat it via the map.
+// The (session, run) slot, or a fresh one when that pair has no entry or its TTL
+// window has elapsed. A different run on the same session is a distinct key, so it
+// naturally gets its own fresh slot instead of evicting this one. Shared by every
+// recorder so counts and seen-operation ids reset together on a turn boundary.
+// Callers mutate the returned slot and reseat it via the map.
 function liveSlotForTurn(sessionKey: string, runId: string, now: number): TurnSendSlot {
-  const existing = turnSendBySession.get(sessionKey);
-  if (existing && existing.runId === runId && isLiveSlot(existing, now)) {
+  const existing = turnSendBySession.get(ledgerKey(sessionKey, runId));
+  if (existing && isLiveSlot(existing, now)) {
     return existing;
   }
   return {
-    runId,
     counts: new Map<string, number>(),
     seenOperations: new Set<string>(),
     recordedAt: now,
@@ -100,9 +112,9 @@ function liveSlotForTurn(sessionKey: string, runId: string, now: number): TurnSe
 
 /**
  * Records one successful send to `targetKey` in the current turn and returns the
- * running count (>= 1). A slot whose `runId` differs, or whose window has expired,
- * is treated as a new turn and its counts are cleared before recording. `now` is
- * injectable for deterministic tests; it defaults to the wall clock.
+ * running count (>= 1). A (session, run) pair with no live entry, or whose window
+ * has expired, starts fresh before recording. `now` is injectable for deterministic
+ * tests; it defaults to the wall clock.
  */
 export function recordTurnSend(
   { sessionKey, runId, targetKey }: TurnSendKey,
@@ -113,7 +125,7 @@ export function recordTurnSend(
   const next = (slot.counts.get(targetKey) ?? 0) + 1;
   slot.counts.set(targetKey, next);
   slot.recordedAt = now;
-  turnSendBySession.set(sessionKey, slot);
+  turnSendBySession.set(ledgerKey(sessionKey, runId), slot);
   return next;
 }
 
@@ -129,8 +141,8 @@ export function hasRecordedTurnSendOperation(
   operationId: string,
   now: number = Date.now(),
 ): boolean {
-  const slot = turnSendBySession.get(sessionKey);
-  if (!slot || slot.runId !== runId || !isLiveSlot(slot, now)) {
+  const slot = turnSendBySession.get(ledgerKey(sessionKey, runId));
+  if (!slot || !isLiveSlot(slot, now)) {
     return false;
   }
   return slot.seenOperations.has(operationId);
@@ -151,7 +163,7 @@ export function recordTurnSendOnce(
   pruneExpired(now);
   const slot = liveSlotForTurn(sessionKey, runId, now);
   slot.recordedAt = now;
-  turnSendBySession.set(sessionKey, slot);
+  turnSendBySession.set(ledgerKey(sessionKey, runId), slot);
   if (slot.seenOperations.has(operationId)) {
     return undefined;
   }
@@ -163,9 +175,9 @@ export function recordTurnSendOnce(
 
 /**
  * Reads the current turn's send count for `targetKey` without incrementing it.
- * Returns 0 when the session has no slot, the slot belongs to a prior turn, or the
- * target has not been sent to yet — so a caller can gate the next send before
- * dispatch. `now` is injectable for deterministic tests; it defaults to the wall clock.
+ * Returns 0 when the (session, run) pair has no entry, or the target has not been
+ * sent to yet — so a caller can gate the next send before dispatch. `now` is
+ * injectable for deterministic tests; it defaults to the wall clock.
  *
  * An expired slot is pruned and treated as 0: otherwise a capped slot past its TTL
  * would keep returning its stale count and block forever, since the cap check runs
@@ -182,12 +194,13 @@ export function peekTurnSendCount(
   { sessionKey, runId, targetKey }: TurnSendKey,
   now: number = Date.now(),
 ): number {
-  const slot = turnSendBySession.get(sessionKey);
-  if (!slot || slot.runId !== runId) {
+  const key = ledgerKey(sessionKey, runId);
+  const slot = turnSendBySession.get(key);
+  if (!slot) {
     return 0;
   }
   if (!isLiveSlot(slot, now)) {
-    turnSendBySession.delete(sessionKey);
+    turnSendBySession.delete(key);
     return 0;
   }
   return slot.counts.get(targetKey) ?? 0;
