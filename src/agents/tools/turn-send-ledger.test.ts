@@ -46,10 +46,10 @@ describe("turn-send-ledger", () => {
     expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
   });
 
-  it("resets counts when the runId changes (new turn)", () => {
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2 - 1);
+  it("starts a fresh count for a new run on the same session", () => {
+    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(1);
     expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
-    // New run for the same session starts the count over.
+    // A new run on the same session is a distinct ledger key, so it starts fresh.
     expect(recordTurnSend({ sessionKey: "s1", runId: "run-2", targetKey: "tg:a" })).toBe(1);
   });
 
@@ -57,6 +57,24 @@ describe("turn-send-ledger", () => {
     expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(1);
     expect(recordTurnSend({ sessionKey: "s2", runId: "run-1", targetKey: "tg:a" })).toBe(1);
     expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
+  });
+
+  it("keeps interleaved runs on one session isolated (A -> B -> A)", () => {
+    // Concurrent foreground turns share a sessionKey but carry distinct runIds:
+    // src/auto-reply/dispatch.freshness.test.ts:703 ("keeps concurrent foreground
+    // finals isolated for different targets sharing a session", sharedSessionKey
+    // = "agent:main:main") starts run A, completes run B on the same session, then
+    // resumes A. B recording between A's sends must not evict A's slot, or A's
+    // cap/nudge silently resets to 0 mid-turn.
+    const session = "agent:main:main";
+    const target = "tg:a";
+    const runA = { sessionKey: session, runId: "run-A", targetKey: target };
+    const runB = { sessionKey: session, runId: "run-B", targetKey: target };
+    expect(recordTurnSend(runA)).toBe(1);
+    expect(recordTurnSend(runB)).toBe(1);
+    expect(recordTurnSend(runA)).toBe(2);
+    expect(peekTurnSendCount(runA)).toBe(2);
+    expect(peekTurnSendCount(runB)).toBe(1);
   });
 
   it("peeks without mutating and returns 0 for a different turn", () => {
@@ -150,6 +168,18 @@ describe("turn-send-ledger operation identity", () => {
     // A new turn has no memory of the prior operationId, so it counts fresh.
     expect(hasRecordedTurnSendOperation(nextTurn, "op-1")).toBe(false);
     expect(recordTurnSendOnce(nextTurn, "op-1")).toBe(1);
+  });
+
+  it("keeps seen operation ids isolated across interleaved runs on one session", () => {
+    const session = "agent:main:main";
+    const target = "tg:a";
+    const runA = { sessionKey: session, runId: "run-A", targetKey: target };
+    const runB = { sessionKey: session, runId: "run-B", targetKey: target };
+    expect(recordTurnSendOnce(runA, "op-a")).toBe(1);
+    expect(recordTurnSendOnce(runB, "op-b")).toBe(1);
+    expect(hasRecordedTurnSendOperation(runA, "op-a")).toBe(true);
+    // op-a already counted for run A -> replay is idempotent (no double count).
+    expect(recordTurnSendOnce(runA, "op-a")).toBeUndefined();
   });
 
   it("forgets seen operations once the slot expires past the TTL", () => {
