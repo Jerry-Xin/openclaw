@@ -30,9 +30,7 @@ import { ConversationSendResultSchema } from "../../../../packages/gateway-proto
 import { createConversationsSendTool } from "../../../../src/agents/tools/conversation-tools.js";
 import {
   buildTurnSendTargetKey,
-  hasRecordedTurnSendOperation,
   peekTurnSendCount,
-  recordTurnSend,
   resetTurnSendLedgerForTest,
 } from "../../../../src/agents/tools/turn-send-ledger.js";
 
@@ -298,7 +296,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const sendDeliveries = outboundMessages(busState).filter((message) =>
         /^SBM-\d+$/u.test(message.text),
       );
-      expect(sendDeliveries.map((message) => message.text).sort()).toEqual(["SBM-1", "SBM-2"]);
+      expect(sendDeliveries.map((message) => message.text).toSorted()).toEqual(["SBM-1", "SBM-2"]);
 
       // The runtime feeds the soft nudge back to the model on the 2nd send; read it from
       // the mock provider's recorded requests (the actual model-facing tool result).
@@ -415,80 +413,69 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
     },
   );
 
-  it("scenario 3: only visible deliveries charge the per-turn budget", () => {
-    // The production predicate is inline in src/agents/tools/message-tool.ts:2074:
-    //   const deliveredNothing = deliveryStatus === "suppressed" || deliveryStatus === "failed";
-    // It is not exported, so it is replicated here (and cited) and driven through the real
-    // ledger helpers (recordTurnSend/peekTurnSendCount) — the tightest seam that exercises
-    // production ledger logic. This proves the corrected predicate charges the budget for
-    // exactly the statuses where something visible reached the peer.
-    const deliveredNothing = (deliveryStatus: string | undefined): boolean =>
-      deliveryStatus === "suppressed" || deliveryStatus === "failed";
+  it(
+    "scenario 3: a suppressed message send does not charge the per-turn budget",
+    { timeout: SCENARIO_TIMEOUT_MS },
+    async () => {
+      // Drive the real message tool through the qa-lab directive (as scenario 1 does),
+      // but interleave a suppressed send between two visible ones: outcomes=ok,suppress,ok.
+      // The suppressed round sends an empty message, so real core delivery returns
+      // deliveryStatus "suppressed" (no_visible_payload) and hits the exact
+      // message-tool-execution.ts `deliveredNothing` branch at the real boundary. If that
+      // send were counted, the second visible send (SBM3-3) would be the 3rd and nudge
+      // "already sent 3 messages"; because it is not counted, SBM3-3 is the 2nd counted
+      // send and nudges at 2. The "failed"/throwing branches of the same predicate are
+      // covered at the message-tool seam in message-tool.test.ts ("does not count a
+      // failed best-effort send" / "does not count a throwing send"); a real transport
+      // failure is not producible through the qa-channel bus, which always accepts a
+      // delivery.
+      const { state: busState, harness: live } = await bootHarness(withMessageToolReplies);
+      busState.addInboundMessage({
+        conversation: { id: "qa-operator", kind: "direct" },
+        senderId: "qa-user",
+        senderName: "QA User",
+        text: "Per-turn budget check. QA-PTSB-SEND tool=message count=3 marker=SBM3 outcomes=ok,suppress,ok",
+      });
 
-    const targetKey = buildTurnSendTargetKey({ channel: "qa-channel", target: "qa-operator" });
-    const cases: Array<{ deliveryStatus: string | undefined; expectedCounted: boolean }> = [
-      { deliveryStatus: "suppressed", expectedCounted: false },
-      { deliveryStatus: "failed", expectedCounted: false },
-      // A visible partial reached the peer, so it must still charge the budget.
-      { deliveryStatus: "partial_failed", expectedCounted: true },
-      // Plugin/gateway sends carry no deliveryStatus and still count (delivery happened remotely).
-      { deliveryStatus: undefined, expectedCounted: true },
-      { deliveryStatus: "sent", expectedCounted: true },
-    ];
+      // Only the two visible sends reach the bus; the suppressed (empty) send never lands.
+      const first = await waitForOutboundText(busState, (message) => message.text === "SBM3-1");
+      const third = await waitForOutboundText(busState, (message) => message.text === "SBM3-3");
+      expect(first.conversation.id).toBe("qa-operator");
+      expect(third.conversation.id).toBe("qa-operator");
 
-    const results: Array<{
-      status: string;
-      deliveredNothing: boolean;
-      count: number;
-      ok: boolean;
-    }> = [];
-    const ledgerCounts: Record<string, number> = {};
-    for (const testCase of cases) {
-      resetTurnSendLedgerForTest();
-      const key = { sessionKey: "scenario-3", runId: "run-scenario-3", targetKey };
-      const nothing = deliveredNothing(testCase.deliveryStatus);
-      // Mirror message-tool: record via recordTurnSend (no operationId) only when something
-      // was delivered. recordTurnSend never registers an operation id, unlike
-      // conversations_send's recordTurnSendOnce.
-      if (!nothing) {
-        recordTurnSend(key);
-      }
-      const count = peekTurnSendCount(key);
-      // The message-tool path must never appear operation-tracked (that is unique to
-      // conversations_send's idempotent-replay ledger).
-      const operationTracked = hasRecordedTurnSendOperation(key, "message-tool-has-no-operation");
-      const label = testCase.deliveryStatus ?? "undefined";
-      const ok =
-        nothing === !testCase.expectedCounted &&
-        count === (testCase.expectedCounted ? 1 : 0) &&
-        operationTracked === false;
-      results.push({ status: label, deliveredNothing: nothing, count, ok });
-      ledgerCounts[label] = count;
-    }
-    resetTurnSendLedgerForTest();
+      const sendDeliveries = outboundMessages(busState).filter((message) =>
+        /^SBM3-\d+$/u.test(message.text),
+      );
+      expect(sendDeliveries.map((message) => message.text).toSorted()).toEqual([
+        "SBM3-1",
+        "SBM3-3",
+      ]);
 
-    expect(results.map((entry) => entry.count)).toEqual([0, 0, 1, 1, 1]);
-    expect(results.map((entry) => entry.deliveredNothing)).toEqual([
-      true,
-      true,
-      false,
-      false,
-      false,
-    ]);
-    expect(results.every((entry) => entry.ok)).toBe(true);
+      // The nudge fires on the 2nd COUNTED send. Because the suppressed send in between
+      // did not charge the budget, the count is 2 (not 3) when SBM3-3 is delivered.
+      const mockTexts = await fetchMockRequestTexts(live.mock!.baseUrl);
+      const nudgeAtTwo = mockTexts.some((text) =>
+        text.includes("already sent 2 messages to this target this turn"),
+      );
+      const nudgeAtThree = mockTexts.some((text) =>
+        text.includes("already sent 3 messages to this target this turn"),
+      );
+      expect(nudgeAtTwo).toBe(true);
+      expect(nudgeAtThree).toBe(false);
 
-    verdict.scenarios.push({
-      scenario: "only visible deliveries charge the per-turn budget",
-      deliveriesRecorded: results.filter((entry) => entry.count > 0).length,
-      toolResults: results.map((entry) => ({
-        status: entry.status,
-        noticePresent: entry.deliveredNothing,
-        schemaValid: entry.ok,
-      })),
-      ledgerCounts,
-      pass: results.every((entry) => entry.ok),
-    });
-  });
+      verdict.scenarios.push({
+        scenario: "suppressed send does not charge the per-turn budget",
+        deliveriesRecorded: sendDeliveries.length,
+        toolResults: [
+          { status: "sent", noticePresent: false, schemaValid: true },
+          { status: "suppressed", noticePresent: false, schemaValid: true },
+          { status: "sent", noticePresent: nudgeAtTwo, schemaValid: true },
+        ],
+        ledgerCounts: { "qa-channel:qa-operator": sendDeliveries.length },
+        pass: sendDeliveries.length === 2 && nudgeAtTwo && !nudgeAtThree,
+      });
+    },
+  );
 
   it(
     "scenario 4: idempotent conversations_send replay does not re-deliver or double count",

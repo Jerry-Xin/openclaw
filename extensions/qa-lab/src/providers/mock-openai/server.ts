@@ -1068,13 +1068,29 @@ async function buildResponsesPayload(
     ).length;
     if (priorPlannedSends < perTurnSendBudget.count) {
       const sequence = priorPlannedSends + 1;
+      // `suppress` emits an empty message so real core delivery returns
+      // deliveryStatus "suppressed" (no_visible_payload); that send must not charge
+      // the per-turn budget. Any other outcome sends a visible markered payload.
+      const outcome = perTurnSendBudget.outcomes?.[sequence - 1] ?? "ok";
+      const suppressed = outcome === "suppress";
       const sendArgs =
         perTurnSendBudget.tool === "conversations_send"
           ? {
               conversationRef: perTurnSendBudget.ref,
               message: `${perTurnSendBudget.marker}-${sequence}`,
             }
-          : { action: "send", message: `${perTurnSendBudget.marker}-${sequence}` };
+          : {
+              action: "send",
+              message: suppressed ? "" : `${perTurnSendBudget.marker}-${sequence}`,
+              // In message_tool_only mode a delivered source-reply send with
+              // `final !== false` terminates the turn (resolveMessageToolSourceReplyFinal
+              // in embedded-agent-message-tool-source-reply.ts). This fixture fans out
+              // several sends in one turn, so each fan-out send marks itself non-final to
+              // keep the run looping; the turn ends when the FINAL assistant text is
+              // emitted after `count` sends. `final` is deleted before dispatch, so it
+              // never reaches delivery — it only gates turn termination.
+              final: false,
+            };
       return buildToolCallEventsWithArgs(perTurnSendBudget.tool, sendArgs);
     }
     return buildAssistantEvents(`${perTurnSendBudget.marker}-FINAL`);
