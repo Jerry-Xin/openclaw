@@ -29,6 +29,13 @@ import { normalizeMessageChannel } from "../../utils/message-channel-normalize.j
 // idle and keeps the map bounded in a long-lived gateway.
 export const TURN_SEND_LEDGER_TTL_MS = 10 * 60_000;
 
+// Absolute ceiling on live (session, run) slots. TTL prunes idle turns, but a
+// burst of many short-lived runs inside one TTL window could grow the map
+// without bound. This LRU cap evicts the oldest-touched slot once the ceiling is
+// crossed, so the map stays bounded even if nothing expires. Sized far above any
+// realistic concurrent-turn count, so it only trips on runaway growth.
+export const MAX_TURN_SEND_SLOTS = 2048;
+
 type TurnSendSlot = {
   counts: Map<string, number>;
   // Operation identities already counted this turn. conversations_send derives a
@@ -50,6 +57,22 @@ const turnSendBySession = new Map<string, TurnSendSlot>();
 // component, so distinct (session, run) pairs never collide.
 function ledgerKey(sessionKey: string, runId: string): string {
   return `${sessionKey}\0${runId}`;
+}
+
+// Reseat a slot as the most-recently-used entry (delete + set moves it to the
+// Map's tail) and evict the oldest slots past the cap. Map iteration order is
+// insertion order, so the first key is the least-recently-touched slot. Every
+// record() touch reseats its slot, so eviction order is LRU by write access.
+function storeSlot(key: string, slot: TurnSendSlot): void {
+  turnSendBySession.delete(key);
+  turnSendBySession.set(key, slot);
+  while (turnSendBySession.size > MAX_TURN_SEND_SLOTS) {
+    const oldest = turnSendBySession.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    turnSendBySession.delete(oldest);
+  }
 }
 
 type TurnSendKey = {
@@ -125,7 +148,7 @@ export function recordTurnSend(
   const next = (slot.counts.get(targetKey) ?? 0) + 1;
   slot.counts.set(targetKey, next);
   slot.recordedAt = now;
-  turnSendBySession.set(ledgerKey(sessionKey, runId), slot);
+  storeSlot(ledgerKey(sessionKey, runId), slot);
   return next;
 }
 
@@ -163,7 +186,7 @@ export function recordTurnSendOnce(
   pruneExpired(now);
   const slot = liveSlotForTurn(sessionKey, runId, now);
   slot.recordedAt = now;
-  turnSendBySession.set(ledgerKey(sessionKey, runId), slot);
+  storeSlot(ledgerKey(sessionKey, runId), slot);
   if (slot.seenOperations.has(operationId)) {
     return undefined;
   }

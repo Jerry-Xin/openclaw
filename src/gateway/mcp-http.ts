@@ -411,7 +411,8 @@ async function startMcpLoopbackServer(port = 0): Promise<() => Promise<void>> {
                     requestContext.cronCreatorCallerOrigin?.kind === "local"
                       ? true
                       : undefined,
-                  turnSourceTo: requestContext.currentChannelId,
+                  turnSourceTo:
+                    requestContext.currentMessagingTarget ?? requestContext.currentChannelId,
                   turnSourceAccountId: requestContext.accountId,
                   turnSourceThreadId: requestContext.currentThreadTs,
                 })
