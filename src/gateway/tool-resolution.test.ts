@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { resolveSessionAgentId } from "../agents/agent-scope.js";
 import {
   buildTurnSendTargetKey,
   recordTurnSend,
@@ -12,6 +13,16 @@ import {
 } from "../agents/tools/turn-send-ledger.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveGatewayScopedTools } from "./tool-resolution.js";
+
+// The message tool keys the send ledger on the agentId-scoped session key it builds
+// internally (pollEchoSessionKey in message-tool-execution.ts), not the raw session key.
+// #114388 made that key `${agentId}\0${sessionKey}` so concurrent agents sharing one
+// session stay isolated. Seed the ledger with the exact string the tool will peek with,
+// derived through the same resolver production uses; a hand-built raw key would silently
+// miss the slot and let the cap stay inert even when the wiring under test is correct.
+function ledgerSessionKey(sessionKey: string): string {
+  return `${resolveSessionAgentId({ sessionKey })}\0${sessionKey}`;
+}
 
 describe("resolveGatewayScopedTools", () => {
   beforeAll(() => {
@@ -312,7 +323,7 @@ describe("resolveGatewayScopedTools per-turn send ledger wiring", () => {
     const sessionKey = "agent:main:telegram:group:-100123";
     const runId = "gw-run-1";
     const targetKey = buildTurnSendTargetKey({ channel: "telegram", target: "peer-1" });
-    recordTurnSend({ sessionKey, runId, targetKey });
+    recordTurnSend({ sessionKey: ledgerSessionKey(sessionKey), runId, targetKey });
 
     const result = resolveGatewayScopedTools({
       cfg: {
@@ -351,7 +362,7 @@ describe("resolveGatewayScopedTools per-turn send ledger wiring", () => {
     const sessionKey = "agent:main:slack:dm:U123";
     const runId = "gw-run-2";
     const targetKey = buildTurnSendTargetKey({ channel: "slack", target: "user:U123" });
-    recordTurnSend({ sessionKey, runId, targetKey });
+    recordTurnSend({ sessionKey: ledgerSessionKey(sessionKey), runId, targetKey });
 
     const result = resolveGatewayScopedTools({
       cfg: {
