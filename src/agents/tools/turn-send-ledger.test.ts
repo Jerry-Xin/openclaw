@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildTurnSendTargetKey,
   hasRecordedTurnSendOperation,
+  MAX_TURN_SEND_SLOTS,
   peekTurnSendCount,
   recordTurnSend,
   recordTurnSendOnce,
@@ -189,5 +190,57 @@ describe("turn-send-ledger operation identity", () => {
     // next record restarts the turn's budget.
     expect(hasRecordedTurnSendOperation(key, "op-1", TURN_SEND_LEDGER_TTL_MS + 1)).toBe(false);
     expect(recordTurnSendOnce(key, "op-1", TURN_SEND_LEDGER_TTL_MS + 2)).toBe(1);
+  });
+});
+
+describe("turn-send-ledger capacity cap", () => {
+  // Distinct (session, run) slots that never expire at now=0, so eviction is
+  // driven purely by the LRU capacity bound rather than the TTL.
+  const slot = (i: number) => ({ sessionKey: "s1", runId: `run-${i}`, targetKey: "tg:a" });
+
+  it("evicts the oldest-touched slot once past MAX_TURN_SEND_SLOTS", () => {
+    for (let i = 0; i < MAX_TURN_SEND_SLOTS; i++) {
+      expect(recordTurnSend(slot(i), 0)).toBe(1);
+    }
+    // Every slot survives while the map sits at the cap.
+    expect(peekTurnSendCount(slot(0), 0)).toBe(1);
+    expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS - 1), 0)).toBe(1);
+    // The next distinct slot crosses the cap and evicts the oldest (run-0).
+    expect(recordTurnSend(slot(MAX_TURN_SEND_SLOTS), 0)).toBe(1);
+    expect(peekTurnSendCount(slot(0), 0)).toBe(0);
+    // The second-oldest and the newest slot remain.
+    expect(peekTurnSendCount(slot(1), 0)).toBe(1);
+    expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS), 0)).toBe(1);
+  });
+
+  it("treats a re-touched slot as most-recently-used, sparing it from eviction", () => {
+    for (let i = 0; i < MAX_TURN_SEND_SLOTS; i++) {
+      recordTurnSend(slot(i), 0);
+    }
+    // Re-recording the oldest slot moves it to the tail; run-1 becomes the oldest.
+    expect(recordTurnSend(slot(0), 0)).toBe(2);
+    recordTurnSend(slot(MAX_TURN_SEND_SLOTS), 0);
+    expect(peekTurnSendCount(slot(0), 0)).toBe(2);
+    expect(peekTurnSendCount(slot(1), 0)).toBe(0);
+  });
+
+  it("keeps TTL expiry and overlapping-run isolation intact under the cap", () => {
+    const session = "agent:main:main";
+    const runA = { sessionKey: session, runId: "run-A", targetKey: "tg:a" };
+    const runB = { sessionKey: session, runId: "run-B", targetKey: "tg:a" };
+    // Interleaved runs on one session keep distinct composite keys, so the LRU
+    // store must not collapse them into one slot.
+    expect(recordTurnSend(runA, 0)).toBe(1);
+    expect(recordTurnSend(runB, 0)).toBe(1);
+    expect(recordTurnSend(runA, 0)).toBe(2);
+    expect(peekTurnSendCount(runA, 0)).toBe(2);
+    expect(peekTurnSendCount(runB, 0)).toBe(1);
+    // A write past the TTL still prunes the idle slots before storing the new one.
+    recordTurnSend(
+      { sessionKey: "s2", runId: "fresh", targetKey: "tg:a" },
+      TURN_SEND_LEDGER_TTL_MS + 1,
+    );
+    expect(peekTurnSendCount(runA, TURN_SEND_LEDGER_TTL_MS + 1)).toBe(0);
+    expect(peekTurnSendCount(runB, TURN_SEND_LEDGER_TTL_MS + 1)).toBe(0);
   });
 });

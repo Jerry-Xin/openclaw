@@ -253,14 +253,21 @@ export function isQaToolSearchFixture(text: string) {
 // then finalize with plain text. Lets an e2e prove the per-turn send ledger (nudge +
 // hard cap) at the real delivery boundary, since the ledger keys on the agent run.
 // Marker `QA-PTSB-SEND` is unique to that fixture, so this never affects other prompts.
+//
+// Optional `outcomes=` maps each planned send (1-based) to a delivery shape: `ok`
+// sends a visible `${marker}-${sequence}` payload; `suppress` sends an empty message
+// so real core delivery returns deliveryStatus "suppressed" (no_visible_payload). This
+// lets an e2e prove a delivered-nothing send does not charge the budget at the real
+// boundary. Absent `outcomes`, every planned send is `ok`.
 export function extractPerTurnSendBudgetDirective(text: string): {
   tool: "message" | "conversations_send";
   count: number;
   marker: string;
   ref?: string;
+  outcomes?: ("ok" | "suppress")[];
 } | null {
   const match =
-    /QA-PTSB-SEND\s+tool=(message|conversations_send)\s+count=(\d+)\s+marker=([A-Za-z0-9._-]+)(?:\s+ref=(conv_[a-f0-9]{32}))?/u.exec(
+    /QA-PTSB-SEND\s+tool=(message|conversations_send)\s+count=(\d+)\s+marker=([A-Za-z0-9._-]+)(?:\s+ref=(conv_[a-f0-9]{32}))?(?:\s+outcomes=([a-z,]+))?/u.exec(
       text,
     );
   if (!match) {
@@ -275,11 +282,16 @@ export function extractPerTurnSendBudgetDirective(text: string): {
   if (tool === "conversations_send" && !match[4]) {
     return null;
   }
+  const outcomes = match[5]
+    ?.split(",")
+    .map((token) => token.trim())
+    .filter((token): token is "ok" | "suppress" => token === "ok" || token === "suppress");
   return {
     tool,
     count,
     marker: match[3] ?? "QA-PTSB",
     ...(match[4] ? { ref: match[4] } : {}),
+    ...(outcomes && outcomes.length > 0 ? { outcomes } : {}),
   };
 }
 
