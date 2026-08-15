@@ -29,6 +29,7 @@ import { startQaLiveLaneGateway } from "../../../../extensions/qa-lab/runtime-ap
 import { ConversationSendResultSchema } from "../../../../packages/gateway-protocol/src/schema/agent.js";
 import { createConversationsSendTool } from "../../../../src/agents/tools/conversation-tools.js";
 import {
+  buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
   peekTurnSendCount,
   resetTurnSendLedgerForTest,
@@ -327,6 +328,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const conversation = await registerQaConversation(live, busState, "REG-OK-2");
 
       const agentSessionKey = `qa-per-turn-budget-2-${randomUUID()}`;
+      const ledgerSessionKey = buildTurnSendLedgerSessionKey("qa", agentSessionKey)!;
       const runId = `run-scenario-2-${randomUUID()}`;
       // Opt in to the per-turn hard cap for the message toolset (shared by conversations_send).
       const config = { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } } as never;
@@ -386,7 +388,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         accountId: conversation.accountId,
         target: conversation.target,
       });
-      const ledgerCount = peekTurnSendCount({ sessionKey: agentSessionKey, runId, targetKey });
+      const ledgerCount = peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey });
       expect(ledgerCount).toBe(1);
 
       verdict.scenarios.push({
@@ -485,6 +487,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const conversation = await registerQaConversation(live, busState, "REG-OK-4");
 
       const agentSessionKey = `qa-per-turn-budget-4-${randomUUID()}`;
+      const ledgerSessionKey = buildTurnSendLedgerSessionKey("qa", agentSessionKey)!;
       // Distinct turn from scenario 2 so no ledger slot leaks across scenarios.
       const runId = `run-scenario-4-${randomUUID()}`;
       // Cap of 1 proves the replay is admitted despite the hard cap being reached.
@@ -513,7 +516,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const firstSchemaValid = Value.Check(ConversationSendResultSchema, first.details);
       expect(firstDetails.status).toBe("sent");
       await waitForOutboundText(busState, (message) => message.text.includes("S4-REPLAY"));
-      expect(peekTurnSendCount({ sessionKey: agentSessionKey, runId, targetKey })).toBe(1);
+      expect(peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey })).toBe(1);
 
       // Replay with the SAME toolCallId "rep-A" (same operationId). The pre-cap gate detects
       // the already-recorded operation and admits the call even though the hard cap (1) is
@@ -540,7 +543,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       expect(replayDeliveries).toHaveLength(1);
 
       // No double count: the ledger stays at one send for the turn.
-      const ledgerCount = peekTurnSendCount({ sessionKey: agentSessionKey, runId, targetKey });
+      const ledgerCount = peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey });
       expect(ledgerCount).toBe(1);
 
       verdict.scenarios.push({
