@@ -333,13 +333,15 @@ vi.mock("./agent-runner-utils.js", async () => ({
     run: { agentAccountId?: string; chatType?: string };
   }) => ({
     ...params.sessionCtx,
-    OriginatingChannel: params.replyRoute?.originatingChannel ?? params.sessionCtx.OriginatingChannel,
+    OriginatingChannel:
+      params.replyRoute?.originatingChannel ?? params.sessionCtx.OriginatingChannel,
     OriginatingTo: params.replyRoute?.originatingTo ?? params.sessionCtx.OriginatingTo,
     AccountId:
       params.replyRoute?.originatingAccountId ??
       params.sessionCtx.AccountId ??
       params.run.agentAccountId,
-    ChatType: params.replyRoute?.originatingChatType ?? params.sessionCtx.ChatType ?? params.run.chatType,
+    ChatType:
+      params.replyRoute?.originatingChatType ?? params.sessionCtx.ChatType ?? params.run.chatType,
     MessageThreadId: params.replyRoute?.originatingThreadId ?? params.sessionCtx.MessageThreadId,
     ReplyToId: params.replyRoute?.originatingReplyToId ?? params.sessionCtx.ReplyToId,
   }),
