@@ -33,6 +33,7 @@ import {
   type AgentToolGatewayRequestCaller,
 } from "./in-process-gateway.js";
 import {
+  buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
   hasRecordedTurnSendOperation,
   peekTurnSendCount,
@@ -161,8 +162,16 @@ function resolveConversationBudgetContext(
   deps: ConversationToolDeps,
   conversationRef: string,
 ): { sessionKey: string; runId: string; targetKey: string; channel: string } | undefined {
-  const sessionKey = options.agentSessionKey?.trim() || undefined;
-  if (!sessionKey || !options.runId || !options.config) {
+  // Scope the ledger by the same agent-prefixed session slot the message tool uses
+  // (buildTurnSendLedgerSessionKey), not the raw session key: keying one tool raw and
+  // the other agent-prefixed splits one turn across two slots and lets alternating the
+  // tools evade the nudge and hard cap. This only changes the ledger slot key; the raw
+  // agentSessionKey still flows unchanged to the Gateway sourceSessionKey and operationId.
+  const ledgerSessionKey = buildTurnSendLedgerSessionKey(
+    resolveToolAgentId(options),
+    options.agentSessionKey,
+  );
+  if (!ledgerSessionKey || !options.runId || !options.config) {
     return undefined;
   }
   // Resolve the opaque ref to its real (channel, account, target) route via the local
@@ -186,7 +195,7 @@ function resolveConversationBudgetContext(
     return undefined;
   }
   return {
-    sessionKey,
+    sessionKey: ledgerSessionKey,
     runId: options.runId,
     targetKey: buildTurnSendTargetKey({
       channel: record.channel,
