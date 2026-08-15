@@ -35,9 +35,9 @@ import {
 import {
   buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
-  hasRecordedTurnSendOperation,
-  peekTurnSendCount,
-  recordTurnSendOnce,
+  commitTurnSend,
+  releaseTurnSend,
+  reserveTurnSend,
 } from "./turn-send-ledger.js";
 
 const CONVERSATION_REF_PATTERN = /^conv_[a-f0-9]{32}$/u;
@@ -240,75 +240,93 @@ export function createConversationsSendTool(
       // The ref is resolved to its (channel, account, target) route so the ledger key
       // is identical to the message tool's for the same recipient.
       const budgetContext = resolveConversationBudgetContext(options, deps, conversationRef);
-      // An idempotent replay (the same toolCallId retried) resolves to the same
-      // operationId; the Gateway returns the completed operation as "sent" without
-      // re-delivering (conversation-send.ts resultForCompletedOperation). Such a
-      // replay must reach the Gateway even at the cap, and must not count twice — so
-      // it bypasses the hard cap and recordTurnSendOnce ignores the second "sent".
-      const alreadyRecorded = budgetContext
-        ? hasRecordedTurnSendOperation(budgetContext, operationId)
-        : false;
-      // Optional hard cap (opt-in via tools.message.maxMessagesPerTurnPerTarget):
-      // block before the Gateway call once the cap is reached this turn.
-      if (budgetContext && options.config && !alreadyRecorded) {
-        const maxPerTurn = resolveEffectiveMessageToolsConfig({
-          cfg: options.config,
-          agentId: resolveToolAgentId(options),
-        })?.maxMessagesPerTurnPerTarget;
-        if (maxPerTurn !== undefined && peekTurnSendCount(budgetContext) >= maxPerTurn) {
-          // conversations_send declares the closed ConversationSendResultSchema, so
-          // the details must stay within it (status/conversationRef/channel). The
-          // human-readable block reason rides in the text content, not details, or
-          // Code Mode's output-schema check (assertCatalogOutputMatchesSchema) throws.
-          return textResult(
-            `Blocked: already sent ${maxPerTurn} message(s) to this conversation this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
-            {
-              status: "suppressed" as const,
-              conversationRef,
-              channel: budgetContext.channel,
-            },
-          );
-        }
+      // Reserve one send before the Gateway call so a concurrent same-target send cannot
+      // slip past a positive cap while this one is in flight. The reserve is keyed by the
+      // operationId: an idempotent replay (the same toolCallId retried) resolves to the
+      // same operationId, so it is admitted past the cap (`replay`) — the Gateway returns
+      // the completed operation as "sent" without re-delivering
+      // (conversation-send.ts resultForCompletedOperation) and settle is skipped so the
+      // count and nudge stay put. The hard cap (opt-in via
+      // tools.message.maxMessagesPerTurnPerTarget) is enforced by the `exhausted` result.
+      const maxPerTurn =
+        budgetContext && options.config
+          ? resolveEffectiveMessageToolsConfig({
+              cfg: options.config,
+              agentId: resolveToolAgentId(options),
+            })?.maxMessagesPerTurnPerTarget
+          : undefined;
+      const reservation = budgetContext
+        ? reserveTurnSend(budgetContext, { maxPerTurn, operationId })
+        : undefined;
+      if (reservation?.status === "exhausted" && budgetContext) {
+        // conversations_send declares the closed ConversationSendResultSchema, so
+        // the details must stay within it (status/conversationRef/channel). The
+        // human-readable block reason rides in the text content, not details, or
+        // Code Mode's output-schema check (assertCatalogOutputMatchesSchema) throws.
+        return textResult(
+          `Blocked: already sent ${maxPerTurn} message(s) to this conversation this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
+          {
+            status: "suppressed" as const,
+            conversationRef,
+            channel: budgetContext.channel,
+          },
+        );
       }
-      const result = await deps.callGateway<ConversationSendResult>({
-        method: "conversations.send",
-        params: {
-          agentId: resolveToolAgentId(options),
-          ...(options.agentSessionKey ? { sourceSessionKey: options.agentSessionKey } : {}),
-          operationId,
-          conversationRef,
-          message,
-        },
-        ...(options.config ? { config: options.config } : {}),
-        ...(signal ? { signal } : {}),
-      });
-      const base = jsonResult(result);
-      // Only confirmed delivery counts; a "queued" (enqueue-only, unconfirmed)
-      // status has not reached the peer yet, and neither has "suppressed"/"unknown".
-      // This matches the delivery owner's confirmed-delivery definition and the
-      // message tool (which has no "queued" concept). recordTurnSendOnce counts a
-      // given operationId at most once, so an idempotent replay returns undefined and
-      // draws no fresh nudge; the soft reminder is appended from the second distinct
-      // send onward unless turnSendNudge is explicitly disabled.
-      if (budgetContext && result.status === "sent") {
-        const sendCount = recordTurnSendOnce(budgetContext, operationId);
-        const nudgeEnabled =
-          !options.config ||
-          resolveEffectiveMessageToolsConfig({
-            cfg: options.config,
+      let result: ConversationSendResult;
+      try {
+        result = await deps.callGateway<ConversationSendResult>({
+          method: "conversations.send",
+          params: {
             agentId: resolveToolAgentId(options),
-          })?.turnSendNudge !== false;
-        if (sendCount !== undefined && sendCount >= 2 && nudgeEnabled) {
-          return {
-            ...base,
-            content: [
-              ...base.content,
-              {
-                type: "text" as const,
-                text: `You have already sent ${sendCount} messages to this conversation this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`,
-              },
-            ],
-          };
+            ...(options.agentSessionKey ? { sourceSessionKey: options.agentSessionKey } : {}),
+            operationId,
+            conversationRef,
+            message,
+          },
+          ...(options.config ? { config: options.config } : {}),
+          ...(signal ? { signal } : {}),
+        });
+      } catch (error) {
+        // Nothing reached the peer: roll back the reservation so a throwing send does
+        // not consume the cap. A `replay` reservation took no pending slot, so this is
+        // a no-op for it.
+        if (reservation?.status === "reserved") {
+          releaseTurnSend(reservation.reservation);
+        }
+        throw error;
+      }
+      const base = jsonResult(result);
+      // Settle the reservation against the outcome. Only a confirmed "sent" commits;
+      // "queued" (enqueue-only, unconfirmed), "suppressed", and "unknown" have not
+      // reached the peer, so they release the reservation and draw no nudge. This
+      // matches the delivery owner's confirmed-delivery definition and the message
+      // tool (which has no "queued" concept). A `replay` reservation is left unsettled
+      // (the Gateway deduped it to the completed receipt), so it neither re-commits nor
+      // nudges. The soft reminder fires from the second committed send onward unless
+      // turnSendNudge is explicitly disabled.
+      if (reservation?.status === "reserved") {
+        if (result.status !== "sent") {
+          releaseTurnSend(reservation.reservation);
+        } else {
+          const sendCount = commitTurnSend(reservation.reservation);
+          const nudgeEnabled =
+            !options.config ||
+            resolveEffectiveMessageToolsConfig({
+              cfg: options.config,
+              agentId: resolveToolAgentId(options),
+            })?.turnSendNudge !== false;
+          if (sendCount >= 2 && nudgeEnabled) {
+            return {
+              ...base,
+              content: [
+                ...base.content,
+                {
+                  type: "text" as const,
+                  text: `You have already sent ${sendCount} messages to this conversation this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`,
+                },
+              ],
+            };
+          }
         }
       }
       return base;

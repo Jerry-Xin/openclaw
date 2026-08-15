@@ -518,10 +518,11 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       await waitForOutboundText(busState, (message) => message.text.includes("S4-REPLAY"));
       expect(peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey })).toBe(1);
 
-      // Replay with the SAME toolCallId "rep-A" (same operationId). The pre-cap gate detects
-      // the already-recorded operation and admits the call even though the hard cap (1) is
-      // reached; the Gateway returns the completed operation as "sent" without re-delivering,
-      // and recordTurnSendOnce ignores the replay so the count stays 1 and no nudge fires.
+      // Replay with the SAME toolCallId "rep-A" (same operationId). reserveTurnSend sees the
+      // already-committed operationId and returns `replay`, admitting the call even though the
+      // hard cap (1) is reached; the Gateway returns the completed operation as "sent" without
+      // re-delivering, and the replay reservation is left unsettled so the count stays 1 and no
+      // nudge fires.
       const replay = await tool.execute(
         "rep-A",
         { conversationRef: conversation.conversationRef, message: "S4-REPLAY" },
@@ -565,6 +566,119 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
           replaySchemaValid &&
           !replayNotice &&
           replayDeliveries.length === 1 &&
+          ledgerCount === 1,
+      });
+    },
+  );
+
+  it(
+    "scenario 5: two concurrent distinct-op sends to one target admit exactly one under the cap",
+    { timeout: SCENARIO_TIMEOUT_MS },
+    async () => {
+      // The core concurrency proof for #119992. Two conversations_send calls with DISTINCT
+      // toolCallIds (distinct operationIds -> NOT an idempotent replay) fire at the same
+      // conversation via Promise.all under maxMessagesPerTurnPerTarget:1. The old
+      // peek->await->record path let both peek 0 and both deliver, blowing past the cap.
+      // The reserve->settle primitive counts the first in-flight reservation toward the cap
+      // synchronously, so the second call is exhausted before it reaches the Gateway:
+      // exactly one delivery lands and the ledger commits exactly one send.
+      const { state: busState, harness: live } = await bootHarness();
+      const conversation = await registerQaConversation(live, busState, "REG-OK-5");
+
+      const agentSessionKey = `qa-per-turn-budget-5-${randomUUID()}`;
+      const ledgerSessionKey = buildTurnSendLedgerSessionKey("qa", agentSessionKey)!;
+      const runId = `run-scenario-5-${randomUUID()}`;
+      const config = { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } } as never;
+      const deps = {
+        callGateway: createLiveCallGateway(live),
+        resolveConversation: (() => conversation) as never,
+      };
+      const tool = createConversationsSendTool(
+        { agentId: "qa", agentSessionKey, runId, config },
+        deps,
+      );
+
+      // Distinct toolCallIds so the two calls derive distinct operationIds — a genuine
+      // race, not a replay. Promise.all evaluates the array left-to-right, so the first
+      // call reserves (synchronously, before its Gateway await) before the second runs.
+      const results = await Promise.all([
+        tool.execute(
+          "s5-A",
+          { conversationRef: conversation.conversationRef, message: "S5-CONC-ALPHA" },
+          undefined,
+        ),
+        tool.execute(
+          "s5-B",
+          { conversationRef: conversation.conversationRef, message: "S5-CONC-BETA" },
+          undefined,
+        ),
+      ]);
+
+      const statusOf = (result: { details: unknown }) =>
+        (result.details as { status?: string }).status;
+      const sentResults = results.filter((result) => statusOf(result) === "sent");
+      const suppressedResults = results.filter((result) => statusOf(result) === "suppressed");
+      expect(sentResults).toHaveLength(1);
+      expect(suppressedResults).toHaveLength(1);
+
+      const sentResult = sentResults[0]!;
+      const suppressedResult = suppressedResults[0]!;
+      const sentSchemaValid = Value.Check(ConversationSendResultSchema, sentResult.details);
+      const suppressedSchemaValid = Value.Check(
+        ConversationSendResultSchema,
+        suppressedResult.details,
+      );
+      const blockTextPresent = toolResultText(suppressedResult).includes(
+        "Blocked: already sent 1 message",
+      );
+      expect(sentSchemaValid).toBe(true);
+      expect(suppressedSchemaValid).toBe(true);
+      expect(suppressedResult.details).toEqual({
+        status: "suppressed",
+        conversationRef: conversation.conversationRef,
+        channel: conversation.channel,
+      });
+      expect(blockTextPresent).toBe(true);
+
+      // Exactly one of the two markers ever reaches the bus; the exhausted call never
+      // called the Gateway, so its message is never delivered.
+      await waitForOutboundText(
+        busState,
+        (message) =>
+          message.text.includes("S5-CONC-ALPHA") || message.text.includes("S5-CONC-BETA"),
+      );
+      await sleep(500);
+      const concurrentDeliveries = outboundMessages(busState).filter(
+        (message) =>
+          message.text.includes("S5-CONC-ALPHA") || message.text.includes("S5-CONC-BETA"),
+      );
+      expect(concurrentDeliveries).toHaveLength(1);
+
+      const targetKey = buildTurnSendTargetKey({
+        channel: conversation.channel,
+        accountId: conversation.accountId,
+        target: conversation.target,
+      });
+      const ledgerCount = peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey });
+      expect(ledgerCount).toBe(1);
+
+      verdict.scenarios.push({
+        scenario: "two concurrent distinct-op sends admit exactly one under the cap",
+        deliveriesRecorded: concurrentDeliveries.length,
+        toolResults: [
+          { status: "sent", noticePresent: false, schemaValid: sentSchemaValid },
+          {
+            status: "suppressed",
+            noticePresent: blockTextPresent,
+            schemaValid: suppressedSchemaValid,
+          },
+        ],
+        ledgerCounts: { "qa-channel:qa-operator": ledgerCount },
+        pass:
+          sentSchemaValid &&
+          suppressedSchemaValid &&
+          blockTextPresent &&
+          concurrentDeliveries.length === 1 &&
           ledgerCount === 1,
       });
     },
