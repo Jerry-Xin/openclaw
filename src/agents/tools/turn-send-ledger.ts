@@ -37,20 +37,28 @@ export const TURN_SEND_LEDGER_TTL_MS = 10 * 60_000;
 export const MAX_TURN_SEND_SLOTS = 2048;
 
 type TurnSendSlot = {
-  counts: Map<string, number>;
-  // Operation identities already counted this turn. conversations_send derives a
+  // Sends that have landed this turn, per target. Admission compares committed +
+  // pending against the cap; peek and the nudge read this committed count.
+  committed: Map<string, number>;
+  // In-flight reservations per target: a send that has been admitted but whose
+  // delivery has not settled yet. Held separately from committed so a concurrent
+  // same-target send counts toward the cap during the in-flight window (blocking
+  // toward it, never past it) and so a rolled-back reservation leaves committed
+  // untouched.
+  pending: Map<string, number>;
+  // Operation identities already committed this turn. conversations_send derives a
   // stable operationId per (toolCallId, conversationRef); the Gateway resolves a
   // repeated one to the completed operation and returns "sent" without
-  // re-delivering. Tracking seen ids lets a replay through the cap and keeps it
-  // from double-counting. The message tool has no operationId and never touches this.
+  // re-delivering. Tracking committed ids lets a replay through the cap and keeps
+  // it from double-counting. The message tool passes its idempotency key here too.
   seenOperations: Set<string>;
   recordedAt: number;
 };
 
-// One entry per (session, run): the turn's per-target counts. Concurrent turns can
-// share a sessionKey but carry distinct runIds, so runId is folded into the key —
-// keying by sessionKey alone would let a later run's record() evict an earlier
-// still-live run's counts.
+// One entry per (session, run): the turn's per-target committed counts and pending
+// reservations. Concurrent turns can share a sessionKey but carry distinct runIds, so
+// runId is folded into the key — keying by sessionKey alone would let a later run's
+// reserve/commit evict an earlier still-live run's counts.
 const turnSendBySession = new Map<string, TurnSendSlot>();
 
 // The map key `${sessionKey}\0${runId}`. The NUL separator can't appear in either
@@ -62,7 +70,7 @@ function ledgerKey(sessionKey: string, runId: string): string {
 // Reseat a slot as the most-recently-used entry (delete + set moves it to the
 // Map's tail) and evict the oldest slots past the cap. Map iteration order is
 // insertion order, so the first key is the least-recently-touched slot. Every
-// record() touch reseats its slot, so eviction order is LRU by write access.
+// reserve/commit/release touch reseats its slot, so eviction order is LRU by write access.
 function storeSlot(key: string, slot: TurnSendSlot): void {
   turnSendBySession.delete(key);
   turnSendBySession.set(key, slot);
@@ -129,112 +137,182 @@ export function buildTurnSendTargetKey(params: {
   return `${channel}\0${normalizeAccountId(params.accountId)}\0${target}`;
 }
 
-// A slot is live only within the TTL window measured from its last write. Peek and
-// record share this predicate so they agree on what "expired" means: peek returns 0
-// for an expired slot (dropping it), while record starts a fresh turn for one.
-// Deliberate tradeoff: a >10-min-idle gap within a single turn resets that turn's
-// budget. Accepted because the cap is a best-effort runaway-fan-out backstop, not a
-// strict guarantee (see the module header).
+// A slot is live only within the TTL window measured from its last write. Peek,
+// reserve, commit, and release share this predicate so they agree on what "expired"
+// means: peek returns 0 for an expired slot (dropping it), while reserve/commit start
+// a fresh turn for one. Deliberate tradeoff: a >10-min-idle gap within a single turn
+// resets that turn's budget. Accepted because the cap is a best-effort runaway-fan-out
+// backstop, not a strict guarantee (see the module header).
 function isLiveSlot(slot: TurnSendSlot, now: number): boolean {
   return now - slot.recordedAt <= TURN_SEND_LEDGER_TTL_MS;
 }
 
 // The (session, run) slot, or a fresh one when that pair has no entry or its TTL
 // window has elapsed. A different run on the same session is a distinct key, so it
-// naturally gets its own fresh slot instead of evicting this one. Shared by every
-// recorder so counts and seen-operation ids reset together on a turn boundary.
-// Callers mutate the returned slot and reseat it via the map.
+// naturally gets its own fresh slot instead of evicting this one. Shared by reserve
+// and commit so committed counts, pending reservations, and seen-operation ids reset
+// together on a turn boundary. Callers mutate the returned slot and reseat it via the map.
 function liveSlotForTurn(sessionKey: string, runId: string, now: number): TurnSendSlot {
   const existing = turnSendBySession.get(ledgerKey(sessionKey, runId));
   if (existing && isLiveSlot(existing, now)) {
     return existing;
   }
   return {
-    counts: new Map<string, number>(),
+    committed: new Map<string, number>(),
+    pending: new Map<string, number>(),
     seenOperations: new Set<string>(),
     recordedAt: now,
   };
 }
 
+type ReservationState = "reserved" | "committed" | "released";
+
 /**
- * Records one successful send to `targetKey` in the current turn and returns the
- * running count (>= 1). A (session, run) pair with no live entry, or whose window
- * has expired, starts fresh before recording. `now` is injectable for deterministic
- * tests; it defaults to the wall clock.
+ * Handle returned by a successful reserveTurnSend. Opaque to callers: they hold it
+ * across the awaited delivery, then settle it exactly once — commitTurnSend when the
+ * send landed, releaseTurnSend when it did not. The mutable `state` makes a second
+ * settle a no-op, so a double commit/release or a commit-after-release cannot corrupt
+ * the counts.
  */
-export function recordTurnSend(
-  { sessionKey, runId, targetKey }: TurnSendKey,
+export type TurnSendReservation = {
+  readonly key: TurnSendKey;
+  readonly operationId: string | undefined;
+  state: ReservationState;
+};
+
+export type TurnSendReserveResult =
+  | { status: "reserved"; reservation: TurnSendReservation }
+  | { status: "exhausted" }
+  | { status: "replay" };
+
+/**
+ * Reserves one send to `targetKey` for the current turn before delivery is attempted,
+ * so a concurrent same-target send cannot slip past a positive cap while the first is
+ * still in flight (the peek→await→record window used to admit both). Admission compares
+ * committed + already-pending against `maxPerTurn`:
+ *
+ *   - `replay`    — `operationId` was already committed this turn (an idempotent Gateway
+ *                   replay). Admitted past the cap and NOT recounted; the caller
+ *                   dispatches but must skip settling.
+ *   - `exhausted` — committed + pending has reached a positive `maxPerTurn`. The caller
+ *                   suppresses the send.
+ *   - `reserved`  — otherwise; pending is incremented and the returned reservation must
+ *                   be settled once via commitTurnSend or releaseTurnSend.
+ *
+ * The reservation is pessimistic for the in-flight window: it blocks toward the cap the
+ * instant it is taken and never past it. That is a deliberate best-effort backstop
+ * against runaway fan-out, not strict serialization — a released reservation frees the
+ * slot again, and the cap is not a hard delivery guarantee (see the module header).
+ *
+ * With `maxPerTurn` undefined (media / no configured cap) admission never returns
+ * `exhausted`, yet pending/committed are still tracked so the soft nudge keeps counting.
+ * `now` is injectable for deterministic tests; it defaults to the wall clock.
+ */
+export function reserveTurnSend(
+  key: TurnSendKey,
+  options: { maxPerTurn?: number; operationId?: string },
   now: number = Date.now(),
-): number {
+): TurnSendReserveResult {
   pruneExpired(now);
-  const slot = liveSlotForTurn(sessionKey, runId, now);
-  const next = (slot.counts.get(targetKey) ?? 0) + 1;
-  slot.counts.set(targetKey, next);
+  const storeKey = ledgerKey(key.sessionKey, key.runId);
+  const slot = liveSlotForTurn(key.sessionKey, key.runId, now);
+  if (options.operationId !== undefined && slot.seenOperations.has(options.operationId)) {
+    slot.recordedAt = now;
+    storeSlot(storeKey, slot);
+    return { status: "replay" };
+  }
+  const committed = slot.committed.get(key.targetKey) ?? 0;
+  const pending = slot.pending.get(key.targetKey) ?? 0;
+  // committed + pending, never committed alone: an in-flight reservation must count
+  // toward the cap or two racing sends both admit before either commits.
+  if (options.maxPerTurn !== undefined && committed + pending >= options.maxPerTurn) {
+    return { status: "exhausted" };
+  }
+  slot.pending.set(key.targetKey, pending + 1);
   slot.recordedAt = now;
-  storeSlot(ledgerKey(sessionKey, runId), slot);
-  return next;
+  storeSlot(storeKey, slot);
+  return {
+    status: "reserved",
+    reservation: { key, operationId: options.operationId, state: "reserved" },
+  };
 }
 
 /**
- * Whether `operationId` has already been counted in the current live turn slot.
- * conversations_send checks this before the hard cap so an idempotent Gateway
- * replay (a repeated toolCallId resolved to the same completed operation without
- * re-delivery) is admitted instead of blocked. Returns false when the session has
- * no live slot for this turn. `now` is injectable for deterministic tests.
+ * Settles a reservation whose delivery landed: moves it from pending to committed,
+ * records its operationId so an idempotent replay is admitted past the cap without
+ * recounting, refreshes the turn TTL, and returns the resulting committed send count
+ * for the target (>= 2 means the caller should nudge). Idempotent: a repeat call — or a
+ * commit after release — neither re-increments committed nor re-decrements pending and
+ * simply reports the current committed count. `now` is injectable for tests.
  */
-export function hasRecordedTurnSendOperation(
-  { sessionKey, runId }: TurnSendKey,
-  operationId: string,
-  now: number = Date.now(),
-): boolean {
-  const slot = turnSendBySession.get(ledgerKey(sessionKey, runId));
+export function commitTurnSend(reservation: TurnSendReservation, now: number = Date.now()): number {
+  const { sessionKey, runId, targetKey } = reservation.key;
+  pruneExpired(now);
+  const storeKey = ledgerKey(sessionKey, runId);
+  const slot = liveSlotForTurn(sessionKey, runId, now);
+  if (reservation.state !== "reserved") {
+    slot.recordedAt = now;
+    storeSlot(storeKey, slot);
+    return slot.committed.get(targetKey) ?? 0;
+  }
+  reservation.state = "committed";
+  releasePending(slot, targetKey);
+  const committed = (slot.committed.get(targetKey) ?? 0) + 1;
+  slot.committed.set(targetKey, committed);
+  if (reservation.operationId !== undefined) {
+    slot.seenOperations.add(reservation.operationId);
+  }
+  slot.recordedAt = now;
+  storeSlot(storeKey, slot);
+  return committed;
+}
+
+/**
+ * Rolls back a reservation whose delivery never reached the peer (suppressed, dry-run,
+ * broadcast, or a throw): decrements only the pending count, leaving committed and the
+ * seen-operation set untouched, so a failed send neither consumes the cap nor fires a
+ * nudge. Idempotent and double-release safe via the reservation `state`; a no-op once
+ * the reservation is committed or the turn's slot has already expired. `now` is
+ * injectable for tests.
+ */
+export function releaseTurnSend(reservation: TurnSendReservation, now: number = Date.now()): void {
+  if (reservation.state !== "reserved") {
+    return;
+  }
+  reservation.state = "released";
+  const { sessionKey, runId, targetKey } = reservation.key;
+  const storeKey = ledgerKey(sessionKey, runId);
+  const slot = turnSendBySession.get(storeKey);
   if (!slot || !isLiveSlot(slot, now)) {
-    return false;
+    return;
   }
-  return slot.seenOperations.has(operationId);
-}
-
-/**
- * Counts one successful send for `operationId` at most once per turn. The first
- * call for a given operationId increments the per-target count and returns it; a
- * repeated call for the same operationId (an idempotent Gateway replay) leaves the
- * count untouched and returns undefined, so a replay neither re-increments the
- * budget nor fires a second nudge. `now` is injectable for deterministic tests.
- */
-export function recordTurnSendOnce(
-  { sessionKey, runId, targetKey }: TurnSendKey,
-  operationId: string,
-  now: number = Date.now(),
-): number | undefined {
-  pruneExpired(now);
-  const slot = liveSlotForTurn(sessionKey, runId, now);
+  releasePending(slot, targetKey);
   slot.recordedAt = now;
-  storeSlot(ledgerKey(sessionKey, runId), slot);
-  if (slot.seenOperations.has(operationId)) {
-    return undefined;
+  storeSlot(storeKey, slot);
+}
+
+// Decrement one pending reservation for `targetKey`, dropping the map entry at zero so
+// the pending map only holds targets with live in-flight sends. Clamped at zero: a slot
+// recreated after TTL expiry has no pending to remove, and a reservation must never
+// drive the count negative.
+function releasePending(slot: TurnSendSlot, targetKey: string): void {
+  const pending = slot.pending.get(targetKey) ?? 0;
+  if (pending > 1) {
+    slot.pending.set(targetKey, pending - 1);
+  } else {
+    slot.pending.delete(targetKey);
   }
-  slot.seenOperations.add(operationId);
-  const next = (slot.counts.get(targetKey) ?? 0) + 1;
-  slot.counts.set(targetKey, next);
-  return next;
 }
 
 /**
- * Reads the current turn's send count for `targetKey` without incrementing it.
- * Returns 0 when the (session, run) pair has no entry, or the target has not been
- * sent to yet — so a caller can gate the next send before dispatch. `now` is
- * injectable for deterministic tests; it defaults to the wall clock.
+ * Reads the current turn's committed send count for `targetKey` without mutating the
+ * ledger — read-only inspection (production settles through reserve/commit; tests use
+ * this to assert the committed total). Returns 0 when the (session, run) pair has no
+ * entry, or the target has not been committed to yet. `now` is injectable for tests.
  *
  * An expired slot is pruned and treated as 0: otherwise a capped slot past its TTL
- * would keep returning its stale count and block forever, since the cap check runs
- * before recordTurnSend (the only other pruner) ever gets to reset it. Deleting the
- * one slot on peek is safe under single-threaded JS.
- *
- * The cap this gates is best-effort, not a strict concurrency guarantee: callers
- * peek, await the actual delivery, then recordTurnSend after it lands, so the
- * peek→await→record window is not atomic. Two tool calls racing on the same
- * target can each peek below the cap before either records, so both admit one
- * send. This bounds runaway fan-out without serializing concurrent sends.
+ * would keep returning its stale count. Deleting the one slot on peek is safe under
+ * single-threaded JS.
  */
 export function peekTurnSendCount(
   { sessionKey, runId, targetKey }: TurnSendKey,
@@ -249,7 +327,7 @@ export function peekTurnSendCount(
     turnSendBySession.delete(key);
     return 0;
   }
-  return slot.counts.get(targetKey) ?? 0;
+  return slot.committed.get(targetKey) ?? 0;
 }
 
 export function resetTurnSendLedgerForTest(): void {
