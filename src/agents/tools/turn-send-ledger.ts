@@ -82,6 +82,29 @@ type TurnSendKey = {
 };
 
 /**
+ * Canonical per-turn ledger *session* slot key `${agentId}\0${sessionKey}`, shared by
+ * the `message` and `conversations_send` tools. Both must scope the ledger by the same
+ * agent-prefixed session so alternating the two tools at one recipient can't evade the
+ * nudge or the hard cap; keying by the raw session key on one tool and the agent-prefixed
+ * key on the other (the #119992 drift) split one turn across two slots.
+ *
+ * The NUL join and fallback mirror the message tool's original inline construction exactly
+ * (message-tool-execution.ts): the session key is trimmed, and when either the agent id or
+ * the trimmed session key is absent the caller has no ledger scope, so this returns
+ * undefined and the budget stays inert for that call.
+ */
+export function buildTurnSendLedgerSessionKey(
+  agentId: string | undefined,
+  sessionKey: string | undefined,
+): string | undefined {
+  const trimmedSessionKey = sessionKey?.trim() || undefined;
+  if (!trimmedSessionKey || !agentId) {
+    return undefined;
+  }
+  return `${agentId}\0${trimmedSessionKey}`;
+}
+
+/**
  * Canonical per-turn ledger key `${channel}\0${account}\0${target}`, shared by the
  * `message` and `conversations_send` tools. Both must key on the same normalized
  * route so alternating the two tools at one real recipient can't evade the nudge or

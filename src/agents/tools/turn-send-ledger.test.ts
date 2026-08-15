@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
   hasRecordedTurnSendOperation,
   MAX_TURN_SEND_SLOTS,
@@ -132,6 +133,33 @@ describe("turn-send-ledger", () => {
     const bare = buildTurnSendTargetKey({ channel: "telegram", target: "12345" });
     expect(prefixed).toBe(bare);
     expect(prefixed).toBe("telegram\u0000default\u000012345");
+  });
+});
+
+describe("turn-send-ledger session slot key", () => {
+  it("builds the canonical agent-prefixed session slot key shared by both send tools", () => {
+    // #119992: the message tool and conversations_send must scope the ledger by the
+    // same `${agentId}\0${sessionKey}` slot. Keying one tool by the raw session key
+    // and the other by this agent-prefixed key split one turn across two slots and let
+    // alternating them evade the nudge/cap. A raw session key alone must not match.
+    expect(buildTurnSendLedgerSessionKey("main", "agent:main:reef:direct:operator")).toBe(
+      "main\u0000agent:main:reef:direct:operator",
+    );
+    expect(buildTurnSendLedgerSessionKey("main", "agent:main:reef:direct:operator")).not.toBe(
+      "agent:main:reef:direct:operator",
+    );
+  });
+
+  it("trims the session key and returns undefined when either component is absent", () => {
+    // Fallback mirrors the message tool's original inline construction exactly: the
+    // session key is trimmed, and a missing agent id or empty session key yields no
+    // ledger scope (undefined), leaving the budget inert for that call.
+    expect(buildTurnSendLedgerSessionKey("main", "  agent:main:main  ")).toBe(
+      "main\u0000agent:main:main",
+    );
+    expect(buildTurnSendLedgerSessionKey(undefined, "agent:main:main")).toBeUndefined();
+    expect(buildTurnSendLedgerSessionKey("main", undefined)).toBeUndefined();
+    expect(buildTurnSendLedgerSessionKey("main", "   ")).toBeUndefined();
   });
 });
 
