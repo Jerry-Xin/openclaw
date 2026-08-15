@@ -2,13 +2,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
-  hasRecordedTurnSendOperation,
+  commitTurnSend,
   MAX_TURN_SEND_SLOTS,
   peekTurnSendCount,
-  recordTurnSend,
-  recordTurnSendOnce,
+  releaseTurnSend,
+  reserveTurnSend,
   resetTurnSendLedgerForTest,
   TURN_SEND_LEDGER_TTL_MS,
+  type TurnSendReservation,
+  type TurnSendReserveResult,
 } from "./turn-send-ledger.js";
 
 // Stand-in for a provider target normalizer: case-fold and strip a leading "tg:"
@@ -29,36 +31,59 @@ vi.mock("../../infra/outbound/target-normalization.js", () => ({
   },
 }));
 
+type LedgerKey = { sessionKey: string; runId: string; targetKey: string };
+
+// Assert a reserve succeeded and hand back the reservation, so a test that expected
+// admission fails loudly at the reserve rather than at a later commit/release.
+function expectReserved(result: TurnSendReserveResult): TurnSendReservation {
+  if (result.status !== "reserved") {
+    throw new Error(`expected a reserved reservation, got "${result.status}"`);
+  }
+  return result.reservation;
+}
+
+// The production reserve->await->settle round-trip collapsed for the counting tests:
+// reserve, then immediately commit as if delivery landed. Returns the committed count.
+// Passing `now` through both calls keeps the deterministic-clock tests injectable.
+function commitOne(
+  key: LedgerKey,
+  options: { maxPerTurn?: number; operationId?: string } = {},
+  now?: number,
+): number {
+  const reservation = expectReserved(reserveTurnSend(key, options, now));
+  return commitTurnSend(reservation, now);
+}
+
 afterEach(() => {
   resetTurnSendLedgerForTest();
   vi.useRealTimers();
 });
 
 describe("turn-send-ledger", () => {
-  it("increments per (runId, target) within one turn", () => {
+  it("counts committed sends per (runId, target) within one turn", () => {
     const base = { sessionKey: "s1", runId: "run-1", targetKey: "tg:a" };
-    expect(recordTurnSend(base)).toBe(1);
-    expect(recordTurnSend(base)).toBe(2);
-    expect(recordTurnSend(base)).toBe(3);
+    expect(commitOne(base)).toBe(1);
+    expect(commitOne(base)).toBe(2);
+    expect(commitOne(base)).toBe(3);
   });
 
-  it("keeps separate counts per target inside the same turn", () => {
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(1);
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:b" })).toBe(1);
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
+  it("keeps separate committed counts per target inside the same turn", () => {
+    expect(commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(1);
+    expect(commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:b" })).toBe(1);
+    expect(commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
   });
 
   it("starts a fresh count for a new run on the same session", () => {
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(1);
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
+    expect(commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(1);
+    expect(commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
     // A new run on the same session is a distinct ledger key, so it starts fresh.
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-2", targetKey: "tg:a" })).toBe(1);
+    expect(commitOne({ sessionKey: "s1", runId: "run-2", targetKey: "tg:a" })).toBe(1);
   });
 
   it("isolates counts across sessions", () => {
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(1);
-    expect(recordTurnSend({ sessionKey: "s2", runId: "run-1", targetKey: "tg:a" })).toBe(1);
-    expect(recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
+    expect(commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(1);
+    expect(commitOne({ sessionKey: "s2", runId: "run-1", targetKey: "tg:a" })).toBe(1);
+    expect(commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
   });
 
   it("keeps interleaved runs on one session isolated (A -> B -> A)", () => {
@@ -66,22 +91,22 @@ describe("turn-send-ledger", () => {
     // src/auto-reply/dispatch.freshness.test.ts:703 ("keeps concurrent foreground
     // finals isolated for different targets sharing a session", sharedSessionKey
     // = "agent:main:main") starts run A, completes run B on the same session, then
-    // resumes A. B recording between A's sends must not evict A's slot, or A's
+    // resumes A. B committing between A's sends must not evict A's slot, or A's
     // cap/nudge silently resets to 0 mid-turn.
     const session = "agent:main:main";
     const target = "tg:a";
     const runA = { sessionKey: session, runId: "run-A", targetKey: target };
     const runB = { sessionKey: session, runId: "run-B", targetKey: target };
-    expect(recordTurnSend(runA)).toBe(1);
-    expect(recordTurnSend(runB)).toBe(1);
-    expect(recordTurnSend(runA)).toBe(2);
+    expect(commitOne(runA)).toBe(1);
+    expect(commitOne(runB)).toBe(1);
+    expect(commitOne(runA)).toBe(2);
     expect(peekTurnSendCount(runA)).toBe(2);
     expect(peekTurnSendCount(runB)).toBe(1);
   });
 
-  it("peeks without mutating and returns 0 for a different turn", () => {
-    recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" });
-    recordTurnSend({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" });
+  it("peeks the committed count without mutating and returns 0 for a different turn", () => {
+    commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" });
+    commitOne({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" });
     expect(peekTurnSendCount({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
     // Peeking must not increment.
     expect(peekTurnSendCount({ sessionKey: "s1", runId: "run-1", targetKey: "tg:a" })).toBe(2);
@@ -91,13 +116,20 @@ describe("turn-send-ledger", () => {
     expect(peekTurnSendCount({ sessionKey: "s9", runId: "run-1", targetKey: "tg:a" })).toBe(0);
   });
 
+  it("does not surface an in-flight reservation as a committed count", () => {
+    const key = { sessionKey: "s1", runId: "run-1", targetKey: "tg:a" };
+    // A reservation is pending, not committed: peek reflects only landed sends.
+    expectReserved(reserveTurnSend(key, {}));
+    expect(peekTurnSendCount(key)).toBe(0);
+  });
+
   it("prunes sessions idle past the TTL on write", () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    recordTurnSend({ sessionKey: "stale", runId: "run-1", targetKey: "tg:a" });
+    commitOne({ sessionKey: "stale", runId: "run-1", targetKey: "tg:a" });
     // Advance beyond the TTL, then write for a different session so the prune runs.
     vi.setSystemTime(10 * 60_000 + 1);
-    recordTurnSend({ sessionKey: "fresh", runId: "run-1", targetKey: "tg:a" });
+    commitOne({ sessionKey: "fresh", runId: "run-1", targetKey: "tg:a" });
     // The stale session's slot is gone: its next write starts a fresh count.
     expect(peekTurnSendCount({ sessionKey: "stale", runId: "run-1", targetKey: "tg:a" })).toBe(0);
   });
@@ -105,14 +137,14 @@ describe("turn-send-ledger", () => {
   it("expires a capped slot on peek once past the TTL, unblocking a stuck turn", () => {
     const key = { sessionKey: "s1", runId: "run-1", targetKey: "tg:a" };
     // `now` is injected so the test needs no timers and stays deterministic.
-    expect(recordTurnSend(key, 0)).toBe(1);
-    expect(recordTurnSend(key, 0)).toBe(2);
+    expect(commitOne(key, {}, 0)).toBe(1);
+    expect(commitOne(key, {}, 0)).toBe(2);
     expect(peekTurnSendCount(key, 0)).toBe(2);
     // Past the TTL the capped slot would otherwise keep returning 2 and block forever,
-    // since the cap check peeks before record (the only other pruner) can reset it.
+    // since the cap check reserves before commit (the only other pruner) can reset it.
     expect(peekTurnSendCount(key, TURN_SEND_LEDGER_TTL_MS + 1)).toBe(0);
-    // A record after expiry restarts the turn's budget with the same runId.
-    expect(recordTurnSend(key, TURN_SEND_LEDGER_TTL_MS + 2)).toBe(1);
+    // A commit after expiry restarts the turn's budget with the same runId.
+    expect(commitOne(key, {}, TURN_SEND_LEDGER_TTL_MS + 2)).toBe(1);
   });
 
   it("builds the canonical channel/account/target key shared by both send tools", () => {
@@ -163,40 +195,106 @@ describe("turn-send-ledger session slot key", () => {
   });
 });
 
+describe("turn-send-ledger reservations", () => {
+  const key = { sessionKey: "s1", runId: "run-1", targetKey: "tg:a" };
+
+  it("counts a pending reservation toward a positive cap before it settles", () => {
+    // Reserve one send at a cap of 1: admitted, but committed is still 0 (nothing
+    // landed yet).
+    expectReserved(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-1" }));
+    expect(peekTurnSendCount(key)).toBe(0);
+    // A second, distinct-op reserve BEFORE the first commits is exhausted — the
+    // in-flight reservation already occupies the single cap slot. This is the race the
+    // reserve/commit split closes: peek-then-record admitted both.
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-2" }).status).toBe("exhausted");
+  });
+
+  it("moves a committed reservation into the committed count and returns it", () => {
+    const reservation = expectReserved(
+      reserveTurnSend(key, { maxPerTurn: 2, operationId: "op-1" }),
+    );
+    expect(commitTurnSend(reservation)).toBe(1);
+    // commit then peek === committed count.
+    expect(peekTurnSendCount(key)).toBe(1);
+  });
+
+  it("admits an already-committed operationId past the cap as a replay", () => {
+    const reservation = expectReserved(
+      reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-1" }),
+    );
+    expect(commitTurnSend(reservation)).toBe(1);
+    // The same op again, with the cap reached, is a replay (idempotent Gateway retry),
+    // not exhausted: it must be admitted so an already-earned receipt is not suppressed.
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-1" }).status).toBe("replay");
+    // A genuinely distinct op at the cap is still exhausted.
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-2" }).status).toBe("exhausted");
+  });
+
+  it("rolls back a released reservation so the slot is free to reserve again", () => {
+    const first = expectReserved(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-1" }));
+    // While it is pending the cap is reached...
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-2" }).status).toBe("exhausted");
+    releaseTurnSend(first);
+    // ...but a rollback frees the slot for a fresh reservation.
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-2" }).status).toBe("reserved");
+    // Release never touched committed: nothing landed.
+    expect(peekTurnSendCount(key)).toBe(0);
+  });
+
+  it("is double-release safe and a release after commit does not decrement committed", () => {
+    const reservation = expectReserved(
+      reserveTurnSend(key, { maxPerTurn: 2, operationId: "op-1" }),
+    );
+    expect(commitTurnSend(reservation)).toBe(1);
+    // Releasing an already-committed reservation, twice, must leave committed intact.
+    releaseTurnSend(reservation);
+    releaseTurnSend(reservation);
+    expect(peekTurnSendCount(key)).toBe(1);
+  });
+
+  it("makes a repeat commit idempotent, reporting the committed count without double-counting", () => {
+    const reservation = expectReserved(reserveTurnSend(key, {}));
+    expect(commitTurnSend(reservation)).toBe(1);
+    // A second commit neither re-increments nor throws.
+    expect(commitTurnSend(reservation)).toBe(1);
+    expect(peekTurnSendCount(key)).toBe(1);
+  });
+
+  it("never exhausts when maxPerTurn is undefined but still counts for the nudge", () => {
+    // Media / no configured cap: admission is unconditional, yet counting continues so
+    // the soft nudge still fires from the second send.
+    expect(commitOne(key, {})).toBe(1);
+    const second = reserveTurnSend(key, {});
+    expect(second.status).toBe("reserved");
+    expect(commitTurnSend(expectReserved(second))).toBe(2);
+    expect(peekTurnSendCount(key)).toBe(2);
+  });
+});
+
 describe("turn-send-ledger operation identity", () => {
   const key = { sessionKey: "s1", runId: "run-1", targetKey: "tg:a" };
 
-  it("counts an operationId once and reports it as recorded afterwards", () => {
-    expect(hasRecordedTurnSendOperation(key, "op-1")).toBe(false);
-    expect(recordTurnSendOnce(key, "op-1")).toBe(1);
-    // The same operationId is now recorded and a replay must not re-increment it.
-    expect(hasRecordedTurnSendOperation(key, "op-1")).toBe(true);
-    expect(recordTurnSendOnce(key, "op-1")).toBeUndefined();
-    // The per-target count stayed at 1 despite the replay.
+  it("counts an operationId once and treats a replay as admitted without re-counting", () => {
+    expect(commitOne(key, { operationId: "op-1" })).toBe(1);
+    // The same operationId is now committed, so a re-reserve is a replay, not a fresh
+    // reservation, and the per-target count stays at 1.
+    expect(reserveTurnSend(key, { operationId: "op-1" }).status).toBe("replay");
     expect(peekTurnSendCount(key)).toBe(1);
   });
 
   it("increments per distinct operationId to the same target", () => {
-    expect(recordTurnSendOnce(key, "op-1")).toBe(1);
-    expect(recordTurnSendOnce(key, "op-2")).toBe(2);
-    expect(peekTurnSendCount(key)).toBe(2);
-  });
-
-  it("shares one slot with recordTurnSend so both counters agree", () => {
-    // The message tool's recordTurnSend and conversations_send's recordTurnSendOnce
-    // write the same per-turn slot; a mixed sequence increments one shared count.
-    expect(recordTurnSend(key)).toBe(1);
-    expect(recordTurnSendOnce(key, "op-1")).toBe(2);
+    expect(commitOne(key, { operationId: "op-1" })).toBe(1);
+    expect(commitOne(key, { operationId: "op-2" })).toBe(2);
     expect(peekTurnSendCount(key)).toBe(2);
   });
 
   it("resets seen operations when the runId changes (new turn)", () => {
-    recordTurnSendOnce(key, "op-1");
-    expect(hasRecordedTurnSendOperation(key, "op-1")).toBe(true);
+    commitOne(key, { operationId: "op-1" });
+    // A new turn has no memory of the prior operationId, so it reserves fresh (not a
+    // replay) and counts from 1.
     const nextTurn = { ...key, runId: "run-2" };
-    // A new turn has no memory of the prior operationId, so it counts fresh.
-    expect(hasRecordedTurnSendOperation(nextTurn, "op-1")).toBe(false);
-    expect(recordTurnSendOnce(nextTurn, "op-1")).toBe(1);
+    expect(reserveTurnSend(nextTurn, { operationId: "op-1" }).status).toBe("reserved");
+    expect(commitOne(nextTurn, { operationId: "op-1" })).toBe(1);
   });
 
   it("keeps seen operation ids isolated across interleaved runs on one session", () => {
@@ -204,20 +302,20 @@ describe("turn-send-ledger operation identity", () => {
     const target = "tg:a";
     const runA = { sessionKey: session, runId: "run-A", targetKey: target };
     const runB = { sessionKey: session, runId: "run-B", targetKey: target };
-    expect(recordTurnSendOnce(runA, "op-a")).toBe(1);
-    expect(recordTurnSendOnce(runB, "op-b")).toBe(1);
-    expect(hasRecordedTurnSendOperation(runA, "op-a")).toBe(true);
-    // op-a already counted for run A -> replay is idempotent (no double count).
-    expect(recordTurnSendOnce(runA, "op-a")).toBeUndefined();
+    expect(commitOne(runA, { operationId: "op-a" })).toBe(1);
+    expect(commitOne(runB, { operationId: "op-b" })).toBe(1);
+    // op-a already committed for run A -> a re-reserve is an idempotent replay.
+    expect(reserveTurnSend(runA, { operationId: "op-a" }).status).toBe("replay");
   });
 
   it("forgets seen operations once the slot expires past the TTL", () => {
-    expect(recordTurnSendOnce(key, "op-1", 0)).toBe(1);
-    expect(hasRecordedTurnSendOperation(key, "op-1", 0)).toBe(true);
-    // Past the TTL the slot is treated as gone, so the id reads as unseen and the
-    // next record restarts the turn's budget.
-    expect(hasRecordedTurnSendOperation(key, "op-1", TURN_SEND_LEDGER_TTL_MS + 1)).toBe(false);
-    expect(recordTurnSendOnce(key, "op-1", TURN_SEND_LEDGER_TTL_MS + 2)).toBe(1);
+    expect(commitOne(key, { operationId: "op-1" }, 0)).toBe(1);
+    // Past the TTL the slot is treated as gone, so the id reads as unseen: the reserve
+    // is fresh, not a replay, and the next commit restarts the turn's budget.
+    expect(reserveTurnSend(key, { operationId: "op-1" }, TURN_SEND_LEDGER_TTL_MS + 1).status).toBe(
+      "reserved",
+    );
+    expect(commitOne(key, { operationId: "op-1" }, TURN_SEND_LEDGER_TTL_MS + 2)).toBe(1);
   });
 });
 
@@ -228,13 +326,13 @@ describe("turn-send-ledger capacity cap", () => {
 
   it("evicts the oldest-touched slot once past MAX_TURN_SEND_SLOTS", () => {
     for (let i = 0; i < MAX_TURN_SEND_SLOTS; i++) {
-      expect(recordTurnSend(slot(i), 0)).toBe(1);
+      expect(commitOne(slot(i), {}, 0)).toBe(1);
     }
     // Every slot survives while the map sits at the cap.
     expect(peekTurnSendCount(slot(0), 0)).toBe(1);
     expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS - 1), 0)).toBe(1);
     // The next distinct slot crosses the cap and evicts the oldest (run-0).
-    expect(recordTurnSend(slot(MAX_TURN_SEND_SLOTS), 0)).toBe(1);
+    expect(commitOne(slot(MAX_TURN_SEND_SLOTS), {}, 0)).toBe(1);
     expect(peekTurnSendCount(slot(0), 0)).toBe(0);
     // The second-oldest and the newest slot remain.
     expect(peekTurnSendCount(slot(1), 0)).toBe(1);
@@ -243,11 +341,11 @@ describe("turn-send-ledger capacity cap", () => {
 
   it("treats a re-touched slot as most-recently-used, sparing it from eviction", () => {
     for (let i = 0; i < MAX_TURN_SEND_SLOTS; i++) {
-      recordTurnSend(slot(i), 0);
+      commitOne(slot(i), {}, 0);
     }
-    // Re-recording the oldest slot moves it to the tail; run-1 becomes the oldest.
-    expect(recordTurnSend(slot(0), 0)).toBe(2);
-    recordTurnSend(slot(MAX_TURN_SEND_SLOTS), 0);
+    // Re-committing the oldest slot moves it to the tail; run-1 becomes the oldest.
+    expect(commitOne(slot(0), {}, 0)).toBe(2);
+    commitOne(slot(MAX_TURN_SEND_SLOTS), {}, 0);
     expect(peekTurnSendCount(slot(0), 0)).toBe(2);
     expect(peekTurnSendCount(slot(1), 0)).toBe(0);
   });
@@ -258,14 +356,15 @@ describe("turn-send-ledger capacity cap", () => {
     const runB = { sessionKey: session, runId: "run-B", targetKey: "tg:a" };
     // Interleaved runs on one session keep distinct composite keys, so the LRU
     // store must not collapse them into one slot.
-    expect(recordTurnSend(runA, 0)).toBe(1);
-    expect(recordTurnSend(runB, 0)).toBe(1);
-    expect(recordTurnSend(runA, 0)).toBe(2);
+    expect(commitOne(runA, {}, 0)).toBe(1);
+    expect(commitOne(runB, {}, 0)).toBe(1);
+    expect(commitOne(runA, {}, 0)).toBe(2);
     expect(peekTurnSendCount(runA, 0)).toBe(2);
     expect(peekTurnSendCount(runB, 0)).toBe(1);
     // A write past the TTL still prunes the idle slots before storing the new one.
-    recordTurnSend(
+    commitOne(
       { sessionKey: "s2", runId: "fresh", targetKey: "tg:a" },
+      {},
       TURN_SEND_LEDGER_TTL_MS + 1,
     );
     expect(peekTurnSendCount(runA, TURN_SEND_LEDGER_TTL_MS + 1)).toBe(0);

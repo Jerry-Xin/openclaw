@@ -86,10 +86,9 @@ import { isPollVoteEchoText } from "./poll-vote-echo.js";
 import {
   buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
-  hasRecordedTurnSendOperation,
-  peekTurnSendCount,
-  recordTurnSend,
-  recordTurnSendOnce,
+  commitTurnSend,
+  releaseTurnSend,
+  reserveTurnSend,
 } from "./turn-send-ledger.js";
 
 function resolveTrustedDecisionChannel(
@@ -570,35 +569,39 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           nextOperationId: () => String(++generatedIdempotencyCounter),
         });
 
-      // Optional hard cap (opt-in, default off): block a send before dispatch once
-      // the same target has already been sent to `max` times this turn. Media
-      // (sendAttachment/upload-file) is exempt so legitimately split attachments are
-      // never truncated; broadcast fan-out is already excluded from budgeting. A replay
-      // already recorded in the shared ledger this turn is admitted past the cap so a
-      // receipt the model already earned is not suppressed; recordTurnSendOnce below
-      // keeps that replay from double-counting the budget. Cross-tool budget unification
-      // (message <-> conversations_send at one recipient) is via that shared ledger slot
-      // key. The safety of admitting the replay depends on delivery-layer idempotency: on
-      // the Gateway-backed path the repeated idempotency key resolves to the completed
-      // operation without re-delivering; direct in-process delivery dedup is out of scope
-      // here — the same idempotent-replay guard the conversations_send tool applies.
-      const alreadyRecorded =
-        budgetContext && actionIdempotencyKey
-          ? hasRecordedTurnSendOperation(budgetContext, actionIdempotencyKey)
-          : false;
+      // Optional hard cap (opt-in, default off): reserve a slot before dispatch so a
+      // concurrent same-target send cannot slip past the cap while this one is in
+      // flight, then settle the reservation once delivery lands (commit) or does not
+      // (release). Media (sendAttachment/upload-file) passes maxPerTurn=undefined so it
+      // is never blocked — legitimately split attachments must not be truncated — while
+      // still counting toward the nudge; broadcast fan-out never builds a budgetContext.
+      // A replay already committed in the shared ledger this turn is admitted past the
+      // cap (`replay`) and left unsettled so a receipt the model already earned is not
+      // suppressed or double-counted. Cross-tool budget unification (message <->
+      // conversations_send at one recipient) is via the shared ledger slot key. The
+      // safety of admitting the replay depends on delivery-layer idempotency: on the
+      // Gateway-backed path the repeated idempotency key resolves to the completed
+      // operation without re-delivering; direct in-process delivery dedup is out of
+      // scope here — the same idempotent-replay guard the conversations_send tool applies.
       const isMediaSendAction = action === "sendAttachment" || action === "upload-file";
-      if (budgetContext && !isMediaSendAction && !alreadyRecorded) {
-        const maxPerTurn = resolveEffectiveMessageToolsConfig({
-          cfg: rawConfig,
-          agentId: resolvedAgentId,
-        })?.maxMessagesPerTurnPerTarget;
-        if (maxPerTurn !== undefined && peekTurnSendCount(budgetContext) >= maxPerTurn) {
-          return jsonResult({
-            status: "suppressed",
-            reason: "turn_send_budget_exhausted",
-            message: `Blocked: already sent ${maxPerTurn} message(s) to this target this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
-          });
-        }
+      const effectiveMessageTools = budgetContext
+        ? resolveEffectiveMessageToolsConfig({ cfg: rawConfig, agentId: resolvedAgentId })
+        : undefined;
+      const maxPerTurn = isMediaSendAction
+        ? undefined
+        : effectiveMessageTools?.maxMessagesPerTurnPerTarget;
+      const reservation = budgetContext
+        ? reserveTurnSend(budgetContext, {
+            maxPerTurn,
+            ...(actionIdempotencyKey ? { operationId: actionIdempotencyKey } : {}),
+          })
+        : undefined;
+      if (reservation?.status === "exhausted") {
+        return jsonResult({
+          status: "suppressed",
+          reason: "turn_send_budget_exhausted",
+          message: `Blocked: already sent ${maxPerTurn} message(s) to this target this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
+        });
       }
 
       const gatewayResolved = resolveGatewayOptions(gatewayOpts);
@@ -719,6 +722,11 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           abortSignal: signal,
         });
       } catch (error) {
+        // Nothing reached the peer: roll back the reservation so a throwing send does
+        // not consume the cap. A `replay` reservation took no pending slot (no-op).
+        if (reservation?.status === "reserved") {
+          releaseTurnSend(reservation.reservation);
+        }
         if (autogeneratedDeliveryFingerprint && actionIdempotencyKey) {
           failedAutogeneratedIdempotencyKeys.set(
             autogeneratedDeliveryFingerprint,
@@ -800,36 +808,33 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           });
         }
       }
-      // Reaching here without throwing means the action was delivered. Count it in
-      // the per-turn ledger regardless of the nudge toggle. From the second send to
-      // this target onward, append a one-line soft reminder unless turnSendNudge is
+      // Reaching here without throwing means the action was dispatched. Settle the
+      // reservation against the outcome: a delivery that landed commits (counting it in
+      // the per-turn ledger regardless of the nudge toggle) and, from the second send to
+      // this target onward, appends a one-line soft reminder unless turnSendNudge is
       // explicitly disabled. A `dry-run` result (e.g. no gateway) never counts.
       //
       // A core send can return deliveryStatus "suppressed" (e.g. no_visible_payload)
       // without reaching the peer; that must not consume the cap or fire a false
-      // nudge. Only "suppressed" is checked because "failed"/"partial_failed" already
-      // throw upstream (message.ts) and never reach here, and plugin/gateway sends
-      // carry kind:"send" with no sendResult (deliveryStatus undefined) — those still
-      // count because delivery happened remotely.
+      // nudge, so it releases the reservation instead. Only "suppressed" is checked
+      // because "failed"/"partial_failed" already throw upstream (message.ts) and never
+      // reach here, and plugin/gateway sends carry kind:"send" with no sendResult
+      // (deliveryStatus undefined) — those still count because delivery happened
+      // remotely. A `replay` reservation is left unsettled (the Gateway deduped it to
+      // the completed receipt), so it neither re-commits nor nudges.
       const deliveryStatus = result.kind === "send" ? result.sendResult?.deliveryStatus : undefined;
       const deliveredNothing = deliveryStatus === "suppressed" || deliveryStatus === "failed";
       let turnSendNotice: string | undefined;
-      if (budgetContext && result.kind !== "broadcast" && !result.dryRun && !deliveredNothing) {
-        // Count this delivery under its idempotency key so a later idempotent replay
-        // (same key) is not counted again: recordTurnSendOnce returns undefined for a
-        // repeat and never fires a second nudge. When there is no key (no runId), the
-        // context is undefined too, so the recordTurnSend fallback is unreachable in
-        // practice; it keeps the plain-count semantics for any keyless caller.
-        const sendCount = actionIdempotencyKey
-          ? recordTurnSendOnce(budgetContext, actionIdempotencyKey)
-          : recordTurnSend(budgetContext);
-        const nudgeEnabled =
-          resolveEffectiveMessageToolsConfig({
-            cfg: rawConfig,
-            agentId: resolvedAgentId,
-          })?.turnSendNudge !== false;
-        if (sendCount !== undefined && sendCount >= 2 && nudgeEnabled) {
-          turnSendNotice = `You have already sent ${sendCount} messages to this target this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`;
+      if (reservation?.status === "reserved") {
+        const landed = result.kind !== "broadcast" && !result.dryRun && !deliveredNothing;
+        if (!landed) {
+          releaseTurnSend(reservation.reservation);
+        } else {
+          const sendCount = commitTurnSend(reservation.reservation);
+          const nudgeEnabled = effectiveMessageTools?.turnSendNudge !== false;
+          if (sendCount >= 2 && nudgeEnabled) {
+            turnSendNotice = `You have already sent ${sendCount} messages to this target this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`;
+          }
         }
       }
       // Single append point for all three return exits so a notice is never dropped

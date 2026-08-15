@@ -152,10 +152,15 @@ successful sends, independent of `tools.loopDetection` and its master switch.
 - **Hard cap (opt-in, default off).** Set
   `tools.message.maxMessagesPerTurnPerTarget` to a positive integer to block
   sends beyond that many deliveries to the same target in one turn. The block
-  happens before delivery and returns a `turn_send_budget_exhausted` suppressed
-  result. Media actions (`sendAttachment`, `upload-file`) and broadcast fan-out
-  are exempt so legitimately split messages are never truncated. The per-agent
-  override lives at `agents.entries.*.tools.message.maxMessagesPerTurnPerTarget`.
+  happens before delivery, and the two tools report it in the two different
+  shapes their result schemas allow. The `message` tool returns a suppressed
+  result carrying the structured reason `turn_send_budget_exhausted`.
+  `conversations_send` declares a closed result schema with no reason field, so
+  it returns a suppressed result (status `suppressed`) whose block reason is in
+  the human-readable text instead of a structured field. Media actions
+  (`sendAttachment`, `upload-file`) and broadcast fan-out are exempt so
+  legitimately split messages are never truncated. The per-agent override lives
+  at `agents.entries.*.tools.message.maxMessagesPerTurnPerTarget`.
 
 ```json5
 {

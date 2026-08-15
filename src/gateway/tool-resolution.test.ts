@@ -8,7 +8,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { resolveSessionAgentId } from "../agents/agent-scope.js";
 import {
   buildTurnSendTargetKey,
-  recordTurnSend,
+  commitTurnSend,
+  reserveTurnSend,
   resetTurnSendLedgerForTest,
 } from "../agents/tools/turn-send-ledger.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -22,6 +23,16 @@ import { resolveGatewayScopedTools } from "./tool-resolution.js";
 // miss the slot and let the cap stay inert even when the wiring under test is correct.
 function ledgerSessionKey(sessionKey: string): string {
   return `${resolveSessionAgentId({ sessionKey })}\0${sessionKey}`;
+}
+
+// Seed one committed send for a (turn, target) via the reserve->commit primitive the
+// tools use, so the opt-in cap of 1 is already reached when the tool under test peeks.
+function seedCommittedSend(key: { sessionKey: string; runId: string; targetKey: string }): void {
+  const reserved = reserveTurnSend(key, {});
+  if (reserved.status !== "reserved") {
+    throw new Error(`expected to seed a reserved send, got "${reserved.status}"`);
+  }
+  commitTurnSend(reserved.reservation);
 }
 
 describe("resolveGatewayScopedTools", () => {
@@ -323,7 +334,7 @@ describe("resolveGatewayScopedTools per-turn send ledger wiring", () => {
     const sessionKey = "agent:main:telegram:group:-100123";
     const runId = "gw-run-1";
     const targetKey = buildTurnSendTargetKey({ channel: "telegram", target: "peer-1" });
-    recordTurnSend({ sessionKey: ledgerSessionKey(sessionKey), runId, targetKey });
+    seedCommittedSend({ sessionKey: ledgerSessionKey(sessionKey), runId, targetKey });
 
     const result = resolveGatewayScopedTools({
       cfg: {
@@ -362,7 +373,7 @@ describe("resolveGatewayScopedTools per-turn send ledger wiring", () => {
     const sessionKey = "agent:main:slack:dm:U123";
     const runId = "gw-run-2";
     const targetKey = buildTurnSendTargetKey({ channel: "slack", target: "user:U123" });
-    recordTurnSend({ sessionKey: ledgerSessionKey(sessionKey), runId, targetKey });
+    seedCommittedSend({ sessionKey: ledgerSessionKey(sessionKey), runId, targetKey });
 
     const result = resolveGatewayScopedTools({
       cfg: {
