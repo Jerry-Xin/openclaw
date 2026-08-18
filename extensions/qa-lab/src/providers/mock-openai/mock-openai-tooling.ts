@@ -108,6 +108,64 @@ export function buildToolCallEventsWithArgs(
   return stream.complete(16);
 }
 
+// Emits the SAME tool call `count` times inside ONE model response, reusing a
+// fixed call_id and item id and byte-identical arguments — bypassing the
+// per-call unique-suffix counter buildMockFunctionCall applies. The copies are
+// genuine duplicate model-emitted tool calls the runtime must disambiguate
+// (normalizeToolCallIdsInMessage) into distinct executions; used by the per-turn
+// send-budget REPEAT fixture to prove the cap-block path over idempotent replay
+// admission. Each copy gets its own output_index so the stream stays routable
+// even though the tool-call identities collide.
+export function buildDuplicateToolCallEventsWithArgs(
+  name: string,
+  args: Record<string, unknown>,
+  count: number,
+): StreamEvent[] {
+  const serialized = JSON.stringify(args);
+  const callId = `call_mock_${name}_ptsb_repeat`;
+  const itemId = `fc_mock_${name}_ptsb_repeat`;
+  const responseId = `resp_mock_${name}_ptsb_repeat`;
+  const buildItem = () => ({
+    type: "function_call",
+    id: itemId,
+    call_id: callId,
+    name,
+    arguments: serialized,
+  });
+  const events: StreamEvent[] = [];
+  const output: ReturnType<typeof buildItem>[] = [];
+  for (let outputIndex = 0; outputIndex < count; outputIndex += 1) {
+    const item = buildItem();
+    output.push(item);
+    events.push({
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item: { ...item, arguments: "" },
+    });
+    events.push({
+      type: "response.function_call_arguments.delta",
+      item_id: itemId,
+      output_index: outputIndex,
+      delta: serialized,
+    });
+    events.push({
+      type: "response.output_item.done",
+      output_index: outputIndex,
+      item,
+    });
+  }
+  events.push({
+    type: "response.completed",
+    response: {
+      id: responseId,
+      status: "completed",
+      output,
+      usage: { input_tokens: 64, output_tokens: 24, total_tokens: 88 },
+    },
+  });
+  return events;
+}
+
 export function buildCustomToolCallEventsWithInput(
   name: string,
   input: string,
