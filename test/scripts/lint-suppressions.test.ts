@@ -208,7 +208,6 @@ describe("production lint suppressions", () => {
         // JSON parser causes can quote reflected credentials from authenticated provider responses.
         "src/agents/provider-http-errors.ts|preserve-caught-error|1",
         "src/agents/sessions/session-manager-entries.ts|unicorn/prefer-structured-clone|1",
-        "src/agents/workspace-extra-bootstrap-walker.ts|unicorn/prefer-regexp-test|1",
         "src/channels/plugins/channel-runtime-surface.types.ts|typescript/no-unnecessary-type-parameters|1",
         "src/channels/plugins/contracts/test-helpers.ts|typescript/no-unnecessary-type-parameters|1",
         "src/channels/plugins/types.plugin.ts|typescript/no-explicit-any|1",
