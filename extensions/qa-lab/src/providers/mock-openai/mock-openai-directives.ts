@@ -295,6 +295,23 @@ export function extractPerTurnSendBudgetDirective(text: string): {
   };
 }
 
+// Per-turn send-budget REPEAT fixture: unlike QA-PTSB-SEND (one send per
+// continuation round), this makes the model emit the SAME `message` send TWICE
+// inside ONE response — identical planned call_id, item id, and byte-identical
+// arguments. The runtime disambiguates the duplicate model-emitted ids
+// (normalizeToolCallIdsInMessage), so the two copies derive DIFFERENT idempotency
+// keys and run as two distinct executions; under a per-turn cap the second is
+// cap-blocked ("turn_send_budget_exhausted"), not admitted as an idempotent
+// replay. Lets an e2e prove the cap-block path (not idempotent admission) at the
+// real delivery boundary. Marker `QA-PTSB-REPEAT` is unique to this fixture.
+export function extractPerTurnSendBudgetRepeatDirective(text: string): { marker: string } | null {
+  const match = /QA-PTSB-REPEAT\s+tool=message\s+marker=([A-Za-z0-9._-]+)/u.exec(text);
+  if (!match) {
+    return null;
+  }
+  return { marker: match[1] ?? "QA-PTSB-REPEAT" };
+}
+
 export function buildExplicitSessionsSpawnArgs(text: string): Record<string, unknown> | null {
   if (!/\bsessions_spawn\b/i.test(text)) {
     return null;
