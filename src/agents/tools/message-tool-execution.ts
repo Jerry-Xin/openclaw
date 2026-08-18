@@ -32,10 +32,7 @@ import type {
 } from "../../infra/outbound/message-action-contracts.js";
 import { projectGatewayQueuedDeliveryResult } from "../../infra/outbound/message-action-execution.js";
 import { getToolResult, runMessageAction } from "../../infra/outbound/message-action-runner.js";
-import {
-  actionRequiresTarget,
-  resolveActionDeliveryTargetAlias,
-} from "../../infra/outbound/message-action-spec.js";
+import { resolveActionDeliveryTargetAlias } from "../../infra/outbound/message-action-spec.js";
 import {
   resolveEffectiveMessageToolsConfig,
   shouldApplyCrossContextMarker,
@@ -578,11 +575,13 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       // A replay already committed in the shared ledger this turn is admitted past the
       // cap (`replay`) and left unsettled so a receipt the model already earned is not
       // suppressed or double-counted. Cross-tool budget unification (message <->
-      // conversations_send at one recipient) is via the shared ledger slot key. The
-      // safety of admitting the replay depends on delivery-layer idempotency: on the
-      // Gateway-backed path the repeated idempotency key resolves to the completed
-      // operation without re-delivering; direct in-process delivery dedup is out of
-      // scope here — the same idempotent-replay guard the conversations_send tool applies.
+      // conversations_send at one recipient) is via the shared ledger slot key.
+      // Admitting the replay is re-delivery-safe only on Gateway-routed sends, where the
+      // repeated idempotency key resolves to the completed operation without
+      // re-delivering. A direct-mode (in-process) channel does not dedup on the
+      // idempotency key, so an admitted replay there WOULD be re-delivered; that path
+      // stays exactly-once only because a duplicate model-emitted send is disambiguated
+      // upstream into distinct tool-call ids and cap-blocked, never admitted as a replay.
       const isMediaSendAction = action === "sendAttachment" || action === "upload-file";
       const effectiveMessageTools = budgetContext
         ? resolveEffectiveMessageToolsConfig({ cfg: rawConfig, agentId: resolvedAgentId })

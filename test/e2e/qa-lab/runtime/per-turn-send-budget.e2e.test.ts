@@ -105,6 +105,19 @@ function withMessageToolReplies(cfg: Record<string, unknown>): Record<string, un
   };
 }
 
+// message-tool replies plus the opt-in per-turn hard cap (one send per target per
+// turn). Used by the repeat scenario so a model-repeated `message` send is
+// cap-blocked at the second copy.
+function withCappedMessageToolReplies(cfg: Record<string, unknown>): Record<string, unknown> {
+  const withReplies = withMessageToolReplies(cfg);
+  const tools = (withReplies.tools as Record<string, unknown> | undefined) ?? {};
+  const message = (tools.message as Record<string, unknown> | undefined) ?? {};
+  return {
+    ...withReplies,
+    tools: { ...tools, message: { ...message, maxMessagesPerTurnPerTarget: 1 } },
+  };
+}
+
 async function bootHarness(
   mutateConfig?: (cfg: Record<string, unknown>) => Record<string, unknown>,
 ): Promise<{ state: BusState; harness: LiveHarness }> {
@@ -179,6 +192,54 @@ async function fetchMockRequestTexts(mockBaseUrl: string): Promise<string[]> {
       (value): value is string => typeof value === "string",
     ),
   );
+}
+
+type MockRequestSnapshot = {
+  body?: { input?: unknown };
+  plannedToolCallId?: unknown;
+};
+
+async function fetchMockRequests(mockBaseUrl: string): Promise<MockRequestSnapshot[]> {
+  const response = await fetch(`${mockBaseUrl}/debug/requests`);
+  return (await response.json()) as MockRequestSnapshot[];
+}
+
+function inputItemsOf(request: MockRequestSnapshot): Record<string, unknown>[] {
+  const input = request.body?.input;
+  return Array.isArray(input)
+    ? input.filter(
+        (item): item is Record<string, unknown> => Boolean(item) && typeof item === "object",
+      )
+    : [];
+}
+
+// Every function_call_output payload string across the recorded transcript requests.
+// A suppressed message result is fed back to the model as one of these.
+function collectToolOutputs(requests: MockRequestSnapshot[]): string[] {
+  const outputs: string[] = [];
+  for (const request of requests) {
+    for (const item of inputItemsOf(request)) {
+      if (item.type === "function_call_output" && typeof item.output === "string") {
+        outputs.push(item.output);
+      }
+    }
+  }
+  return outputs;
+}
+
+async function waitForMockRequestText(
+  mockBaseUrl: string,
+  predicate: (text: string) => boolean,
+  timeoutMs = 60_000,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if ((await fetchMockRequestTexts(mockBaseUrl)).some(predicate)) {
+      return;
+    }
+    await sleep(200);
+  }
+  throw new Error(`timed out after ${timeoutMs}ms waiting for a matching mock request text`);
 }
 
 // One registry row read back from the running Gateway (conversations.list). Its
@@ -680,6 +741,110 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
           blockTextPresent &&
           concurrentDeliveries.length === 1 &&
           ledgerCount === 1,
+      });
+    },
+  );
+
+  it(
+    "scenario 6: a model-repeated direct message send under the cap is disambiguated and cap-blocked (exactly-once delivery) — proves the cap-block path, NOT idempotent admission",
+    { timeout: SCENARIO_TIMEOUT_MS },
+    async () => {
+      // The direct-tool counterpart to scenario 5's concurrency proof. The mock emits
+      // the SAME `message` send TWICE in ONE model response — identical planned call_id,
+      // item id, and byte-identical arguments (QA-PTSB-REPEAT). The runtime disambiguates
+      // the duplicate model-emitted ids (normalizeToolCallIdsInMessage) into two distinct
+      // tool-call ids, so deriveMessageToolIdempotency yields DIFFERENT keys: the second
+      // copy is NOT recognized as an idempotent replay and, under
+      // maxMessagesPerTurnPerTarget:1, is cap-blocked before dispatch. This is the honest,
+      // reachable proof — the replay-admission branch is unreachable from a model turn
+      // because the runtime always rewrites the duplicate ids. On qa-channel (deliveryMode
+      // "direct") the delivery layer does not dedup on the idempotency key, so admitting a
+      // replay here WOULD re-deliver; exactly-once delivery is therefore the direct
+      // no-double-count proof (the real turn runs in the Gateway child, whose per-turn
+      // ledger is not peekable from this process, exactly as scenarios 1 and 3 treat it).
+      const { state: busState, harness: live } = await bootHarness(withCappedMessageToolReplies);
+      busState.addInboundMessage({
+        conversation: { id: "qa-operator", kind: "direct" },
+        senderId: "qa-user",
+        senderName: "QA User",
+        text: "Per-turn budget check. QA-PTSB-REPEAT tool=message marker=SBR6",
+      });
+
+      // (a) Exactly one copy reaches the peer. Wait for the delivery, then confirm no
+      // second SBR6 ever lands (a re-delivered replay would surface a second one).
+      const delivered = await waitForOutboundText(busState, (message) => message.text === "SBR6");
+      expect(delivered.conversation.id).toBe("qa-operator");
+
+      // (b) The second tool result is the schema-valid suppressed shape, fed back to the
+      // model. Wait for it in the mock's recorded requests (the actual model-facing result).
+      await waitForMockRequestText(live.mock!.baseUrl, (text) =>
+        text.includes("turn_send_budget_exhausted"),
+      );
+      await sleep(500);
+      const repeatDeliveries = outboundMessages(busState).filter(
+        (message) => message.text === "SBR6",
+      );
+      expect(repeatDeliveries).toHaveLength(1);
+
+      const requests = await fetchMockRequests(live.mock!.baseUrl);
+      const suppressedOutput = collectToolOutputs(requests).find((output) =>
+        output.includes("turn_send_budget_exhausted"),
+      );
+      expect(suppressedOutput).toBeDefined();
+      const suppressedResult = JSON.parse(suppressedOutput!) as {
+        status?: unknown;
+        reason?: unknown;
+        message?: unknown;
+      };
+      const suppressedSchemaValid =
+        suppressedResult.status === "suppressed" &&
+        suppressedResult.reason === "turn_send_budget_exhausted" &&
+        typeof suppressedResult.message === "string" &&
+        suppressedResult.message.includes("Blocked: already sent 1 message");
+      expect(suppressedSchemaValid).toBe(true);
+
+      // (c) The two executions carried DISTINCT tool-call ids after the runtime rewrote the
+      // duplicate model-emitted id. The emitting response planned a single identity
+      // (plannedToolCallId), yet the first transcript round that carries both message sends
+      // shows two distinct call_ids — that contrast IS the disambiguation proof. (Counting
+      // across all requests would over-count: later rounds re-encode the same two ids into
+      // provider-sanitized variants.)
+      const plannedRepeat = requests
+        .map((request) => request.plannedToolCallId)
+        .find((id): id is string => typeof id === "string" && id.includes("ptsb_repeat"));
+      expect(plannedRepeat).toBeDefined();
+      const messageIdsPerRequest = requests.map((request) =>
+        inputItemsOf(request)
+          .filter(
+            (item) =>
+              item.type === "function_call" &&
+              item.name === "message" &&
+              typeof item.call_id === "string",
+          )
+          .map((item) => item.call_id as string),
+      );
+      const firstRoundWithBothSends = messageIdsPerRequest.find((ids) => ids.length >= 2);
+      expect(firstRoundWithBothSends).toBeDefined();
+      const distinctExecutedIds = new Set(firstRoundWithBothSends);
+      expect(distinctExecutedIds.size).toBe(2);
+
+      verdict.scenarios.push({
+        scenario:
+          "direct message-tool repeat under cap is disambiguated and cap-blocked (exactly-once delivery)",
+        deliveriesRecorded: repeatDeliveries.length,
+        toolResults: [
+          { status: "sent", noticePresent: false, schemaValid: true },
+          {
+            status: "suppressed",
+            noticePresent: suppressedSchemaValid,
+            schemaValid: suppressedSchemaValid,
+          },
+        ],
+        // Child-process ledger is not peekable here; exactly-one delivery is the
+        // no-double-count proxy (a re-delivered replay would show 2 on this direct channel).
+        ledgerCounts: { "qa-channel:qa-operator": repeatDeliveries.length },
+        pass:
+          repeatDeliveries.length === 1 && suppressedSchemaValid && distinctExecutedIds.size === 2,
       });
     },
   );

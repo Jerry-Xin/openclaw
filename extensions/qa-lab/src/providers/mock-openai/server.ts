@@ -146,6 +146,7 @@ import {
   extractSessionStatusSessionKey,
   resolveHeartbeatPromptReply,
   extractPerTurnSendBudgetDirective,
+  extractPerTurnSendBudgetRepeatDirective,
 } from "./mock-openai-directives.js";
 import {
   buildRemoteCompactionV2Events,
@@ -195,6 +196,7 @@ import {
   execCommandFromToolProgressPrompt,
   buildCustomToolCallEventsWithInput,
   buildToolCallEventsWithArgs as buildRawToolCallEventsWithArgs,
+  buildDuplicateToolCallEventsWithArgs,
   extractOrbitCode,
   extractToolSearchTarget,
   toolSearchOutputHasCandidate,
@@ -1094,6 +1096,33 @@ async function buildResponsesPayload(
       return buildToolCallEventsWithArgs(perTurnSendBudget.tool, sendArgs);
     }
     return buildAssistantEvents(`${perTurnSendBudget.marker}-FINAL`);
+  }
+  // Per-turn send-budget REPEAT fixture (QA-PTSB-REPEAT): emit the SAME `message`
+  // send twice in ONE response (identical planned call_id, item id, and args) on
+  // the opening round, then finalize with text once the copies have run. Proves
+  // the runtime disambiguates a model-repeated send so a per-turn cap blocks the
+  // second copy instead of admitting it as an idempotent replay. Placed beside
+  // QA-PTSB-SEND so its unique marker wins before the scenario chain.
+  const perTurnSendBudgetRepeat = extractPerTurnSendBudgetRepeatDirective(allInputText);
+  if (perTurnSendBudgetRepeat && hasDeclaredTool(body, "message")) {
+    const priorMessageSends = input.filter(
+      (item) => item.type === "function_call" && item.name === "message",
+    ).length;
+    if (priorMessageSends === 0) {
+      return buildDuplicateToolCallEventsWithArgs(
+        "message",
+        {
+          action: "send",
+          message: perTurnSendBudgetRepeat.marker,
+          // Non-final so the run keeps looping to the finalizer after both copies
+          // resolve; `final` is deleted before dispatch (see QA-PTSB-SEND) and so
+          // never reaches delivery or idempotency derivation.
+          final: false,
+        },
+        2,
+      );
+    }
+    return buildAssistantEvents(`${perTurnSendBudgetRepeat.marker}-FINAL`);
   }
   // The queued followup carries the stalled prompt in transcript history, so
   // current-turn dispatch must win before the persistent recovery fixture.
