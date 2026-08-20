@@ -13,9 +13,14 @@
  * `recentPollVoteBySession` precedent in message-tool.ts: a per-tool-instance
  * counter would be lost across the run boundary that separates the tool calls in
  * one turn, so the count must outlive the instance. A "turn" is one agent run
- * (`runId`), so each entry is scoped to one (session, run) pair; a run that has no
- * entry starts fresh, which bounds the counts to a single turn without any
- * explicit cleanup. Concurrent foreground runs can share one sessionKey (see
+ * (`runId`), so each entry is scoped to one (session, run) pair and stays
+ * authoritative for the run's whole lifetime — including long tool waits and
+ * provider fallback attempts that reuse the runId — so the opt-in hard cap holds
+ * for the entire turn as documented (docs/tools/loop-detection.md,
+ * schema.help.runtime.ts). The logical-run owner deletes the slot at its terminal
+ * boundary (clearTurnSendLedgerForRun, wired from the fallback-chain `finally` in
+ * embedded-agent-runner/run-entry.ts); a run that has no entry starts fresh.
+ * Concurrent foreground runs can share one sessionKey (see
  * src/auto-reply/dispatch.freshness.test.ts), so the runId is part of the key
  * rather than a field that resets a shared slot — otherwise a later run would
  * evict an earlier still-live run's counts.
@@ -24,16 +29,13 @@ import { normalizeTargetForProvider } from "../../infra/outbound/target-normaliz
 import { normalizeAccountId } from "../../routing/account-id.js";
 import { normalizeMessageChannel } from "../../utils/message-channel-normalize.js";
 
-// A turn can span more tool round-trips than a poll echo, so this TTL is longer
-// than POLL_VOTE_ECHO_TTL_MS; it only prunes (session, run) entries that went fully
-// idle and keeps the map bounded in a long-lived gateway.
-export const TURN_SEND_LEDGER_TTL_MS = 10 * 60_000;
-
-// Absolute ceiling on live (session, run) slots. TTL prunes idle turns, but a
-// burst of many short-lived runs inside one TTL window could grow the map
-// without bound. This LRU cap evicts the oldest-touched slot once the ceiling is
-// crossed, so the map stays bounded even if nothing expires. Sized far above any
-// realistic concurrent-turn count, so it only trips on runaway growth.
+// Absolute ceiling on retained (session, run) slots — a last-resort process bound,
+// not the normal lifecycle. The logical-run owner clears each slot at its terminal
+// boundary (clearTurnSendLedgerForRun), so completed runs do not accumulate; this
+// LRU cap only trips if that terminal cleanup is missed under runaway concurrency
+// (> MAX_TURN_SEND_SLOTS live turns at once). storeSlot evicts the oldest-touched
+// slot when the ceiling is crossed. Sized far above any realistic concurrent-turn
+// count, so it only fires on runaway growth.
 export const MAX_TURN_SEND_SLOTS = 2048;
 
 type TurnSendSlot = {
@@ -52,7 +54,6 @@ type TurnSendSlot = {
   // re-delivering. Tracking committed ids lets a replay through the cap and keeps
   // it from double-counting. The message tool passes its idempotency key here too.
   seenOperations: Set<string>;
-  recordedAt: number;
 };
 
 // One entry per (session, run): the turn's per-target committed counts and pending
@@ -137,32 +138,19 @@ export function buildTurnSendTargetKey(params: {
   return `${channel}\0${normalizeAccountId(params.accountId)}\0${target}`;
 }
 
-// A slot is live only within the TTL window measured from its last write. Peek,
-// reserve, commit, and release share this predicate so they agree on what "expired"
-// means: peek returns 0 for an expired slot (dropping it), while reserve/commit start
-// a fresh turn for one. Deliberate tradeoff: a >10-min-idle gap within a single turn
-// resets that turn's budget. Accepted because the cap is a best-effort runaway-fan-out
-// backstop, not a strict guarantee (see the module header).
-function isLiveSlot(slot: TurnSendSlot, now: number): boolean {
-  return now - slot.recordedAt <= TURN_SEND_LEDGER_TTL_MS;
-}
-
-// The (session, run) slot, or a fresh one when that pair has no entry or its TTL
-// window has elapsed. A different run on the same session is a distinct key, so it
-// naturally gets its own fresh slot instead of evicting this one. Shared by reserve
-// and commit so committed counts, pending reservations, and seen-operation ids reset
-// together on a turn boundary. Callers mutate the returned slot and reseat it via the map.
-function liveSlotForTurn(sessionKey: string, runId: string, now: number): TurnSendSlot {
-  const existing = turnSendBySession.get(ledgerKey(sessionKey, runId));
-  if (existing && isLiveSlot(existing, now)) {
-    return existing;
-  }
-  return {
-    committed: new Map<string, number>(),
-    pending: new Map<string, number>(),
-    seenOperations: new Set<string>(),
-    recordedAt: now,
-  };
+// The (session, run) slot, or a fresh one when that pair has no entry. A different run
+// on the same session is a distinct key, so it naturally gets its own fresh slot instead
+// of evicting this one. Shared by reserve and commit so committed counts, pending
+// reservations, and seen-operation ids live — and reset only at the run's terminal
+// boundary — together. Callers mutate the returned slot and reseat it via storeSlot.
+function liveSlotForTurn(sessionKey: string, runId: string): TurnSendSlot {
+  return (
+    turnSendBySession.get(ledgerKey(sessionKey, runId)) ?? {
+      committed: new Map<string, number>(),
+      pending: new Map<string, number>(),
+      seenOperations: new Set<string>(),
+    }
+  );
 }
 
 type ReservationState = "reserved" | "committed" | "released";
@@ -206,18 +194,14 @@ export type TurnSendReserveResult =
  *
  * With `maxPerTurn` undefined (media / no configured cap) admission never returns
  * `exhausted`, yet pending/committed are still tracked so the soft nudge keeps counting.
- * `now` is injectable for deterministic tests; it defaults to the wall clock.
  */
 export function reserveTurnSend(
   key: TurnSendKey,
   options: { maxPerTurn?: number; operationId?: string },
-  now: number = Date.now(),
 ): TurnSendReserveResult {
-  pruneExpired(now);
   const storeKey = ledgerKey(key.sessionKey, key.runId);
-  const slot = liveSlotForTurn(key.sessionKey, key.runId, now);
+  const slot = liveSlotForTurn(key.sessionKey, key.runId);
   if (options.operationId !== undefined && slot.seenOperations.has(options.operationId)) {
-    slot.recordedAt = now;
     storeSlot(storeKey, slot);
     return { status: "replay" };
   }
@@ -229,7 +213,6 @@ export function reserveTurnSend(
     return { status: "exhausted" };
   }
   slot.pending.set(key.targetKey, pending + 1);
-  slot.recordedAt = now;
   storeSlot(storeKey, slot);
   return {
     status: "reserved",
@@ -240,18 +223,17 @@ export function reserveTurnSend(
 /**
  * Settles a reservation whose delivery landed: moves it from pending to committed,
  * records its operationId so an idempotent replay is admitted past the cap without
- * recounting, refreshes the turn TTL, and returns the resulting committed send count
- * for the target (>= 2 means the caller should nudge). Idempotent: a repeat call — or a
- * commit after release — neither re-increments committed nor re-decrements pending and
- * simply reports the current committed count. `now` is injectable for tests.
+ * recounting, and returns the resulting committed send count for the target (>= 2 means
+ * the caller should nudge). Settles against the same (session, run) slot no matter how
+ * long the awaited delivery took — the slot lives for the whole run. Idempotent: a
+ * repeat call — or a commit after release — neither re-increments committed nor
+ * re-decrements pending and simply reports the current committed count.
  */
-export function commitTurnSend(reservation: TurnSendReservation, now: number = Date.now()): number {
+export function commitTurnSend(reservation: TurnSendReservation): number {
   const { sessionKey, runId, targetKey } = reservation.key;
-  pruneExpired(now);
   const storeKey = ledgerKey(sessionKey, runId);
-  const slot = liveSlotForTurn(sessionKey, runId, now);
+  const slot = liveSlotForTurn(sessionKey, runId);
   if (reservation.state !== "reserved") {
-    slot.recordedAt = now;
     storeSlot(storeKey, slot);
     return slot.committed.get(targetKey) ?? 0;
   }
@@ -262,7 +244,6 @@ export function commitTurnSend(reservation: TurnSendReservation, now: number = D
   if (reservation.operationId !== undefined) {
     slot.seenOperations.add(reservation.operationId);
   }
-  slot.recordedAt = now;
   storeSlot(storeKey, slot);
   return committed;
 }
@@ -272,10 +253,9 @@ export function commitTurnSend(reservation: TurnSendReservation, now: number = D
  * broadcast, or a throw): decrements only the pending count, leaving committed and the
  * seen-operation set untouched, so a failed send neither consumes the cap nor fires a
  * nudge. Idempotent and double-release safe via the reservation `state`; a no-op once
- * the reservation is committed or the turn's slot has already expired. `now` is
- * injectable for tests.
+ * the reservation is committed or the turn's slot has already been cleared.
  */
-export function releaseTurnSend(reservation: TurnSendReservation, now: number = Date.now()): void {
+export function releaseTurnSend(reservation: TurnSendReservation): void {
   if (reservation.state !== "reserved") {
     return;
   }
@@ -283,18 +263,16 @@ export function releaseTurnSend(reservation: TurnSendReservation, now: number = 
   const { sessionKey, runId, targetKey } = reservation.key;
   const storeKey = ledgerKey(sessionKey, runId);
   const slot = turnSendBySession.get(storeKey);
-  if (!slot || !isLiveSlot(slot, now)) {
+  if (!slot) {
     return;
   }
   releasePending(slot, targetKey);
-  slot.recordedAt = now;
   storeSlot(storeKey, slot);
 }
 
 // Decrement one pending reservation for `targetKey`, dropping the map entry at zero so
-// the pending map only holds targets with live in-flight sends. Clamped at zero: a slot
-// recreated after TTL expiry has no pending to remove, and a reservation must never
-// drive the count negative.
+// the pending map only holds targets with live in-flight sends. Clamped at zero: a
+// reservation must never drive the count negative.
 function releasePending(slot: TurnSendSlot, targetKey: string): void {
   const pending = slot.pending.get(targetKey) ?? 0;
   if (pending > 1) {
@@ -308,36 +286,40 @@ function releasePending(slot: TurnSendSlot, targetKey: string): void {
  * Reads the current turn's committed send count for `targetKey` without mutating the
  * ledger — read-only inspection (production settles through reserve/commit; tests use
  * this to assert the committed total). Returns 0 when the (session, run) pair has no
- * entry, or the target has not been committed to yet. `now` is injectable for tests.
- *
- * An expired slot is pruned and treated as 0: otherwise a capped slot past its TTL
- * would keep returning its stale count. Deleting the one slot on peek is safe under
- * single-threaded JS.
+ * entry, or the target has not been committed to yet.
  */
-export function peekTurnSendCount(
-  { sessionKey, runId, targetKey }: TurnSendKey,
-  now: number = Date.now(),
-): number {
-  const key = ledgerKey(sessionKey, runId);
-  const slot = turnSendBySession.get(key);
+export function peekTurnSendCount({ sessionKey, runId, targetKey }: TurnSendKey): number {
+  const slot = turnSendBySession.get(ledgerKey(sessionKey, runId));
   if (!slot) {
-    return 0;
-  }
-  if (!isLiveSlot(slot, now)) {
-    turnSendBySession.delete(key);
     return 0;
   }
   return slot.committed.get(targetKey) ?? 0;
 }
 
-export function resetTurnSendLedgerForTest(): void {
-  turnSendBySession.clear();
+/**
+ * Deletes the exact (session, run) slot at a logical run's terminal boundary, freeing
+ * its per-target counts, pending reservations, and seen-operation ids. The logical-run
+ * owner calls this from the fallback-chain `finally` in run-entry.ts after all owned
+ * tool work has settled, so the budget survives internal retries and provider fallbacks
+ * (same runId) and resets only when the run truly ends. Rebuilds the canonical ledger
+ * session key the send tools write under (buildTurnSendLedgerSessionKey), so the deleted
+ * composite key is byte-identical to theirs; deleting only the (session, run) pair
+ * leaves a concurrent run on the same session — a distinct runId, hence a distinct key —
+ * untouched. A missing agent id or session key, or an already-absent slot, is a harmless
+ * no-op (the LRU cap reclaims any slot a run terminates without reaching here).
+ */
+export function clearTurnSendLedgerForRun(args: {
+  sessionKey: string;
+  runId: string;
+  agentId?: string;
+}): void {
+  const ledgerSessionKey = buildTurnSendLedgerSessionKey(args.agentId, args.sessionKey);
+  if (!ledgerSessionKey) {
+    return;
+  }
+  turnSendBySession.delete(ledgerKey(ledgerSessionKey, args.runId));
 }
 
-function pruneExpired(now: number): void {
-  for (const [key, slot] of turnSendBySession) {
-    if (!isLiveSlot(slot, now)) {
-      turnSendBySession.delete(key);
-    }
-  }
+export function resetTurnSendLedgerForTest(): void {
+  turnSendBySession.clear();
 }

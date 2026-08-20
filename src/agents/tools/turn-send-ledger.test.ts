@@ -2,16 +2,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
+  clearTurnSendLedgerForRun,
   commitTurnSend,
   MAX_TURN_SEND_SLOTS,
   peekTurnSendCount,
   releaseTurnSend,
   reserveTurnSend,
   resetTurnSendLedgerForTest,
-  TURN_SEND_LEDGER_TTL_MS,
   type TurnSendReservation,
   type TurnSendReserveResult,
 } from "./turn-send-ledger.js";
+
+// The idle TTL that once reset a live run's budget mid-turn was removed (#119992): a
+// present (session, run) slot is now authoritative for the whole run, cleared only by
+// clearTurnSendLedgerForRun at the run's terminal boundary. This test-only constant lets
+// the long-idle regressions advance the clock past the old boundary and prove the budget
+// no longer resets — the very case the old TTL bypassed.
+const OLD_TTL_MS = 10 * 60_000;
 
 // Stand-in for a provider target normalizer: case-fold and strip a leading "tg:"
 // prefix, mirroring what a real telegram plugin normalizer does. Any other target
@@ -44,14 +51,12 @@ function expectReserved(result: TurnSendReserveResult): TurnSendReservation {
 
 // The production reserve->await->settle round-trip collapsed for the counting tests:
 // reserve, then immediately commit as if delivery landed. Returns the committed count.
-// Passing `now` through both calls keeps the deterministic-clock tests injectable.
 function commitOne(
   key: LedgerKey,
   options: { maxPerTurn?: number; operationId?: string } = {},
-  now?: number,
 ): number {
-  const reservation = expectReserved(reserveTurnSend(key, options, now));
-  return commitTurnSend(reservation, now);
+  const reservation = expectReserved(reserveTurnSend(key, options));
+  return commitTurnSend(reservation);
 }
 
 afterEach(() => {
@@ -123,28 +128,21 @@ describe("turn-send-ledger", () => {
     expect(peekTurnSendCount(key)).toBe(0);
   });
 
-  it("prunes sessions idle past the TTL on write", () => {
+  it("keeps a capped run exhausted after a long idle wait past the old TTL (#119992)", () => {
+    // Regression for the removed idle-TTL bypass. Under a hard cap of 1, the first send
+    // commits and reaches the cap. The run then idles far past the old 10-minute TTL
+    // (a slow tool wait) before its next same-target send. The slot must stay
+    // authoritative — a distinct operation is still `exhausted` and the count is still 1,
+    // never reset to a fresh budget. Drives the Date.now() default the pre-fix code read,
+    // so this FAILS on pre-fix code (which pruned the slot and re-admitted the send).
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    commitOne({ sessionKey: "stale", runId: "run-1", targetKey: "tg:a" });
-    // Advance beyond the TTL, then write for a different session so the prune runs.
-    vi.setSystemTime(10 * 60_000 + 1);
-    commitOne({ sessionKey: "fresh", runId: "run-1", targetKey: "tg:a" });
-    // The stale session's slot is gone: its next write starts a fresh count.
-    expect(peekTurnSendCount({ sessionKey: "stale", runId: "run-1", targetKey: "tg:a" })).toBe(0);
-  });
-
-  it("expires a capped slot on peek once past the TTL, unblocking a stuck turn", () => {
     const key = { sessionKey: "s1", runId: "run-1", targetKey: "tg:a" };
-    // `now` is injected so the test needs no timers and stays deterministic.
-    expect(commitOne(key, {}, 0)).toBe(1);
-    expect(commitOne(key, {}, 0)).toBe(2);
-    expect(peekTurnSendCount(key, 0)).toBe(2);
-    // Past the TTL the capped slot would otherwise keep returning 2 and block forever,
-    // since the cap check reserves before commit (the only other pruner) can reset it.
-    expect(peekTurnSendCount(key, TURN_SEND_LEDGER_TTL_MS + 1)).toBe(0);
-    // A commit after expiry restarts the turn's budget with the same runId.
-    expect(commitOne(key, {}, TURN_SEND_LEDGER_TTL_MS + 2)).toBe(1);
+    expect(commitOne(key, { maxPerTurn: 1, operationId: "op-1" })).toBe(1);
+    // Idle beyond the old TTL, then a genuinely new send to the same target this run.
+    vi.setSystemTime(OLD_TTL_MS + 1);
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-2" }).status).toBe("exhausted");
+    expect(peekTurnSendCount(key)).toBe(1);
   });
 
   it("builds the canonical channel/account/target key shared by both send tools", () => {
@@ -308,66 +306,98 @@ describe("turn-send-ledger operation identity", () => {
     expect(reserveTurnSend(runA, { operationId: "op-a" }).status).toBe("replay");
   });
 
-  it("forgets seen operations once the slot expires past the TTL", () => {
-    expect(commitOne(key, { operationId: "op-1" }, 0)).toBe(1);
-    // Past the TTL the slot is treated as gone, so the id reads as unseen: the reserve
-    // is fresh, not a replay, and the next commit restarts the turn's budget.
-    expect(reserveTurnSend(key, { operationId: "op-1" }, TURN_SEND_LEDGER_TTL_MS + 1).status).toBe(
-      "reserved",
-    );
-    expect(commitOne(key, { operationId: "op-1" }, TURN_SEND_LEDGER_TTL_MS + 2)).toBe(1);
+  it("keeps a committed operationId a replay across a long idle wait in one run", () => {
+    // Regression (#119992): seenOperations survives the whole run, not a rolling idle
+    // window. After idling far past the old TTL, the SAME operationId is still an
+    // idempotent replay (count unchanged) and a DISTINCT operation still counts forward —
+    // pre-fix the slot expired and the id read as unseen, restarting the budget.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    expect(commitOne(key, { operationId: "op-1" })).toBe(1);
+    vi.setSystemTime(OLD_TTL_MS + 1);
+    expect(reserveTurnSend(key, { operationId: "op-1" }).status).toBe("replay");
+    expect(peekTurnSendCount(key)).toBe(1);
+    expect(commitOne(key, { operationId: "op-2" })).toBe(2);
   });
 });
 
 describe("turn-send-ledger capacity cap", () => {
-  // Distinct (session, run) slots that never expire at now=0, so eviction is
-  // driven purely by the LRU capacity bound rather than the TTL.
+  // Distinct (session, run) slots, so eviction is driven purely by the LRU capacity
+  // bound (the sole memory bound now the idle TTL is gone).
   const slot = (i: number) => ({ sessionKey: "s1", runId: `run-${i}`, targetKey: "tg:a" });
 
   it("evicts the oldest-touched slot once past MAX_TURN_SEND_SLOTS", () => {
     for (let i = 0; i < MAX_TURN_SEND_SLOTS; i++) {
-      expect(commitOne(slot(i), {}, 0)).toBe(1);
+      expect(commitOne(slot(i), {})).toBe(1);
     }
     // Every slot survives while the map sits at the cap.
-    expect(peekTurnSendCount(slot(0), 0)).toBe(1);
-    expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS - 1), 0)).toBe(1);
+    expect(peekTurnSendCount(slot(0))).toBe(1);
+    expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS - 1))).toBe(1);
     // The next distinct slot crosses the cap and evicts the oldest (run-0).
-    expect(commitOne(slot(MAX_TURN_SEND_SLOTS), {}, 0)).toBe(1);
-    expect(peekTurnSendCount(slot(0), 0)).toBe(0);
+    expect(commitOne(slot(MAX_TURN_SEND_SLOTS), {})).toBe(1);
+    expect(peekTurnSendCount(slot(0))).toBe(0);
     // The second-oldest and the newest slot remain.
-    expect(peekTurnSendCount(slot(1), 0)).toBe(1);
-    expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS), 0)).toBe(1);
+    expect(peekTurnSendCount(slot(1))).toBe(1);
+    expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS))).toBe(1);
   });
 
   it("treats a re-touched slot as most-recently-used, sparing it from eviction", () => {
     for (let i = 0; i < MAX_TURN_SEND_SLOTS; i++) {
-      commitOne(slot(i), {}, 0);
+      commitOne(slot(i), {});
     }
     // Re-committing the oldest slot moves it to the tail; run-1 becomes the oldest.
-    expect(commitOne(slot(0), {}, 0)).toBe(2);
-    commitOne(slot(MAX_TURN_SEND_SLOTS), {}, 0);
-    expect(peekTurnSendCount(slot(0), 0)).toBe(2);
-    expect(peekTurnSendCount(slot(1), 0)).toBe(0);
+    expect(commitOne(slot(0), {})).toBe(2);
+    commitOne(slot(MAX_TURN_SEND_SLOTS), {});
+    expect(peekTurnSendCount(slot(0))).toBe(2);
+    expect(peekTurnSendCount(slot(1))).toBe(0);
+  });
+});
+
+describe("turn-send-ledger run terminal cleanup", () => {
+  it("clears only the exact (session, run) slot and leaves siblings intact", () => {
+    // Cleanup must delete one composite (canonical session, run) slot — never a
+    // concurrent run on the same session, nor the same run on a different session.
+    const agentId = "main";
+    const sessionA = "agent:main:a";
+    const sessionB = "agent:main:b";
+    const ledgerA = buildTurnSendLedgerSessionKey(agentId, sessionA)!;
+    const ledgerB = buildTurnSendLedgerSessionKey(agentId, sessionB)!;
+    const target = "tg:a";
+    const aX = { sessionKey: ledgerA, runId: "run-X", targetKey: target };
+    const aY = { sessionKey: ledgerA, runId: "run-Y", targetKey: target };
+    const bX = { sessionKey: ledgerB, runId: "run-X", targetKey: target };
+    commitOne(aX);
+    commitOne(aY);
+    commitOne(bX);
+
+    // Clear (session A, run X) using the raw agentId + sessionKey the tools were built
+    // with; the cleanup rebuilds the same canonical slot key internally.
+    clearTurnSendLedgerForRun({ agentId, sessionKey: sessionA, runId: "run-X" });
+    expect(peekTurnSendCount(aX)).toBe(0);
+    // Same session, different run — untouched.
+    expect(peekTurnSendCount(aY)).toBe(1);
+    // Different session, same runId — untouched.
+    expect(peekTurnSendCount(bX)).toBe(1);
   });
 
-  it("keeps TTL expiry and overlapping-run isolation intact under the cap", () => {
-    const session = "agent:main:main";
-    const runA = { sessionKey: session, runId: "run-A", targetKey: "tg:a" };
-    const runB = { sessionKey: session, runId: "run-B", targetKey: "tg:a" };
-    // Interleaved runs on one session keep distinct composite keys, so the LRU
-    // store must not collapse them into one slot.
-    expect(commitOne(runA, {}, 0)).toBe(1);
-    expect(commitOne(runB, {}, 0)).toBe(1);
-    expect(commitOne(runA, {}, 0)).toBe(2);
-    expect(peekTurnSendCount(runA, 0)).toBe(2);
-    expect(peekTurnSendCount(runB, 0)).toBe(1);
-    // A write past the TTL still prunes the idle slots before storing the new one.
-    commitOne(
-      { sessionKey: "s2", runId: "fresh", targetKey: "tg:a" },
-      {},
-      TURN_SEND_LEDGER_TTL_MS + 1,
-    );
-    expect(peekTurnSendCount(runA, TURN_SEND_LEDGER_TTL_MS + 1)).toBe(0);
-    expect(peekTurnSendCount(runB, TURN_SEND_LEDGER_TTL_MS + 1)).toBe(0);
+  it("is a harmless no-op for a missing slot or an unresolvable scope", () => {
+    const agentId = "main";
+    const session = "agent:main:a";
+    const ledger = buildTurnSendLedgerSessionKey(agentId, session)!;
+    const key = { sessionKey: ledger, runId: "run-X", targetKey: "tg:a" };
+    commitOne(key);
+    // Clearing an absent run, then re-clearing an already-cleared run, must not throw and
+    // must not disturb the live slot / already-cleared slot.
+    expect(() =>
+      clearTurnSendLedgerForRun({ agentId, sessionKey: session, runId: "run-absent" }),
+    ).not.toThrow();
+    expect(peekTurnSendCount(key)).toBe(1);
+    clearTurnSendLedgerForRun({ agentId, sessionKey: session, runId: "run-X" });
+    expect(() =>
+      clearTurnSendLedgerForRun({ agentId, sessionKey: session, runId: "run-X" }),
+    ).not.toThrow();
+    expect(peekTurnSendCount(key)).toBe(0);
+    // A missing agent id yields no ledger scope, so cleanup is inert (no throw).
+    expect(() => clearTurnSendLedgerForRun({ sessionKey: session, runId: "run-X" })).not.toThrow();
   });
 });
