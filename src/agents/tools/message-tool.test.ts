@@ -37,6 +37,7 @@ import {
   wrapToolWithBeforeToolCallHook,
 } from "../agent-tools.before-tool-call.js";
 import { readEmbeddedMessageDeliveryFact } from "../embedded-agent-message-delivery.js";
+import { wrapStreamFnTrimToolCallNames } from "../embedded-agent-runner/run/attempt-tool-call-stream-normalization.js";
 import { createOpenClawTools } from "../openclaw-tools.js";
 import { withGatewayToolCallerIdentity } from "./gateway-caller-context.js";
 import { createMessageTool } from "./message-tool-execution.js";
@@ -5691,6 +5692,66 @@ describe("per-turn send budget", () => {
       reason: "turn_send_budget_exhausted",
     });
     expect(mocks.runMessageAction).toHaveBeenCalledTimes(2);
+  });
+
+  it("disambiguates a duplicate model-emitted toolCallId into a distinct cap-blocked send, not an idempotent replay", async () => {
+    // #119992 / PR #120491: the ledger admits a genuine idempotent replay past the cap
+    // (same operationId already committed this turn). That admission is re-delivery-safe
+    // only when the delivery owner dedups the key — which a direct-mode channel like
+    // imessage does NOT (the delivery-layer dedup gap is tracked in #125824). This
+    // regression proves the guard the message tool actually relies on so the cap stays
+    // exactly-once on direct channels: the runtime disambiguates a duplicate
+    // model-emitted tool-call id BEFORE the tool sees it, so two same-id sends derive
+    // DIFFERENT idempotency keys and the second is cap-blocked, never admitted as a
+    // replay. It drives the real normalization -> idempotency-key -> cap-block chain that
+    // per-turn-send-budget.e2e.test.ts scenario 6 proves end to end, at a faster unit
+    // layer. It is honestly labeled: this proves the CAP-BLOCK/disambiguation path, NOT
+    // idempotent admission (the adjacent test above covers a genuine same-id replay).
+    const args = { action: "send", channel: "imessage", message: "same reworded answer" };
+
+    // (1) The model emits the SAME `message` tool-call id twice in one response, with
+    // byte-identical arguments (the duplicate-answer scenario #119992 guards). Drive the
+    // real streaming normalization the runtime runs on every response
+    // (wrapStreamFnTrimToolCallNames -> normalizeToolCallIdsInMessage).
+    const callA = { type: "toolCall", name: "message", id: "call_dup", arguments: { ...args } };
+    const callB = { type: "toolCall", name: "message", id: "call_dup", arguments: { ...args } };
+    const finalMessage = { role: "assistant", content: [callA, callB] };
+    const baseFn = vi.fn(() => ({
+      result: async () => finalMessage,
+      [Symbol.asyncIterator]: () => (async function* () {})(),
+    }));
+    const wrappedFn = wrapStreamFnTrimToolCallNames(baseFn as never, new Set(["message"]));
+    const stream = await Promise.resolve(wrappedFn({} as never, {} as never, {} as never));
+    await (stream as { result: () => Promise<unknown> }).result();
+
+    // The duplicate id was rewritten to a fresh unique id, so the two executed tool calls
+    // now carry DISTINCT ids — the disambiguation that makes the replay branch
+    // unreachable from a real model turn.
+    expect(callA.id).toBe("call_dup");
+    expect(callB.id).not.toBe("call_dup");
+    expect(callB.id).not.toBe(callA.id);
+
+    // (2) Execute the message tool with the two disambiguated ids under a cap of 1, using
+    // byte-identical params. Distinct toolCallIds derive distinct idempotency keys
+    // (deriveMessageToolIdempotency keys on the toolCallId), so the second copy is a NEW
+    // send subject to the cap — not a replay.
+    stubSend();
+    const tool = createBudgetTool({ maxPerTurn: 1 });
+    const first = await tool.execute(callA.id, { ...args }, undefined);
+    expect(first.details).not.toMatchObject({ status: "suppressed" });
+    expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
+
+    const second = await tool.execute(callB.id, { ...args }, undefined);
+    // Cap-blocked before dispatch — NOT admitted as a replay: exactly one delivery on the
+    // direct channel. Had the duplicate id NOT been disambiguated (both executed as
+    // "call_dup"), the second would derive the SAME idempotency key, be admitted as an
+    // idempotent replay, and reach the runner a second time (the re-delivery this guard
+    // prevents on a direct channel — see the "admits an idempotent replay" test above).
+    expect(second.details).toMatchObject({
+      status: "suppressed",
+      reason: "turn_send_budget_exhausted",
+    });
+    expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
   });
 
   it("exempts media actions from the hard cap while still counting them", async () => {
