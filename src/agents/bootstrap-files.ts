@@ -290,7 +290,9 @@ async function resolveIneligibleAutomaticMemoryFiles(params: {
   );
 }
 
-/** Shared parameters for the bootstrap-file resolvers. */
+/** Shared parameters for the bootstrap-file resolvers. Kept internal so the
+ * public `resolveBootstrapFilesForRun` SDK signature stays callback-free while
+ * the timing-aware variant extends it with the substage-timing callback. */
 type BootstrapFileResolutionParams = {
   workspaceDir: string;
   config?: OpenClawConfig;
@@ -312,6 +314,20 @@ type BootstrapFileResolutionTimingParams = BootstrapFileResolutionParams & {
   ) => void;
 };
 
+/** Prepare the same bounded workspace facts without invoking run-owned bootstrap hooks. */
+export async function resolveBootstrapFilesForPreparation(
+  params: BootstrapFileResolutionParams,
+): Promise<WorkspaceBootstrapFile[]> {
+  return resolveBootstrapFiles({ ...params, readOnlyState: true }, false);
+}
+
+/** Resolves hook-adjusted, session-filtered bootstrap files for a run. */
+export async function resolveBootstrapFilesForRun(
+  params: BootstrapFileResolutionParams,
+): Promise<WorkspaceBootstrapFile[]> {
+  return resolveBootstrapFilesForRunWithTiming(params);
+}
+
 /**
  * Timing-aware variant used only by the embedded runner to record bootstrap
  * substage durations. Kept off the plugin SDK surface (not re-exported by
@@ -320,19 +336,6 @@ type BootstrapFileResolutionTimingParams = BootstrapFileResolutionParams & {
  */
 export async function resolveBootstrapFilesForRunWithTiming(
   params: BootstrapFileResolutionTimingParams,
-): Promise<WorkspaceBootstrapFile[]> {
-  return resolveBootstrapFiles(params, true);
-}
-
-/** Prepare the same bounded workspace facts without invoking run-owned bootstrap hooks. */
-export async function resolveBootstrapFilesForPreparation(
-  params: BootstrapFileResolutionParams,
-): Promise<WorkspaceBootstrapFile[]> {
-  return resolveBootstrapFiles({ ...params, readOnlyState: true }, false);
-}
-
-export async function resolveBootstrapFilesForRun(
-  params: BootstrapFileResolutionParams,
 ): Promise<WorkspaceBootstrapFile[]> {
   return resolveBootstrapFiles(params, true);
 }
