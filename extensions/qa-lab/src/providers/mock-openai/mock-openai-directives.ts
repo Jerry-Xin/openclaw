@@ -277,7 +277,8 @@ export function extractPerTurnSendBudgetDirective(text: string): {
   if (!Number.isFinite(count) || count < 1) {
     return null;
   }
-  const tool = match[1] as "message" | "conversations_send";
+  // Capture group 1 is the alternation `(message|conversations_send)`; narrow by comparison instead of an unsound cast.
+  const tool = match[1] === "conversations_send" ? "conversations_send" : "message";
   // conversations_send cannot be planned without a concrete conversationRef to target.
   if (tool === "conversations_send" && !match[4]) {
     return null;
