@@ -116,6 +116,9 @@ export function isClaudeCliBackend(provider: string): boolean {
 //     terminal and never clears between that run's candidates.
 // Undefined therefore means "an outer owner will clear" (dispatch) or "no send tool
 // ran" (isolated completion, compaction), so settlement defers in both.
+// `threw` is settlement's real exceptional exit, not merely a failed run(): a post-run
+// settlement throw (e.g. auth-profile settlement) is a non-terminal exit for a
+// non-final candidate and must defer, exactly like a non-final run failure.
 function shouldClearTurnSendLedgerAtCliTerminal(
   context: PreparedCliRunContext,
   threw: boolean,
@@ -196,6 +199,11 @@ export async function settlePreparedCliRun(params: {
   const runParams = context.params;
   let result: EmbeddedAgentRunResult | undefined;
   let runError: unknown;
+  // Tracks whether settlement reached its normal return. `runError` only records a
+  // failed run(); an exception raised by post-run settlement (e.g. auth-profile
+  // settlement) leaves it undefined even though we exit exceptionally, so the
+  // finally must gate on real control flow, not on `runError`.
+  let completedNormally = false;
   try {
     result = await run();
   } catch (error) {
@@ -275,15 +283,19 @@ export async function settlePreparedCliRun(params: {
     if (runError) {
       throw runError instanceof Error ? runError : new Error(formatErrorMessage(runError));
     }
+    completedNormally = true;
     return result as EmbeddedAgentRunResult;
   } finally {
     // Delete the exact per-turn send slot at the logical-run terminal so a reused
     // runId (isolated cron reuses its durable session id) starts the next turn with
     // a fresh budget. Gated to the true terminal so fallback candidates that hand
-    // off to the next attempt keep the turn's committed counts intact.
+    // off to the next attempt keep the turn's committed counts intact. `threw` is the
+    // real exceptional exit (`!completedNormally`), so a post-run settlement failure
+    // on a non-final candidate defers like a non-final run failure instead of wiping
+    // the turn's counts mid-chain.
     if (
       context.turnSendLedgerScope &&
-      shouldClearTurnSendLedgerAtCliTerminal(context, runError !== undefined)
+      shouldClearTurnSendLedgerAtCliTerminal(context, !completedNormally)
     ) {
       clearTurnSendLedgerForRun(context.turnSendLedgerScope);
     }
