@@ -678,7 +678,7 @@ describe("resolveBootstrapFilesForRun", () => {
     await fs.writeFile(path.join(workspaceDir, DEFAULT_USER_FILENAME), "trusted user", "utf8");
     memoryRuntimeMocks.classifyWorkspacePaths.mockImplementation(
       () =>
-        new Promise((resolve) =>
+        new Promise((resolve) => {
           setTimeout(
             () =>
               resolve({
@@ -689,8 +689,8 @@ describe("resolveBootstrapFilesForRun", () => {
                 ],
               }),
             40,
-          ),
-        ),
+          );
+        }),
     );
 
     const substages: Array<{ name: string; durationMs: number }> = [];
