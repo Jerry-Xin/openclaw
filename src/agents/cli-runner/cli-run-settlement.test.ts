@@ -1,6 +1,7 @@
 /** Tests native CLI continuity projection and bounded transcript-flush probing. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions.js";
+import type { AuthProfileStore } from "../auth-profiles.js";
 import {
   isCliBindingFlushed,
   restoreCliRunnerTestDeps,
@@ -226,6 +227,8 @@ describe("settlePreparedCliRun per-turn send ledger terminal cleanup", () => {
     runId: string;
     isFinalFallbackAttempt?: boolean | "omit";
     withScope?: boolean;
+    effectiveAuthProfileId?: string;
+    authProfileStore?: AuthProfileStore;
   }): PreparedCliRunContext {
     const scope = { agentId, sessionKey: grantSessionKey, runId: params.runId };
     // Cron forwards isFinalFallbackAttempt to every CLI candidate, so it defaults to a
@@ -233,8 +236,9 @@ describe("settlePreparedCliRun per-turn send ledger terminal cleanup", () => {
     // (run-entry.ts owns that terminal) or a tool-less direct run.
     const finalFallback = params.isFinalFallbackAttempt ?? true;
     // SAFETY: settlePreparedCliRun reads only params.{cleanup*, sessionId, provider,
-    // runId, isFinalFallbackAttempt} and turnSendLedgerScope on the no-auth-profile,
-    // no-cleanup path exercised here; the rest of the prepared context is unused.
+    // runId, isFinalFallbackAttempt}, turnSendLedgerScope, and — when the auth-profile
+    // settlement path is exercised — context.{effectiveAuthProfileId, authProfileStore,
+    // agentDir, modelId}; the rest of the prepared context is unused.
     return {
       params: {
         cleanupCliLiveSessionOnRunEnd: false,
@@ -246,6 +250,10 @@ describe("settlePreparedCliRun per-turn send ledger terminal cleanup", () => {
       },
       started: 0,
       modelId: "opus",
+      ...(params.effectiveAuthProfileId
+        ? { effectiveAuthProfileId: params.effectiveAuthProfileId }
+        : {}),
+      ...(params.authProfileStore ? { authProfileStore: params.authProfileStore } : {}),
       ...(params.withScope === false ? {} : { turnSendLedgerScope: scope }),
     } as unknown as PreparedCliRunContext;
   }
@@ -313,6 +321,66 @@ describe("settlePreparedCliRun per-turn send ledger terminal cleanup", () => {
     ).rejects.toBe(failure);
 
     expect(peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey })).toBe(1);
+  });
+
+  // A run success drives the auth-profile settlement branch, which is not wrapped in
+  // the cleanup try/catch: if it throws, settlement exits exceptionally even though
+  // the run itself succeeded (runError stays undefined). Terminal cleanup must gate on
+  // that real exceptional exit, not on runError.
+  const successResult = {
+    payloads: [],
+    meta: { executionTrace: { attempts: [{ result: "success" }] } },
+  } as unknown as EmbeddedAgentRunResult;
+
+  function throwingAuthProfileStore(): AuthProfileStore {
+    return {
+      get profiles(): Record<string, unknown> {
+        throw new Error("auth-profile settlement failed");
+      },
+    } as unknown as AuthProfileStore;
+  }
+
+  it("does NOT clear when a non-final candidate succeeds but auth-profile settlement throws", async () => {
+    // The run succeeded (runError === undefined) yet settlement exits exceptionally.
+    // A pre-fix gate of `runError !== undefined` would read threw === false and wipe
+    // this non-final candidate's committed counts mid-chain.
+    const runId = "run-settle-throw-nonfinal";
+    commitSend(runId);
+
+    await expect(
+      settlePreparedCliRun({
+        context: makeContext({
+          runId,
+          isFinalFallbackAttempt: false,
+          effectiveAuthProfileId: "profile-1",
+          authProfileStore: throwingAuthProfileStore(),
+        }),
+        run: async () => successResult,
+      }),
+    ).rejects.toThrow("auth-profile settlement failed");
+
+    expect(peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey })).toBe(1);
+  });
+
+  it("clears when a final candidate succeeds but auth-profile settlement throws", async () => {
+    // Same exceptional exit, but this is the chain's terminal (isFinalFallbackAttempt
+    // === true), so the slot is released for the reused runId's next turn.
+    const runId = "run-settle-throw-final";
+    commitSend(runId);
+
+    await expect(
+      settlePreparedCliRun({
+        context: makeContext({
+          runId,
+          isFinalFallbackAttempt: true,
+          effectiveAuthProfileId: "profile-1",
+          authProfileStore: throwingAuthProfileStore(),
+        }),
+        run: async () => successResult,
+      }),
+    ).rejects.toThrow("auth-profile settlement failed");
+
+    expect(peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey })).toBe(0);
   });
 
   it("defers cleanup for a dispatched candidate whose outer runner owns the terminal", async () => {
