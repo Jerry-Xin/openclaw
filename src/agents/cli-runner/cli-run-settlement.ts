@@ -21,6 +21,7 @@ import { resolveAuthProfileFailureReason } from "../embedded-agent-runner/run/au
 import { buildEmbeddedRunPayloads } from "../embedded-agent-runner/run/payloads.js";
 import { mergeAttemptToolMediaPayloads } from "../embedded-agent-runner/run/tool-media-payloads.js";
 import { coerceToFailoverError, isFailoverError } from "../failover-error.js";
+import { clearTurnSendLedgerForRun } from "../tools/turn-send-ledger.js";
 import { CliAuthProfilePreparationError } from "./auth-profile-preparation-error.js";
 import { hashCliReseedPrompt } from "./reseed-envelope.js";
 import type { ClaudeCliRunDiagnosticLifecycle } from "./run-diagnostics.js";
@@ -100,6 +101,32 @@ export function isClaudeCliBackend(provider: string): boolean {
   return provider.trim().toLowerCase() === "claude-cli";
 }
 
+// The per-turn send budget spans the whole logical turn, including provider
+// fallbacks that reuse the runId (turn-send-ledger.ts). A prepared CLI run is one
+// fallback candidate, so settlement may delete the slot only at the turn's true
+// terminal:
+//   - A direct CLI owner (cron) drives its own runWithModelFallback and forwards
+//     isFinalFallbackAttempt to every candidate. Clear on a success (the chain stops
+//     on the first success) or the final attempt's failure; a non-final failure hands
+//     off to the next candidate, which must inherit the committed counts.
+//   - A CLI candidate dispatched inside an embedded/command-rpc run does NOT forward
+//     isFinalFallbackAttempt (it is undefined). Its logical terminal is owned by the
+//     embedded runner's fallback-chain finally (run-entry.ts), which clears the same
+//     slot after the whole chain. Deferring here keeps exactly one cleanup owner per
+//     terminal and never clears between that run's candidates.
+// Undefined therefore means "an outer owner will clear" (dispatch) or "no send tool
+// ran" (isolated completion, compaction), so settlement defers in both.
+function shouldClearTurnSendLedgerAtCliTerminal(
+  context: PreparedCliRunContext,
+  threw: boolean,
+): boolean {
+  const { isFinalFallbackAttempt } = context.params;
+  if (isFinalFallbackAttempt === undefined) {
+    return false;
+  }
+  return !threw || isFinalFallbackAttempt === true;
+}
+
 export async function assertCliRuntimeBinding(context: PreparedCliRunContext): Promise<void> {
   if (!context.runtimeArtifactFingerprint) {
     return;
@@ -174,78 +201,93 @@ export async function settlePreparedCliRun(params: {
   } catch (error) {
     runError = error;
   }
-  const terminalRunError = runError;
-  let cleanupError: unknown;
-  const recordCleanupError = (error: unknown) => {
-    cleanupError ??= error;
-  };
-  if (runParams.cleanupCliLiveSessionOnRunEnd === true) {
-    try {
-      const { closeCliLiveSession } = await import("./cli-live-session-registry.js");
-      await closeCliLiveSession(context, "restart");
-    } catch (error) {
-      recordCleanupError(error);
+  try {
+    const terminalRunError = runError;
+    let cleanupError: unknown;
+    const recordCleanupError = (error: unknown) => {
+      cleanupError ??= error;
+    };
+    if (runParams.cleanupCliLiveSessionOnRunEnd === true) {
+      try {
+        const { closeCliLiveSession } = await import("./cli-live-session-registry.js");
+        await closeCliLiveSession(context, "restart");
+      } catch (error) {
+        recordCleanupError(error);
+      }
+    }
+    if (runParams.cleanupBundleMcpOnRunEnd === true) {
+      // The run's session ID is immutable; its session key can already belong to
+      // a newer run. Never retire the newer runtime or close the shared listener.
+      try {
+        const { retireSessionMcpRuntime } = await import("../agent-bundle-mcp-tools.js");
+        await retireSessionMcpRuntime({
+          sessionId: runParams.sessionId,
+          reason: "cli-run-end",
+          onError: recordCleanupError,
+        });
+      } catch (error) {
+        recordCleanupError(error);
+      }
+    }
+    if (cleanupError) {
+      if (runError || result?.didSendViaMessagingTool === true) {
+        log.warn(`cli run cleanup failed after completion: ${formatErrorMessage(cleanupError)}`);
+      } else {
+        diagnosticLifecycle?.setPhase("cleanup");
+        runError =
+          cleanupError instanceof Error
+            ? cleanupError
+            : new Error(formatErrorMessage(cleanupError));
+      }
+    }
+    // Retiring a caller is not a provider failure and must not quarantine its credential.
+    runParams.assertCurrent?.();
+    // Settle only after backend recovery is exhausted. Recording inside an
+    // attempt would quarantine a healthy profile for a recovered session fault.
+    if (context.effectiveAuthProfileId && context.authProfileStore) {
+      const profileId = context.effectiveAuthProfileId;
+      const authProfileStore = context.authProfileStore;
+      if (terminalRunError) {
+        await settleCliAuthProfile({
+          store: authProfileStore,
+          profileId,
+          provider: authProfileStore.profiles[profileId]?.provider ?? runParams.provider,
+          agentDir: context.agentDir,
+          terminal: {
+            outcome: "failure",
+            error: terminalRunError,
+            config: runParams.config,
+            runId: runParams.runId,
+            modelId: context.modelId,
+          },
+        });
+      } else if (result?.meta.executionTrace?.attempts?.at(-1)?.result === "success") {
+        const provider = authProfileStore.profiles[profileId]?.provider ?? runParams.provider;
+        await settleCliAuthProfile({
+          store: authProfileStore,
+          profileId,
+          provider,
+          agentDir: context.agentDir,
+          terminal: { outcome: "success" },
+        });
+      }
+    }
+    if (runError) {
+      throw runError instanceof Error ? runError : new Error(formatErrorMessage(runError));
+    }
+    return result as EmbeddedAgentRunResult;
+  } finally {
+    // Delete the exact per-turn send slot at the logical-run terminal so a reused
+    // runId (isolated cron reuses its durable session id) starts the next turn with
+    // a fresh budget. Gated to the true terminal so fallback candidates that hand
+    // off to the next attempt keep the turn's committed counts intact.
+    if (
+      context.turnSendLedgerScope &&
+      shouldClearTurnSendLedgerAtCliTerminal(context, runError !== undefined)
+    ) {
+      clearTurnSendLedgerForRun(context.turnSendLedgerScope);
     }
   }
-  if (runParams.cleanupBundleMcpOnRunEnd === true) {
-    // The run's session ID is immutable; its session key can already belong to
-    // a newer run. Never retire the newer runtime or close the shared listener.
-    try {
-      const { retireSessionMcpRuntime } = await import("../agent-bundle-mcp-tools.js");
-      await retireSessionMcpRuntime({
-        sessionId: runParams.sessionId,
-        reason: "cli-run-end",
-        onError: recordCleanupError,
-      });
-    } catch (error) {
-      recordCleanupError(error);
-    }
-  }
-  if (cleanupError) {
-    if (runError || result?.didSendViaMessagingTool === true) {
-      log.warn(`cli run cleanup failed after completion: ${formatErrorMessage(cleanupError)}`);
-    } else {
-      diagnosticLifecycle?.setPhase("cleanup");
-      runError =
-        cleanupError instanceof Error ? cleanupError : new Error(formatErrorMessage(cleanupError));
-    }
-  }
-  // Retiring a caller is not a provider failure and must not quarantine its credential.
-  runParams.assertCurrent?.();
-  // Settle only after backend recovery is exhausted. Recording inside an
-  // attempt would quarantine a healthy profile for a recovered session fault.
-  if (context.effectiveAuthProfileId && context.authProfileStore) {
-    const profileId = context.effectiveAuthProfileId;
-    const authProfileStore = context.authProfileStore;
-    if (terminalRunError) {
-      await settleCliAuthProfile({
-        store: authProfileStore,
-        profileId,
-        provider: authProfileStore.profiles[profileId]?.provider ?? runParams.provider,
-        agentDir: context.agentDir,
-        terminal: {
-          outcome: "failure",
-          error: terminalRunError,
-          config: runParams.config,
-          runId: runParams.runId,
-          modelId: context.modelId,
-        },
-      });
-    } else if (result?.meta.executionTrace?.attempts?.at(-1)?.result === "success") {
-      const provider = authProfileStore.profiles[profileId]?.provider ?? runParams.provider;
-      await settleCliAuthProfile({
-        store: authProfileStore,
-        profileId,
-        provider,
-        agentDir: context.agentDir,
-        terminal: { outcome: "success" },
-      });
-    }
-  }
-  if (runError) {
-    throw runError instanceof Error ? runError : new Error(formatErrorMessage(runError));
-  }
-  return result as EmbeddedAgentRunResult;
 }
 
 export function resolveCliSourceReplyMirror(params: {
