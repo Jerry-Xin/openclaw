@@ -2,8 +2,10 @@ import { retireSessionMcpRuntime } from "../../agents/agent-bundle-mcp-tools.js"
 import { withPreparedModelRuntimePluginGenerationScope } from "../../agents/prepared-model-runtime-generation-scope.js";
 import type { PreparedModelRuntimeLease } from "../../agents/prepared-model-runtime.types.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
+import { clearTurnSendLedgerForRun } from "../../agents/tools/turn-send-ledger.js";
 import { cleanupBrowserSessionsForLifecycleEnd } from "../../browser-lifecycle-cleanup.js";
 import type { CliDeps } from "../../cli/outbound-send-deps.js";
+import { canonicalizeMainSessionAlias } from "../../config/sessions/main-session.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   assertAgentRunLifecycleGenerationCurrent,
@@ -341,6 +343,28 @@ export async function runCronIsolatedAgentTurn(params: {
     });
   } finally {
     releasePreparedRuntime();
+    // Guarantee the per-turn send budget is released at the cron logical-run terminal,
+    // even if a candidate deferred its own cleanup (a non-final fallback failure) and the
+    // fallback chain then threw before a later candidate settled. Cron reuses its durable
+    // session id as the runId, so a leaked slot would suppress the next scheduled turn's
+    // genuine send. The key mirrors the loopback grant exactly (resolveCliMcpSessionKey
+    // canonicalizes the main alias); the CLI settlement terminal clears the same slot on
+    // ordinary success/failure, so this is a bounded safety net, not the primary owner.
+    try {
+      clearTurnSendLedgerForRun({
+        agentId: prepared.context.agentId,
+        sessionKey: canonicalizeMainSessionAlias({
+          cfg: prepared.context.cfgWithAgentDefaults,
+          agentId: prepared.context.agentId,
+          sessionKey: prepared.context.runSessionKey?.trim() || "main",
+        }),
+        runId: initialSessionId,
+      });
+    } catch (ledgerError) {
+      logWarn(
+        `[cron:${params.job.id}] Failed to clear per-turn send ledger during cleanup: ${String(ledgerError)}`,
+      );
+    }
     try {
       await prepared.context.runContinuationSession?.seal();
     } catch (sealError) {
