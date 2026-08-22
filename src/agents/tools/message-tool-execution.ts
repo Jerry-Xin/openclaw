@@ -566,53 +566,17 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           nextOperationId: () => String(++generatedIdempotencyCounter),
         });
 
-      // Optional hard cap (opt-in, default off): reserve a slot before dispatch so a
-      // concurrent same-target send cannot slip past the cap while this one is in
-      // flight, then settle the reservation once delivery lands (commit) or does not
-      // (release). Media (sendAttachment/upload-file) passes maxPerTurn=undefined so it
-      // is never blocked — legitimately split attachments must not be truncated — while
-      // still counting toward the nudge; broadcast fan-out never builds a budgetContext.
-      // A replay already committed in the shared ledger this turn is admitted past the
-      // cap (`replay`) and left unsettled so a receipt the model already earned is not
-      // suppressed or double-counted. Cross-tool budget unification (message <->
-      // conversations_send at one recipient) is via the shared ledger slot key.
-      // Admitting the replay is re-delivery-safe only on Gateway-routed sends, where the
-      // repeated idempotency key resolves to the completed operation without
-      // re-delivering. A direct-mode (in-process) channel does not dedup on the
-      // idempotency key, so an admitted replay there WOULD be re-delivered; that path
-      // stays exactly-once only because a duplicate model-emitted send is disambiguated
-      // upstream into distinct tool-call ids and cap-blocked, never admitted as a replay.
-      const isMediaSendAction = action === "sendAttachment" || action === "upload-file";
-      const effectiveMessageTools = budgetContext
-        ? resolveEffectiveMessageToolsConfig({ cfg: rawConfig, agentId: resolvedAgentId })
-        : undefined;
-      const maxPerTurn = isMediaSendAction
-        ? undefined
-        : effectiveMessageTools?.maxMessagesPerTurnPerTarget;
-      const reservation = budgetContext
-        ? reserveTurnSend(budgetContext, {
-            maxPerTurn,
-            ...(actionIdempotencyKey ? { operationId: actionIdempotencyKey } : {}),
-          })
-        : undefined;
-      if (reservation?.status === "exhausted") {
-        return jsonResult({
-          status: "suppressed",
-          reason: "turn_send_budget_exhausted",
-          message: `Blocked: already sent ${maxPerTurn} message(s) to this target this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
-        });
-      }
-
+      // Resolve the delivery route BEFORE reserving, because whether a repeated send is
+      // re-delivery-safe depends on which delivery branch runMessageAction will take.
+      // Direct tool invocations already execute inside the authenticated Gateway request,
+      // so keep their authority operation-local by dispatching channel actions in-process
+      // (gateway === undefined) instead of laundering it through a new backend connection.
       const gatewayResolved = resolveGatewayOptions(gatewayOpts);
       const { token: gatewayToken } = gatewayResolved;
       const callerOwnsTerminalReceipt =
         gatewayResolved.target === "remote" ||
         normalizeOptionalString(gatewayOpts.gatewayUrl) !== undefined ||
         normalizeOptionalString(gatewayOpts.gatewayToken) !== undefined;
-      // Direct tool invocations already execute inside the authenticated
-      // Gateway request. Keep their authority operation-local by dispatching
-      // channel actions in-process instead of laundering it through a new
-      // backend connection.
       const gateway: MessageActionGateway | undefined =
         options?.conversationReadOrigin === "direct-operator"
           ? undefined
@@ -639,6 +603,62 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
                   callerOwnsTerminalReceipt,
                 }),
             };
+
+      // Optional hard cap (opt-in, default off): reserve a slot before dispatch so a
+      // concurrent same-target send cannot slip past the cap while this one is in
+      // flight, then settle the reservation once delivery lands (commit) or does not
+      // (release). Media (sendAttachment/upload-file) passes maxPerTurn=undefined so it
+      // is never blocked — legitimately split attachments must not be truncated — while
+      // still counting toward the nudge; broadcast fan-out never builds a budgetContext.
+      // Cross-tool budget unification (message <-> conversations_send at one recipient)
+      // is via the shared ledger slot key.
+      //
+      // Replay admission is route-aware. A committed operationId is handed to the ledger
+      // ONLY when delivery actually relays through the Gateway backend, which resolves a
+      // repeated idempotency key to the already-completed operation and returns it without
+      // sending again. There the replay is admitted past the cap (`replay`) and left
+      // unsettled, so a receipt the model already earned is neither suppressed nor
+      // double-counted. A direct in-process send (message.ts sendDurableMessageBatchCore)
+      // does NOT dedup on the idempotency key, so a repeat there is a genuine second
+      // delivery; the operationId is withheld and the repeat is treated as an ordinary new
+      // send — cap-blocked when a cap is set, honestly counted when it is not. The route is
+      // read from the same gateway-vs-direct branch delivery itself selects (a live gateway
+      // connection plus the channel's gateway execution/delivery mode), never from the
+      // caller-supplied receipt owner or gateway target alone, which do not prove which
+      // delivery branch runs.
+      const isMediaSendAction = action === "sendAttachment" || action === "upload-file";
+      const effectiveMessageTools = budgetContext
+        ? resolveEffectiveMessageToolsConfig({ cfg: rawConfig, agentId: resolvedAgentId })
+        : undefined;
+      const maxPerTurn = isMediaSendAction
+        ? undefined
+        : effectiveMessageTools?.maxMessagesPerTurnPerTarget;
+      const budgetDeliveryChannel = normalizeMessageChannel(
+        scope.channel ?? effectiveCurrentChannel.currentChannelProvider,
+      );
+      const budgetChannelPlugin =
+        budgetContext && budgetDeliveryChannel
+          ? getChannelPlugin(budgetDeliveryChannel)
+          : undefined;
+      const routeDedupsCompletedOperation =
+        gateway !== undefined &&
+        (budgetChannelPlugin?.actions?.resolveExecutionMode?.({ action }) === "gateway" ||
+          budgetChannelPlugin?.outbound?.deliveryMode === "gateway");
+      const reservation = budgetContext
+        ? reserveTurnSend(budgetContext, {
+            maxPerTurn,
+            ...(actionIdempotencyKey && routeDedupsCompletedOperation
+              ? { operationId: actionIdempotencyKey }
+              : {}),
+          })
+        : undefined;
+      if (reservation?.status === "exhausted") {
+        return jsonResult({
+          status: "suppressed",
+          reason: "turn_send_budget_exhausted",
+          message: `Blocked: already sent ${maxPerTurn} message(s) to this target this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
+        });
+      }
       const hasCurrentMessageId =
         typeof options?.currentMessageId === "number" ||
         (typeof options?.currentMessageId === "string" &&

@@ -42,7 +42,12 @@ import { createOpenClawTools } from "../openclaw-tools.js";
 import { withGatewayToolCallerIdentity } from "./gateway-caller-context.js";
 import { createMessageTool } from "./message-tool-execution.js";
 import { runSessionsSendA2AFlow } from "./sessions-send-tool.a2a.js";
-import { resetTurnSendLedgerForTest } from "./turn-send-ledger.js";
+import {
+  buildTurnSendLedgerSessionKey,
+  buildTurnSendTargetKey,
+  peekTurnSendCount,
+  resetTurnSendLedgerForTest,
+} from "./turn-send-ledger.js";
 
 type CreateMessageTool = typeof createMessageTool;
 
@@ -5413,6 +5418,62 @@ describe("per-turn send budget", () => {
     );
   }
 
+  // A real direct-mode iMessage outbound adapter that records every delivered text. Used
+  // by the direct-route replay test so the REAL runMessageAction -> sendMessage path drives
+  // the adapter and its call count is the authoritative "delivered exactly once" proof.
+  function registerImessageDirectDeliveryPlugin(deliveries: string[]) {
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "imessage",
+          source: "test",
+          plugin: createChannelPlugin({
+            id: "imessage",
+            label: "iMessage",
+            docsPath: "/channels/imessage",
+            blurb: "iMessage test plugin",
+            actions: ["send", "sendAttachment"],
+            config: { listAccountIds: () => ["primary"] },
+            outbound: {
+              deliveryMode: "direct",
+              sendText: async (ctx) => {
+                deliveries.push(ctx.text);
+                return {
+                  channel: "imessage" as ChannelPlugin["id"],
+                  messageId: `m${deliveries.length}`,
+                };
+              },
+            },
+          }),
+        },
+      ]),
+    );
+  }
+
+  // A gateway-mode iMessage plugin. Route detection reads outbound.deliveryMode, so this
+  // makes the message tool treat the send as genuinely Gateway-routed (repeat idempotency
+  // keys are deduped to the completed operation by the backend). Its send methods are never
+  // called: the gateway-route replay test keeps the runner mocked to model that dedup.
+  function registerImessageGatewayDeliveryPlugin() {
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "imessage",
+          source: "test",
+          plugin: createChannelPlugin({
+            id: "imessage",
+            label: "iMessage",
+            docsPath: "/channels/imessage",
+            blurb: "iMessage test plugin",
+            actions: ["send", "sendAttachment"],
+            config: { listAccountIds: () => ["primary"] },
+            outbound: { deliveryMode: "gateway" },
+          }),
+        },
+      ]),
+    );
+  }
+
   function createBudgetTool(params?: {
     sessionKey?: string;
     runId?: string;
@@ -5660,53 +5721,133 @@ describe("per-turn send budget", () => {
     expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
   });
 
-  it("admits an idempotent replay of a capped send without blocking or double-counting", async () => {
-    stubSend();
-    const tool = createBudgetTool({ maxPerTurn: 1 });
+  it("suppresses an idempotent replay on a direct route and delivers exactly once (real delivery path)", async () => {
+    // Route-aware admission (PR #120491 / #119992). On a direct in-process channel the
+    // delivery layer does NOT dedup on the idempotency key, so a repeated send is a genuine
+    // second delivery. The tool therefore WITHHOLDS the operationId from the ledger on a
+    // direct route, so under maxMessagesPerTurnPerTarget:1 an identical replay is treated as
+    // an ordinary new send and cap-blocked before dispatch. This drives the REAL
+    // runMessageAction -> sendMessage -> outbound adapter path (no mocked runner), so the
+    // recording adapter's own call count is the authoritative "delivered exactly once" proof
+    // — the very re-delivery the previous mock-runner version wrongly assumed away.
+    const deliveries: string[] = [];
+    registerImessageDirectDeliveryPlugin(deliveries);
+    mocks.runMessageAction.mockReset();
+    mocks.runMessageAction.mockImplementation(actualRunMessageAction as never);
+    const tool = createMessageTool({
+      currentChannelProvider: "imessage",
+      currentChannelId: currentChat,
+      agentId: "test",
+      agentAccountId: "primary",
+      agentSessionKey: "agent:test:imessage:direct:real-direct-replay",
+      runId: "run-real-direct",
+      config: {
+        channels: { imessage: { enabled: true } },
+        tools: { message: { maxMessagesPerTurnPerTarget: 1 } },
+      } as never,
+      runMessageAction: mocks.runMessageAction as never,
+    });
+    const args = {
+      action: "send",
+      channel: "imessage",
+      target: "+15550009999",
+      message: "same answer",
+    };
 
-    // (a) The first send is admitted, reaches the runner, and is counted (count 1).
-    const first = await send(tool, "only");
+    // First send: admitted, real direct delivery, adapter records one message.
+    const first = await tool.execute("call-real-direct", { ...args }, undefined);
+    expect(first.details).not.toMatchObject({ status: "suppressed" });
+    expect(deliveries).toEqual(["same answer"]);
+
+    // Replay (same toolCallId + identical params -> same autogenerated idempotency key):
+    // cap-blocked before dispatch because the direct route withholds the operationId.
+    const replay = await tool.execute("call-real-direct", { ...args }, undefined);
+    expect(replay.details).toMatchObject({
+      status: "suppressed",
+      reason: "turn_send_budget_exhausted",
+    });
+    // No re-delivery: the direct adapter received the message exactly once.
+    expect(deliveries).toEqual(["same answer"]);
+  });
+
+  it("admits an idempotent replay on a Gateway-routed channel without re-delivering or double-counting", async () => {
+    // The gateway-route counterpart to the direct-route test above. On a genuinely
+    // Gateway-routed channel (outbound.deliveryMode "gateway") the backend resolves a
+    // repeated idempotency key to the already-completed operation and returns it without
+    // sending again, so the tool DOES hand the operationId to the ledger: under
+    // maxMessagesPerTurnPerTarget:1 an identical replay is admitted past the cap (`replay`),
+    // reaches the runner, draws no false nudge, and does not double-count. The mocked runner
+    // models the backend's key-based dedup (one physical delivery per distinct idempotency
+    // key); the real Gateway dedup is proven end to end by per-turn-send-budget.e2e.test.ts
+    // scenario 4.
+    registerImessageGatewayDeliveryPlugin();
+    const deliveredKeys = new Set<string>();
+    mocks.runMessageAction.mockReset();
+    mocks.runMessageAction.mockImplementation(async (input: RunMessageActionInput) => {
+      deliveredKeys.add(String(input.params?.idempotencyKey));
+      return {
+        kind: "send",
+        action: "send",
+        channel: "imessage",
+        to: currentChat,
+        handledBy: "plugin",
+        payload: {},
+        dryRun: false,
+      } as MessageActionResult;
+    });
+    const sessionKey = "agent:test:imessage:direct:gw-replay";
+    const runId = "run-gw-replay";
+    const tool = createMessageTool({
+      currentChannelProvider: "imessage",
+      currentChannelId: currentChat,
+      agentId: "test",
+      agentAccountId: "primary",
+      agentSessionKey: sessionKey,
+      runId,
+      sourceReplyDeliveryMode: "message_tool_only",
+      runMessageAction: mocks.runMessageAction as never,
+      config: { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } } as never,
+    });
+    const args = { action: "send", channel: "imessage", message: "only" };
+
+    // First send: admitted, one delivery, counted (count 1).
+    const first = await tool.execute("call-gw-replay", { ...args }, undefined);
     expect(first.details).not.toMatchObject({ status: "suppressed" });
     expect(softNotice(first)).toBeUndefined();
     expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
 
-    // (b) A replay of the SAME tool call (same toolCallId + identical params, so the
-    // autogenerated idempotency key matches) must NOT be blocked by the cap. The
-    // Gateway dedups the repeated key to the completed "sent" receipt, so the replay
-    // has to reach delivery; it must draw no false nudge and must not double-count.
-    const replay = await send(tool, "only");
+    // Replay (same toolCallId + identical params): admitted past the cap and reaches the
+    // runner a second time, but the backend dedups the repeated key, so exactly one physical
+    // delivery lands and no false nudge fires.
+    const replay = await tool.execute("call-gw-replay", { ...args }, undefined);
     expect(replay.details).not.toMatchObject({
       status: "suppressed",
       reason: "turn_send_budget_exhausted",
     });
     expect(softNotice(replay)).toBeUndefined();
-    // Reaching the runner a second time proves the replay was admitted past the cap;
-    // a blocked send returns before dispatch and never calls the runner.
     expect(mocks.runMessageAction).toHaveBeenCalledTimes(2);
+    expect(deliveredKeys.size).toBe(1);
 
-    // (c) A genuinely different send to the same target is still blocked by the cap,
-    // proving admitting the replay did not disable the budget (count stayed at 1).
-    const distinct = await send(tool, "different");
-    expect(distinct.details).toMatchObject({
-      status: "suppressed",
-      reason: "turn_send_budget_exhausted",
+    // No double count: the ledger still records exactly one send for the turn.
+    const ledgerSessionKey = buildTurnSendLedgerSessionKey("test", sessionKey)!;
+    const targetKey = buildTurnSendTargetKey({
+      channel: "imessage",
+      accountId: "primary",
+      target: currentChat,
     });
-    expect(mocks.runMessageAction).toHaveBeenCalledTimes(2);
+    expect(peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey })).toBe(1);
   });
 
   it("disambiguates a duplicate model-emitted toolCallId into a distinct cap-blocked send, not an idempotent replay", async () => {
-    // #119992 / PR #120491: the ledger admits a genuine idempotent replay past the cap
-    // (same operationId already committed this turn). That admission is re-delivery-safe
-    // only when the delivery owner dedups the key — which a direct-mode channel like
-    // imessage does NOT (the delivery-layer dedup gap is tracked in #125824). This
-    // regression proves the guard the message tool actually relies on so the cap stays
-    // exactly-once on direct channels: the runtime disambiguates a duplicate
-    // model-emitted tool-call id BEFORE the tool sees it, so two same-id sends derive
-    // DIFFERENT idempotency keys and the second is cap-blocked, never admitted as a
-    // replay. It drives the real normalization -> idempotency-key -> cap-block chain that
-    // per-turn-send-budget.e2e.test.ts scenario 6 proves end to end, at a faster unit
-    // layer. It is honestly labeled: this proves the CAP-BLOCK/disambiguation path, NOT
-    // idempotent admission (the adjacent test above covers a genuine same-id replay).
+    // #119992 / PR #120491: distinct tool-call ids derive distinct idempotency keys, so a
+    // second same-target send is a NEW send subject to the cap, never an idempotent replay.
+    // The runtime disambiguates a duplicate model-emitted tool-call id BEFORE the tool sees
+    // it, so two same-answer sends the model emits under one id still reach the tool as
+    // distinct ids and the second is cap-blocked. (On a direct route the tool would now
+    // cap-block a genuine same-id replay too — see the direct-route replay test above — but
+    // this disambiguation still holds on every route and is what per-turn-send-budget
+    // .e2e.test.ts scenario 6 proves end to end; this covers the same chain at a faster unit
+    // layer.) It is honestly labeled: this proves the CAP-BLOCK/disambiguation path.
     const args = { action: "send", channel: "imessage", message: "same reworded answer" };
 
     // (1) The model emits the SAME `message` tool-call id twice in one response, with
