@@ -127,7 +127,7 @@ function shouldClearTurnSendLedgerAtCliTerminal(
   if (isFinalFallbackAttempt === undefined) {
     return false;
   }
-  return !threw || isFinalFallbackAttempt === true;
+  return !threw || isFinalFallbackAttempt;
 }
 
 export async function assertCliRuntimeBinding(context: PreparedCliRunContext): Promise<void> {
