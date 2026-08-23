@@ -20,12 +20,14 @@ import { resolveExplicitFinalSourceReplyDeliveryEvidence } from "../embedded-age
 import { resolveAuthProfileFailureReason } from "../embedded-agent-runner/run/auth-profile-failure-policy.js";
 import { buildEmbeddedRunPayloads } from "../embedded-agent-runner/run/payloads.js";
 import { mergeAttemptToolMediaPayloads } from "../embedded-agent-runner/run/tool-media-payloads.js";
-import { coerceToFailoverError, isFailoverError } from "../failover-error.js";
+import { isFailoverError } from "../failover-error.js";
 import { clearTurnSendLedgerForRun } from "../tools/turn-send-ledger.js";
 import { CliAuthProfilePreparationError } from "./auth-profile-preparation-error.js";
 import { hashCliReseedPrompt } from "./reseed-envelope.js";
 import type { ClaudeCliRunDiagnosticLifecycle } from "./run-diagnostics.js";
 import type { PreparedCliRunContext, RunCliAgentParams } from "./types.js";
+
+export { settleCliBackendOutcome } from "./cli-backend-outcome.js";
 
 const log = createSubsystemLogger("agents/cli-runner");
 
@@ -725,43 +727,4 @@ export function buildCliRunResult(params: {
       ? { acceptedSessionSpawns: output.acceptedSessionSpawns }
       : {}),
   };
-}
-
-export function settleCliBackendOutcome(params: {
-  runResult: EmbeddedAgentRunResult | undefined;
-  runError: unknown;
-  runFailed: boolean;
-  cleanupError: Error | undefined;
-  deliveredMessagingSideEffect: boolean;
-  diagnosticLifecycle?: ClaudeCliRunDiagnosticLifecycle;
-  failoverContext: { provider: string; model: string; sessionId: string; lane?: string };
-}): EmbeddedAgentRunResult {
-  const {
-    cleanupError,
-    deliveredMessagingSideEffect,
-    diagnosticLifecycle,
-    failoverContext,
-    runError,
-    runFailed,
-    runResult,
-  } = params;
-  if (cleanupError) {
-    if (!deliveredMessagingSideEffect) {
-      if (runFailed) {
-        log.warn(`CLI run also failed before backend cleanup: ${formatErrorMessage(runError)}`);
-      }
-      diagnosticLifecycle?.setPhase("cleanup");
-      throw cleanupError;
-    }
-    log.warn(
-      `CLI backend cleanup failed after confirmed message delivery: ${formatErrorMessage(cleanupError)}`,
-    );
-  }
-  if (runFailed) {
-    throw coerceToFailoverError(runError, failoverContext) ?? runError;
-  }
-  if (!runResult) {
-    throw new Error("CLI run completed without a result");
-  }
-  return runResult;
 }
