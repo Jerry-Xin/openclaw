@@ -4,7 +4,6 @@ import {
   buildTurnSendTargetKey,
   clearTurnSendLedgerForRun,
   commitTurnSend,
-  MAX_TURN_SEND_SLOTS,
   peekTurnSendCount,
   releaseTurnSend,
   reserveTurnSend,
@@ -321,35 +320,66 @@ describe("turn-send-ledger operation identity", () => {
   });
 });
 
-describe("turn-send-ledger capacity cap", () => {
-  // Distinct (session, run) slots, so eviction is driven purely by the LRU capacity
-  // bound (the sole memory bound now the idle TTL is gone).
+describe("turn-send-ledger live-slot retention", () => {
+  // The removed LRU cap evicted the oldest-touched slot once 2048 slots accumulated.
+  // The victim could be a run that is still live but idle (a long tool wait while
+  // 2049+ turns run concurrently): evicting it silently zeroed its committed counts
+  // mid-turn and released its hard cap. Evicting a live slot can never be correct, so
+  // terminal cleanup is now the ledger's only delete path — every live slot must be
+  // retained no matter how many concurrent runs exist.
+  const OLD_LRU_CAP = 2048;
   const slot = (i: number) => ({ sessionKey: "s1", runId: `run-${i}`, targetKey: "tg:a" });
 
-  it("evicts the oldest-touched slot once past MAX_TURN_SEND_SLOTS", () => {
-    for (let i = 0; i < MAX_TURN_SEND_SLOTS; i++) {
+  it("retains every live slot beyond the old LRU cap (no live-slot eviction)", () => {
+    const total = OLD_LRU_CAP + 2;
+    for (let i = 0; i < total; i++) {
       expect(commitOne(slot(i), {})).toBe(1);
     }
-    // Every slot survives while the map sits at the cap.
+    // Every slot survives — including the oldest, which the old eviction deleted the
+    // moment the cap was crossed.
     expect(peekTurnSendCount(slot(0))).toBe(1);
-    expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS - 1))).toBe(1);
-    // The next distinct slot crosses the cap and evicts the oldest (run-0).
-    expect(commitOne(slot(MAX_TURN_SEND_SLOTS), {})).toBe(1);
-    expect(peekTurnSendCount(slot(0))).toBe(0);
-    // The second-oldest and the newest slot remain.
     expect(peekTurnSendCount(slot(1))).toBe(1);
-    expect(peekTurnSendCount(slot(MAX_TURN_SEND_SLOTS))).toBe(1);
+    expect(peekTurnSendCount(slot(OLD_LRU_CAP))).toBe(1);
+    expect(peekTurnSendCount(slot(total - 1))).toBe(1);
+    // The oldest slot is still authoritative: its next send counts forward to 2; it was
+    // not silently reset to a fresh budget.
+    expect(commitOne(slot(0), {})).toBe(2);
+    expect(peekTurnSendCount(slot(0))).toBe(2);
   });
 
-  it("treats a re-touched slot as most-recently-used, sparing it from eviction", () => {
-    for (let i = 0; i < MAX_TURN_SEND_SLOTS; i++) {
+  it("deletes a slot only at its run's terminal boundary (sole delete path)", () => {
+    // A live slot must keep its committed counts, pending reservations, and seen
+    // operation ids intact through unbounded churn on other (session, run) slots —
+    // touches far beyond the old cap, in any order — and disappear only when its own
+    // run clears it at the terminal boundary.
+    const agentId = "main";
+    const session = "agent:main:churn";
+    const ledgerSessionKey = buildTurnSendLedgerSessionKey(agentId, session)!;
+    const victim = { sessionKey: ledgerSessionKey, runId: "run-victim", targetKey: "tg:a" };
+    expect(commitOne(victim, { maxPerTurn: 3, operationId: "op-victim" })).toBe(1);
+
+    for (let i = 0; i < OLD_LRU_CAP + 16; i++) {
       commitOne(slot(i), {});
     }
-    // Re-committing the oldest slot moves it to the tail; run-1 becomes the oldest.
+    // Re-touch early slots too — order of access must not matter without eviction.
     expect(commitOne(slot(0), {})).toBe(2);
-    commitOne(slot(MAX_TURN_SEND_SLOTS), {});
+
+    expect(peekTurnSendCount(victim)).toBe(1);
+    // Seen-operation identity survived the churn: the committed op replays, a distinct
+    // op still reserves under the cap.
+    expect(reserveTurnSend(victim, { maxPerTurn: 3, operationId: "op-victim" }).status).toBe(
+      "replay",
+    );
+    expect(reserveTurnSend(victim, { maxPerTurn: 3, operationId: "op-other" }).status).toBe(
+      "reserved",
+    );
+
+    // The terminal boundary deletes exactly the victim slot...
+    clearTurnSendLedgerForRun({ agentId, sessionKey: session, runId: "run-victim" });
+    expect(peekTurnSendCount(victim)).toBe(0);
+    // ...and leaves every other slot — all live runs — untouched.
     expect(peekTurnSendCount(slot(0))).toBe(2);
-    expect(peekTurnSendCount(slot(1))).toBe(0);
+    expect(peekTurnSendCount(slot(OLD_LRU_CAP + 15))).toBe(1);
   });
 });
 
