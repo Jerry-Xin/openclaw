@@ -848,4 +848,143 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       });
     },
   );
+
+  it(
+    "scenario 7: a spoofed attach-grant principal is refused before any delivery I/O (authority chain)",
+    { timeout: SCENARIO_TIMEOUT_MS },
+    async () => {
+      // Authority-chain proof demanded by the ClawSweeper re-review: an unauthorized
+      // principal must be refused BEFORE the final delivery I/O, proven end to end
+      // through the real MCP loopback entry — no mocked resolver output. The harness's
+      // own attach.grant method mints a real non-owner grant; the forged principal then
+      // drives the real HTTP boundary with that grant plus spoofed delivery-authority
+      // headers (routable target, channel, account, session). Every hop is the genuine
+      // defense: validateMcpLoopbackRequest -> resolveAttachGrant ->
+      // resolveMcpRequestContext (grant branch: spoofable headers forced to undefined) ->
+      // owner-only tool deny -> zero deliveries on the qa-channel bus. The positive
+      // control on the same lane shows the delivery path itself is live, so the zero
+      // below is a real refusal, not a dead harness. Verdict entries carry no tokens.
+      const { state: busState, harness: live } = await bootHarness();
+      const conversation = await registerQaConversation(live, busState, "REG-OK-7");
+
+      const grant = (await live.gateway.call(
+        "attach.grant",
+        { sessionKey: `qa-per-turn-budget-7-${randomUUID()}`, agentId: "qa" },
+        { timeoutMs: 10_000 },
+      )) as {
+        token: string;
+        mcpConfig: { mcpServers: { openclaw: { url: string } } };
+      };
+      const mcpUrl = grant.mcpConfig.mcpServers.openclaw.url;
+
+      // The forgery: a valid non-owner grant plus spoofed delivery-authority headers
+      // attempting to ride the delivery owner toward the registered conversation.
+      const spoofedHeaders = {
+        "content-type": "application/json",
+        authorization: `Bearer ${grant.token}`,
+        "x-session-key": "agent:qa:SPOOFED-other-session",
+        "x-openclaw-message-channel": conversation.channel,
+        "x-openclaw-account-id": conversation.accountId,
+        "x-openclaw-current-channel-id": conversation.channel,
+        "x-openclaw-current-messaging-target": conversation.target,
+      };
+
+      // (a) tools/list through the real entry: the grant principal resolves non-owner,
+      // so the owner-only conversations_send must not be advertised.
+      const listResponse = await fetch(mcpUrl, {
+        method: "POST",
+        headers: spoofedHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      expect(listResponse.status).toBe(200);
+      const listed = (await listResponse.json()) as {
+        result?: { tools?: Array<{ name: string }> };
+      };
+      const listedNames = (listed.result?.tools ?? []).map((tool) => tool.name);
+      const conversationsSendHidden = !listedNames.includes("conversations_send");
+      expect(conversationsSendHidden).toBe(true);
+
+      // (b) tools/call conversations_send anyway (the forgery's end goal): it must be
+      // refused, and — the authority-chain point — nothing may ever reach the bus.
+      const callResponse = await fetch(mcpUrl, {
+        method: "POST",
+        headers: spoofedHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "conversations_send",
+            arguments: { conversationRef: conversation.conversationRef, message: "S7-SPOOF" },
+          },
+        }),
+      });
+      const callBody = (await callResponse.json()) as {
+        error?: { message?: string };
+        result?: { isError?: boolean };
+      };
+      const refused =
+        callResponse.status !== 200 ||
+        callBody.error !== undefined ||
+        callBody.result?.isError === true;
+      expect(refused).toBe(true);
+      await sleep(500);
+      const spoofedDeliveries = outboundMessages(busState).filter((message) =>
+        message.text.includes("S7-SPOOF"),
+      );
+      expect(spoofedDeliveries).toHaveLength(0);
+
+      // (c) Positive control: the legitimate owner-bound path on the same lane delivers
+      // exactly one (real Gateway conversations.send -> qa-channel bus, as scenarios
+      // 2/4/5), proving the refusal above is an authorization decision, not a broken
+      // delivery path.
+      const agentSessionKey = `qa-per-turn-budget-7-${randomUUID()}`;
+      const runId = `run-scenario-7-${randomUUID()}`;
+      const config = {} as never;
+      const tool = createConversationsSendTool(
+        { agentId: "qa", agentSessionKey, runId, config },
+        {
+          callGateway: createLiveCallGateway(live),
+          resolveConversation: (() => conversation) as never,
+        },
+      );
+      const positiveResult = await tool.execute(
+        "s7-pos",
+        { conversationRef: conversation.conversationRef, message: "S7-POS-OK" },
+        undefined,
+      );
+      const positiveStatus = (positiveResult.details as { status?: string }).status;
+      expect(positiveStatus).toBe("sent");
+      await waitForOutboundText(busState, (message) => message.text.includes("S7-POS-OK"));
+      await sleep(500);
+      const positiveDeliveries = outboundMessages(busState).filter((message) =>
+        message.text.includes("S7-POS-OK"),
+      );
+      expect(positiveDeliveries).toHaveLength(1);
+
+      verdict.scenarios.push({
+        scenario: "spoofed attach-grant principal refused before delivery I/O (authority chain)",
+        deliveriesRecorded: spoofedDeliveries.length,
+        toolResults: [
+          {
+            status: "tools-list: conversations_send not advertised",
+            noticePresent: false,
+            schemaValid: conversationsSendHidden,
+          },
+          {
+            status: refused ? "tools/call refused pre-delivery" : "tools/call NOT refused",
+            noticePresent: false,
+            schemaValid: refused,
+          },
+          { status: positiveStatus ?? "unknown", noticePresent: false, schemaValid: true },
+        ],
+        ledgerCounts: { "qa-channel:qa-operator": positiveDeliveries.length },
+        pass:
+          conversationsSendHidden &&
+          refused &&
+          spoofedDeliveries.length === 0 &&
+          positiveDeliveries.length === 1,
+      });
+    },
+  );
 });

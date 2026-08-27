@@ -29,15 +29,6 @@ import { normalizeTargetForProvider } from "../../infra/outbound/target-normaliz
 import { normalizeAccountId } from "../../routing/account-id.js";
 import { normalizeMessageChannel } from "../../utils/message-channel-normalize.js";
 
-// Absolute ceiling on retained (session, run) slots — a last-resort process bound,
-// not the normal lifecycle. The logical-run owner clears each slot at its terminal
-// boundary (clearTurnSendLedgerForRun), so completed runs do not accumulate; this
-// LRU cap only trips if that terminal cleanup is missed under runaway concurrency
-// (> MAX_TURN_SEND_SLOTS live turns at once). storeSlot evicts the oldest-touched
-// slot when the ceiling is crossed. Sized far above any realistic concurrent-turn
-// count, so it only fires on runaway growth.
-export const MAX_TURN_SEND_SLOTS = 2048;
-
 type TurnSendSlot = {
   // Sends that have landed this turn, per target. Admission compares committed +
   // pending against the cap; peek and the nudge read this committed count.
@@ -68,20 +59,18 @@ function ledgerKey(sessionKey: string, runId: string): string {
   return `${sessionKey}\0${runId}`;
 }
 
-// Reseat a slot as the most-recently-used entry (delete + set moves it to the
-// Map's tail) and evict the oldest slots past the cap. Map iteration order is
-// insertion order, so the first key is the least-recently-touched slot. Every
-// reserve/commit/release touch reseats its slot, so eviction order is LRU by write access.
+// Write a slot back under its key — the ledger's only write path, paired with exactly
+// one delete path: clearTurnSendLedgerForRun at the owning run's terminal boundary.
+// There is deliberately no size-based eviction: the previous LRU cap deleted the
+// oldest-touched slot once 2048 slots accumulated, and that victim could be a run that
+// is still live but idle (a long tool wait while 2049+ turns run concurrently) —
+// evicting it silently zeroed that run's committed counts, pending reservations, and
+// seen-operation ids mid-turn, releasing its hard cap. Retained slots are bounded by
+// the number of concurrently live runs instead: every run clears its own slot at its
+// terminal boundary (the fallback-chain `finally` in run-entry.ts), so completed runs
+// never accumulate.
 function storeSlot(key: string, slot: TurnSendSlot): void {
-  turnSendBySession.delete(key);
   turnSendBySession.set(key, slot);
-  while (turnSendBySession.size > MAX_TURN_SEND_SLOTS) {
-    const oldest = turnSendBySession.keys().next().value;
-    if (oldest === undefined) {
-      break;
-    }
-    turnSendBySession.delete(oldest);
-  }
 }
 
 type TurnSendKey = {
@@ -306,7 +295,9 @@ export function peekTurnSendCount({ sessionKey, runId, targetKey }: TurnSendKey)
  * composite key is byte-identical to theirs; deleting only the (session, run) pair
  * leaves a concurrent run on the same session — a distinct runId, hence a distinct key —
  * untouched. A missing agent id or session key, or an already-absent slot, is a harmless
- * no-op (the LRU cap reclaims any slot a run terminates without reaching here).
+ * no-op. This is the ledger's only delete path — nothing else ever removes a slot, so a
+ * live run's counts can never be reclaimed out from under it; the terminal `finally` in
+ * run-entry.ts guarantees every owned run reaches this boundary.
  */
 export function clearTurnSendLedgerForRun(args: {
   sessionKey: string;
