@@ -25,7 +25,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { Value } from "typebox/value";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { createQaBusState, startQaBusServer } from "../../../../extensions/qa-lab/api.js";
-import { startQaLiveLaneGateway } from "../../../../extensions/qa-lab/runtime-api.js";
+import { createQaLiveLaneGateway } from "../../../../extensions/qa-lab/runtime-api.js";
 import { ConversationSendResultSchema } from "../../../../packages/gateway-protocol/src/schema/agent.js";
 import { createConversationsSendTool } from "../../../../src/agents/tools/conversation-tools.js";
 import {
@@ -34,6 +34,7 @@ import {
   peekTurnSendCount,
   resetTurnSendLedgerForTest,
 } from "../../../../src/agents/tools/turn-send-ledger.js";
+import { stopQaGatewayFixture } from "../../../helpers/qa-gateway-cleanup.js";
 
 const PRIMARY_MODEL = "mock-openai/gpt-5.6-luna";
 const ALTERNATE_MODEL = "mock-openai/gpt-5.6-luna-alt";
@@ -41,7 +42,8 @@ const SCENARIO_TIMEOUT_MS = 120_000;
 
 type BusState = ReturnType<typeof createQaBusState>;
 type BusServer = Awaited<ReturnType<typeof startQaBusServer>>;
-type LiveHarness = Awaited<ReturnType<typeof startQaLiveLaneGateway>>;
+type LiveGatewayOwner = ReturnType<typeof createQaLiveLaneGateway>;
+type LiveHarness = Awaited<ReturnType<LiveGatewayOwner["start"]>>;
 
 type OutboundMessage = {
   direction: string;
@@ -87,6 +89,7 @@ function buildQaChannelTransport() {
 
 let bus: BusServer | undefined;
 let state: BusState | undefined;
+let gatewayOwner: LiveGatewayOwner | undefined;
 let harness: LiveHarness | undefined;
 
 // Route visible replies through the message tool (sourceReplyDeliveryMode
@@ -124,7 +127,8 @@ async function bootHarness(
   resetTurnSendLedgerForTest();
   state = createQaBusState();
   bus = await startQaBusServer({ state });
-  harness = await startQaLiveLaneGateway({
+  gatewayOwner = createQaLiveLaneGateway();
+  harness = await gatewayOwner.start({
     repoRoot: process.cwd(),
     providerMode: "mock-openai",
     primaryModel: PRIMARY_MODEL,
@@ -138,9 +142,12 @@ async function bootHarness(
 }
 
 afterEach(async () => {
-  await harness?.stop().catch(() => undefined);
+  if (gatewayOwner) {
+    await stopQaGatewayFixture(gatewayOwner).catch(() => undefined);
+  }
   await bus?.stop().catch(() => undefined);
   harness = undefined;
+  gatewayOwner = undefined;
   bus = undefined;
   state = undefined;
   resetTurnSendLedgerForTest();
