@@ -14,11 +14,11 @@ import {
 } from "../../security/dangerous-tools.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { compactToolOutputHint } from "../tool-schema-hints.js";
+import { ToolSearchRuntime } from "../tool-search-runtime.js";
 import {
   createToolSearchCatalogRef,
   registerHeadlessToolSearchCatalog,
   resolveToolSearchConfig,
-  ToolSearchRuntime,
 } from "../tool-search.js";
 import {
   createConversationsListTool,
