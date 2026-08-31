@@ -279,23 +279,11 @@ function toolResultText(result: { content: Array<{ type: string; text?: string }
     .join("\n");
 }
 
-// Registers a qa-channel DM conversation in the "qa" agent's registry by running one
-// real inbound turn (the model's "Reply exactly:" echo confirms the turn landed), then
-// reads the exact (channel, account, target) route back from the Gateway registry via
-// conversations.list. The reply marker is distinct from the send markers so it never
-// pollutes the per-scenario delivery count.
-async function registerQaConversation(
-  live: LiveHarness,
-  busState: BusState,
-  replyMarker: string,
-): Promise<LiveConversation> {
-  busState.addInboundMessage({
-    conversation: { id: "qa-operator", kind: "direct" },
-    senderId: "qa-user",
-    senderName: "QA User",
-    text: `Register conversation. Reply exactly: ${replyMarker}`,
-  });
-  await waitForOutboundText(busState, (message) => message.text.includes(replyMarker));
+// Reads the exact (channel, account, target) route for the qa-operator DM back from the
+// running Gateway registry via conversations.list. The conversation is registered the
+// first time an inbound turn to qa-operator is processed, so any scenario that has already
+// driven such a turn can read it without minting another.
+async function readQaOperatorConversation(live: LiveHarness): Promise<LiveConversation> {
   const startedAt = Date.now();
   let lastListed: LiveConversation[] = [];
   while (Date.now() - startedAt < 30_000) {
@@ -317,6 +305,81 @@ async function registerQaConversation(
     `timed out waiting for the qa-operator conversation to register; saw: ${JSON.stringify(
       lastListed,
     )}`,
+  );
+}
+
+// Registers a qa-channel DM conversation in the "qa" agent's registry by running one
+// real inbound turn (the model's "Reply exactly:" echo confirms the turn landed), then
+// reads the exact (channel, account, target) route back from the Gateway registry. The
+// reply marker is distinct from the send markers so it never pollutes the per-scenario
+// delivery count.
+async function registerQaConversation(
+  live: LiveHarness,
+  busState: BusState,
+  replyMarker: string,
+): Promise<LiveConversation> {
+  busState.addInboundMessage({
+    conversation: { id: "qa-operator", kind: "direct" },
+    senderId: "qa-user",
+    senderName: "QA User",
+    text: `Register conversation. Reply exactly: ${replyMarker}`,
+  });
+  await waitForOutboundText(busState, (message) => message.text.includes(replyMarker));
+  return await readQaOperatorConversation(live);
+}
+
+// Positive-control marker on the in-process conversations_send lane: a fresh turn (new
+// session + runId, no cap) that really delivers `markerText` through the running Gateway
+// to `conversation` (Gateway conversations.send -> qa-channel bus, exactly the lane the
+// scenarios deliver on). The no-delivery fences drive one of these to prove the lane is
+// live and has flushed past the point of interest.
+function deliverConversationMarker(
+  live: LiveHarness,
+  conversation: LiveConversation,
+  markerText: string,
+): () => Promise<unknown> {
+  return async () => {
+    const tool = createConversationsSendTool(
+      {
+        agentId: "qa",
+        agentSessionKey: `qa-fence-${randomUUID()}`,
+        runId: `run-fence-${randomUUID()}`,
+        config: {} as never,
+      },
+      {
+        callGateway: createLiveCallGateway(live),
+        resolveConversation: (() => conversation) as never,
+      },
+    );
+    return await tool.execute(
+      `fence-${randomUUID()}`,
+      { conversationRef: conversation.conversationRef, message: markerText },
+      undefined,
+    );
+  };
+}
+
+// Deterministic no-delivery barrier. A fixed `sleep` can only SAMPLE the outbound bus at
+// one instant; it can never prove a send is absent, because a slow delivery could always
+// land just after the sample. Instead we fence: capture the bus event cursor at the point
+// of interest (after the action under test has fully settled), drive a positive-control
+// marker delivery on the SAME outbound lane, then event-wait until the cursor advances
+// strictly past the fence WITH the marker present. Once the marker is on the bus the lane
+// has provably processed every event through the fence, so a send that was refused or
+// suppressed before it would already be visible if it were ever going to land. The caller
+// then asserts zero matches over that provably-complete window — a real negative, not a
+// timed guess.
+async function settleOutboundPastFence(
+  busState: BusState,
+  marker: { deliver: () => Promise<unknown>; matches: (message: OutboundMessage) => boolean },
+  timeoutMs = 30_000,
+): Promise<void> {
+  const fenceCursor = busState.getSnapshot().cursor;
+  await marker.deliver();
+  await busState.waitForCursorAdvance(fenceCursor, timeoutMs, (snapshot) =>
+    (snapshot.messages as OutboundMessage[]).some(
+      (message) => message.direction === "outbound" && !message.deleted && marker.matches(message),
+    ),
   );
 }
 
@@ -444,7 +507,12 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       expect(secondNotice).toBe(true);
 
       // Only the first send reached the bus; the capped second never called the Gateway.
-      await sleep(500);
+      // Fence the bus with a positive-control marker on the same conversation so the
+      // absence of S2-CAP-BETA is proven over a provably-complete window, not sampled.
+      await settleOutboundPastFence(busState, {
+        deliver: deliverConversationMarker(live, conversation, "S2-FENCE-OK"),
+        matches: (message) => message.text.includes("S2-FENCE-OK"),
+      });
       const capDeliveries = outboundMessages(busState).filter(
         (message) => message.text.includes("S2-CAP-ALPHA") || message.text.includes("S2-CAP-BETA"),
       );
@@ -604,8 +672,12 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       expect(replaySchemaValid).toBe(true);
       expect(replayNotice).toBe(false);
 
-      // No re-delivery: the bus still shows exactly one S4-REPLAY message.
-      await sleep(500);
+      // No re-delivery: fence the bus past a positive-control marker, then confirm the bus
+      // still shows exactly one S4-REPLAY over that provably-complete window.
+      await settleOutboundPastFence(busState, {
+        deliver: deliverConversationMarker(live, conversation, "S4-FENCE-OK"),
+        matches: (message) => message.text.includes("S4-FENCE-OK"),
+      });
       const replayDeliveries = outboundMessages(busState).filter((message) =>
         message.text.includes("S4-REPLAY"),
       );
@@ -709,13 +781,17 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       expect(blockTextPresent).toBe(true);
 
       // Exactly one of the two markers ever reaches the bus; the exhausted call never
-      // called the Gateway, so its message is never delivered.
+      // called the Gateway, so its message is never delivered. Fence past a positive-control
+      // marker so the "exactly one" holds over a provably-complete window.
       await waitForOutboundText(
         busState,
         (message) =>
           message.text.includes("S5-CONC-ALPHA") || message.text.includes("S5-CONC-BETA"),
       );
-      await sleep(500);
+      await settleOutboundPastFence(busState, {
+        deliver: deliverConversationMarker(live, conversation, "S5-FENCE-OK"),
+        matches: (message) => message.text.includes("S5-FENCE-OK"),
+      });
       const concurrentDeliveries = outboundMessages(busState).filter(
         (message) =>
           message.text.includes("S5-CONC-ALPHA") || message.text.includes("S5-CONC-BETA"),
@@ -787,7 +863,16 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       await waitForMockRequestText(live.mock!.baseUrl, (text) =>
         text.includes("turn_send_budget_exhausted"),
       );
-      await sleep(500);
+      // The suppressed result was fed back to the model, so the duplicate copy was
+      // cap-blocked before dispatch and no second SBR6 can be in flight. Fence the bus on
+      // the same conversation (its route is already registered by the turn above) so the
+      // exactly-one assertion holds over a provably-complete window rather than a fixed
+      // sample. A re-delivered replay would surface a second SBR6 before the marker lands.
+      const conversation = await readQaOperatorConversation(live);
+      await settleOutboundPastFence(busState, {
+        deliver: deliverConversationMarker(live, conversation, "SBR6-FENCE-OK"),
+        matches: (message) => message.text.includes("SBR6-FENCE-OK"),
+      });
       const repeatDeliveries = outboundMessages(busState).filter(
         (message) => message.text === "SBR6",
       );
@@ -860,20 +945,60 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
     "scenario 7: a spoofed attach-grant principal is refused before any delivery I/O (authority chain)",
     { timeout: SCENARIO_TIMEOUT_MS },
     async () => {
-      // Authority-chain proof demanded by the ClawSweeper re-review: an unauthorized
-      // principal must be refused BEFORE the final delivery I/O, proven end to end
-      // through the real MCP loopback entry — no mocked resolver output. The harness's
-      // own attach.grant method mints a real non-owner grant; the forged principal then
-      // drives the real HTTP boundary with that grant plus spoofed delivery-authority
-      // headers (routable target, channel, account, session). Every hop is the genuine
-      // defense: validateMcpLoopbackRequest -> resolveAttachGrant ->
+      // Authority-chain proof demanded by the ClawSweeper re-review, made discriminating by
+      // an explicit pair on ONE qa-channel delivery lane against the SAME registered routable
+      // target:
+      //   (A) an authority-bound owner conversations_send delivers exactly once, proving the
+      //       lane is live (real Gateway conversations.send -> qa-channel bus, as 2/4/5);
+      //   (B) the real MCP loopback entry carrying a valid non-owner grant plus spoofed
+      //       delivery-authority headers (routable target/channel/account/session) is refused
+      //       BEFORE any delivery I/O and lands zero.
+      // (A) runs first so its exactly-once delivery establishes liveness; that is what makes
+      // (B)'s zero an authorization refusal rather than a dead harness. Every hop in (B) is the
+      // genuine defense — validateMcpLoopbackRequest -> resolveAttachGrant ->
       // resolveMcpRequestContext (grant branch: spoofable headers forced to undefined) ->
-      // owner-only tool deny -> zero deliveries on the qa-channel bus. The positive
-      // control on the same lane shows the delivery path itself is live, so the zero
-      // below is a real refusal, not a dead harness. Verdict entries carry no tokens.
+      // owner-only tool deny — with no mocked resolver or gateway boundary. Both zero windows
+      // are cursor-fenced past a positive-control marker, so an absent delivery is proven over a
+      // provably-complete bus window, not sampled. Verdict entries carry no tokens.
       const { state: busState, harness: live } = await bootHarness();
       const conversation = await registerQaConversation(live, busState, "REG-OK-7");
 
+      // (A) Positive control FIRST: an authority-bound owner send to the legitimate routable
+      // target delivers exactly once. Fence past a distinct marker so "exactly once" holds over
+      // a complete window — a re-delivered duplicate would surface before the marker lands.
+      const positiveSessionKey = `qa-per-turn-budget-7-${randomUUID()}`;
+      const positiveRunId = `run-scenario-7-${randomUUID()}`;
+      const positiveTool = createConversationsSendTool(
+        {
+          agentId: "qa",
+          agentSessionKey: positiveSessionKey,
+          runId: positiveRunId,
+          config: {} as never,
+        },
+        {
+          callGateway: createLiveCallGateway(live),
+          resolveConversation: (() => conversation) as never,
+        },
+      );
+      const positiveResult = await positiveTool.execute(
+        "s7-pos",
+        { conversationRef: conversation.conversationRef, message: "S7-POS-OK" },
+        undefined,
+      );
+      const positiveStatus = (positiveResult.details as { status?: string }).status;
+      expect(positiveStatus).toBe("sent");
+      await waitForOutboundText(busState, (message) => message.text.includes("S7-POS-OK"));
+      await settleOutboundPastFence(busState, {
+        deliver: deliverConversationMarker(live, conversation, "S7-LIVE-OK"),
+        matches: (message) => message.text.includes("S7-LIVE-OK"),
+      });
+      const positiveDeliveries = outboundMessages(busState).filter((message) =>
+        message.text.includes("S7-POS-OK"),
+      );
+      expect(positiveDeliveries).toHaveLength(1);
+
+      // (B) The forgery against the SAME registered target through the real MCP loopback entry:
+      // a valid non-owner grant minted by the harness's own attach.grant.
       const grant = (await live.gateway.call(
         "attach.grant",
         { sessionKey: `qa-per-turn-budget-7-${randomUUID()}`, agentId: "qa" },
@@ -884,8 +1009,8 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       };
       const mcpUrl = grant.mcpConfig.mcpServers.openclaw.url;
 
-      // The forgery: a valid non-owner grant plus spoofed delivery-authority headers
-      // attempting to ride the delivery owner toward the registered conversation.
+      // The non-owner grant plus spoofed delivery-authority headers attempting to ride the
+      // delivery owner toward the registered conversation.
       const spoofedHeaders = {
         "content-type": "application/json",
         authorization: `Bearer ${grant.token}`,
@@ -896,8 +1021,8 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         "x-openclaw-current-messaging-target": conversation.target,
       };
 
-      // (a) tools/list through the real entry: the grant principal resolves non-owner,
-      // so the owner-only conversations_send must not be advertised.
+      // (B.1) tools/list through the real entry: the grant principal resolves non-owner, so
+      // the owner-only conversations_send must not be advertised.
       const listResponse = await fetch(mcpUrl, {
         method: "POST",
         headers: spoofedHeaders,
@@ -911,7 +1036,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const conversationsSendHidden = !listedNames.includes("conversations_send");
       expect(conversationsSendHidden).toBe(true);
 
-      // (b) tools/call conversations_send anyway (the forgery's end goal): it must be
+      // (B.2) tools/call conversations_send anyway (the forgery's end goal): it must be
       // refused, and — the authority-chain point — nothing may ever reach the bus.
       const callResponse = await fetch(mcpUrl, {
         method: "POST",
@@ -935,44 +1060,28 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         callBody.error !== undefined ||
         callBody.result?.isError === true;
       expect(refused).toBe(true);
-      await sleep(500);
+
+      // Cursor-fenced no-delivery window: a positive-control marker lands past the fence,
+      // proving the lane processed everything through the refusal, so S7-SPOOF is absent over
+      // a complete window rather than a 500ms sample. (A) already proved this lane delivers.
+      await settleOutboundPastFence(busState, {
+        deliver: deliverConversationMarker(live, conversation, "S7-SETTLED-OK"),
+        matches: (message) => message.text.includes("S7-SETTLED-OK"),
+      });
       const spoofedDeliveries = outboundMessages(busState).filter((message) =>
         message.text.includes("S7-SPOOF"),
       );
       expect(spoofedDeliveries).toHaveLength(0);
 
-      // (c) Positive control: the legitimate owner-bound path on the same lane delivers
-      // exactly one (real Gateway conversations.send -> qa-channel bus, as scenarios
-      // 2/4/5), proving the refusal above is an authorization decision, not a broken
-      // delivery path.
-      const agentSessionKey = `qa-per-turn-budget-7-${randomUUID()}`;
-      const runId = `run-scenario-7-${randomUUID()}`;
-      const config = {} as never;
-      const tool = createConversationsSendTool(
-        { agentId: "qa", agentSessionKey, runId, config },
-        {
-          callGateway: createLiveCallGateway(live),
-          resolveConversation: (() => conversation) as never,
-        },
-      );
-      const positiveResult = await tool.execute(
-        "s7-pos",
-        { conversationRef: conversation.conversationRef, message: "S7-POS-OK" },
-        undefined,
-      );
-      const positiveStatus = (positiveResult.details as { status?: string }).status;
-      expect(positiveStatus).toBe("sent");
-      await waitForOutboundText(busState, (message) => message.text.includes("S7-POS-OK"));
-      await sleep(500);
-      const positiveDeliveries = outboundMessages(busState).filter((message) =>
-        message.text.includes("S7-POS-OK"),
-      );
-      expect(positiveDeliveries).toHaveLength(1);
-
       verdict.scenarios.push({
         scenario: "spoofed attach-grant principal refused before delivery I/O (authority chain)",
         deliveriesRecorded: spoofedDeliveries.length,
         toolResults: [
+          {
+            status: positiveStatus ?? "unknown",
+            noticePresent: false,
+            schemaValid: positiveDeliveries.length === 1,
+          },
           {
             status: "tools-list: conversations_send not advertised",
             noticePresent: false,
@@ -983,7 +1092,6 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
             noticePresent: false,
             schemaValid: refused,
           },
-          { status: positiveStatus ?? "unknown", noticePresent: false, schemaValid: true },
         ],
         ledgerCounts: { "qa-channel:qa-operator": positiveDeliveries.length },
         pass:
