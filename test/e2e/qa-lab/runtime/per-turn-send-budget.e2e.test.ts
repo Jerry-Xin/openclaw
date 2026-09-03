@@ -829,22 +829,24 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
   );
 
   it(
-    "scenario 6: a model-repeated direct message send under the cap is disambiguated and cap-blocked (exactly-once delivery) — proves the cap-block path, NOT idempotent admission",
+    "scenario 6: two byte-identical direct message sends under the cap are cap-blocked (exactly-once delivery) — proves the cap-block path, NOT idempotent admission",
     { timeout: SCENARIO_TIMEOUT_MS },
     async () => {
       // The direct-tool counterpart to scenario 5's concurrency proof. The mock emits
-      // the SAME `message` send TWICE in ONE model response — identical planned call_id,
-      // item id, and byte-identical arguments (QA-PTSB-REPEAT). The runtime disambiguates
-      // the duplicate model-emitted ids (normalizeToolCallIdsInMessage) into two distinct
-      // tool-call ids, so deriveMessageToolIdempotency yields DIFFERENT keys: the second
-      // copy is NOT recognized as an idempotent replay and, under
-      // maxMessagesPerTurnPerTarget:1, is cap-blocked before dispatch. This is the honest,
-      // reachable proof — the replay-admission branch is unreachable from a model turn
-      // because the runtime always rewrites the duplicate ids. On qa-channel (deliveryMode
-      // "direct") the delivery layer does not dedup on the idempotency key, so admitting a
-      // replay here WOULD re-deliver; exactly-once delivery is therefore the direct
-      // no-double-count proof (the real turn runs in the Gateway child, whose per-turn
-      // ledger is not peekable from this process, exactly as scenarios 1 and 3 treat it).
+      // the SAME `message` send TWICE in ONE model response — byte-identical arguments
+      // (QA-PTSB-REPEAT), but each copy carrying a distinct call_id and item id. Distinct
+      // ids are mandatory: the Responses transport's terminal guard rejects a stream that
+      // repeats a tool-call identity, so byte-identical ids would throw before any dispatch
+      // (zero delivery). With distinct ids the two copies pass the guard and, because the
+      // message-tool idempotency key folds in the tool-call id, derive DIFFERENT keys
+      // despite the identical payload — so the second copy is NOT recognized as an
+      // idempotent replay and, under maxMessagesPerTurnPerTarget:1, is cap-blocked before
+      // dispatch (reserveTurnSend exhaustion), exactly mirroring scenario 5's distinct
+      // operationIds. On qa-channel (deliveryMode "direct") the delivery layer does not
+      // dedup on the idempotency key, so admitting a replay here WOULD re-deliver;
+      // exactly-once delivery is therefore the direct no-double-count proof (the real turn
+      // runs in the Gateway child, whose per-turn ledger is not peekable from this process,
+      // exactly as scenarios 1 and 3 treat it).
       const { state: busState, harness: live } = await bootHarness(withCappedMessageToolReplies);
       busState.addInboundMessage({
         conversation: { id: "qa-operator", kind: "direct" },
@@ -854,7 +856,8 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       });
 
       // (a) Exactly one copy reaches the peer. Wait for the delivery, then confirm no
-      // second SBR6 ever lands (a re-delivered replay would surface a second one).
+      // second SBR6 ever lands (a second admitted send would surface a second copy —
+      // distinct idempotency keys are not deduped on this direct channel).
       const delivered = await waitForOutboundText(busState, (message) => message.text === "SBR6");
       expect(delivered.conversation.id).toBe("qa-operator");
 
@@ -863,11 +866,11 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       await waitForMockRequestText(live.mock!.baseUrl, (text) =>
         text.includes("turn_send_budget_exhausted"),
       );
-      // The suppressed result was fed back to the model, so the duplicate copy was
+      // The suppressed result was fed back to the model, so the second copy was
       // cap-blocked before dispatch and no second SBR6 can be in flight. Fence the bus on
       // the same conversation (its route is already registered by the turn above) so the
       // exactly-one assertion holds over a provably-complete window rather than a fixed
-      // sample. A re-delivered replay would surface a second SBR6 before the marker lands.
+      // sample. A second admitted send would surface a second SBR6 before the marker lands.
       const conversation = await readQaOperatorConversation(live);
       await settleOutboundPastFence(busState, {
         deliver: deliverConversationMarker(live, conversation, "SBR6-FENCE-OK"),
@@ -895,10 +898,12 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         suppressedResult.message.includes("Blocked: already sent 1 message");
       expect(suppressedSchemaValid).toBe(true);
 
-      // (c) The two executions carried DISTINCT tool-call ids after the runtime rewrote the
-      // duplicate model-emitted id. The emitting response planned a single identity
-      // (plannedToolCallId), yet the first transcript round that carries both message sends
-      // shows two distinct call_ids — that contrast IS the disambiguation proof. (Counting
+      // (c) The two executions carried DISTINCT tool-call ids with byte-identical
+      // payloads. The emitting response planned a message send tagged ptsb_repeat
+      // (plannedToolCallId records the first copy), and the first transcript round that
+      // carries both message sends shows two distinct call_ids — the two distinct
+      // idempotency keys that make the second copy a genuine send rather than a replay,
+      // the direct-tool analogue of scenario 5's two distinct operationIds. (Counting
       // across all requests would over-count: later rounds re-encode the same two ids into
       // provider-sanitized variants.)
       const plannedRepeat = requests
@@ -922,7 +927,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
 
       verdict.scenarios.push({
         scenario:
-          "direct message-tool repeat under cap is disambiguated and cap-blocked (exactly-once delivery)",
+          "direct message-tool byte-identical repeat under cap is cap-blocked (exactly-once delivery)",
         deliveriesRecorded: repeatDeliveries.length,
         toolResults: [
           { status: "sent", noticePresent: false, schemaValid: true },
@@ -933,7 +938,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
           },
         ],
         // Child-process ledger is not peekable here; exactly-one delivery is the
-        // no-double-count proxy (a re-delivered replay would show 2 on this direct channel).
+        // no-double-count proxy (a second admitted send would show 2 on this direct channel).
         ledgerCounts: { "qa-channel:qa-operator": repeatDeliveries.length },
         pass:
           repeatDeliveries.length === 1 && suppressedSchemaValid && distinctExecutedIds.size === 2,
