@@ -108,34 +108,39 @@ export function buildToolCallEventsWithArgs(
   return stream.complete(16);
 }
 
-// Emits the SAME tool call `count` times inside ONE model response, reusing a
-// fixed call_id and item id and byte-identical arguments — bypassing the
-// per-call unique-suffix counter buildMockFunctionCall applies. The copies are
-// genuine duplicate model-emitted tool calls the runtime must disambiguate
-// (normalizeToolCallIdsInMessage) into distinct executions; used by the per-turn
-// send-budget REPEAT fixture to prove the cap-block path over idempotent replay
-// admission. Each copy gets its own output_index so the stream stays routable
-// even though the tool-call identities collide.
+// Emits the SAME tool call `count` times inside ONE model response — one send
+// repeated with byte-identical arguments, but each copy carrying a DISTINCT
+// call_id and item id (`..._ptsb_repeat_${n}`). Distinct ids are required: the
+// Responses transport's terminal guard rejects a stream that repeats a tool-call
+// identity (openai-responses-stream-internal.ts), so byte-identical ids would
+// throw pre-dispatch and never reach delivery. With distinct ids the copies pass
+// the guard and, because the message-tool idempotency key folds in the tool-call
+// id, derive DIFFERENT idempotency keys despite the identical payload — so the
+// second copy is a genuinely distinct send, not an idempotent replay. Used by the
+// per-turn send-budget REPEAT fixture to prove the cap-block path (reserveTurnSend
+// exhaustion) rather than idempotent admission, the direct-tool mirror of the
+// concurrent conversations_send race in scenario 5. Each copy gets its own
+// output_index so the stream stays routable.
 export function buildDuplicateToolCallEventsWithArgs(
   name: string,
   args: Record<string, unknown>,
   count: number,
 ): StreamEvent[] {
   const serialized = JSON.stringify(args);
-  const callId = `call_mock_${name}_ptsb_repeat`;
-  const itemId = `fc_mock_${name}_ptsb_repeat`;
   const responseId = `resp_mock_${name}_ptsb_repeat`;
-  const buildItem = () => ({
+  const buildItem = (outputIndex: number) => ({
     type: "function_call",
-    id: itemId,
-    call_id: callId,
+    // Distinct per copy so the byte-identical sends carry distinct tool-call
+    // identities; the `ptsb_repeat` tag lets the e2e locate them in the transcript.
+    id: `fc_mock_${name}_ptsb_repeat_${outputIndex + 1}`,
+    call_id: `call_mock_${name}_ptsb_repeat_${outputIndex + 1}`,
     name,
     arguments: serialized,
   });
   const events: StreamEvent[] = [];
   const output: ReturnType<typeof buildItem>[] = [];
   for (let outputIndex = 0; outputIndex < count; outputIndex += 1) {
-    const item = buildItem();
+    const item = buildItem(outputIndex);
     output.push(item);
     events.push({
       type: "response.output_item.added",
@@ -144,7 +149,7 @@ export function buildDuplicateToolCallEventsWithArgs(
     });
     events.push({
       type: "response.function_call_arguments.delta",
-      item_id: itemId,
+      item_id: item.id,
       output_index: outputIndex,
       delta: serialized,
     });

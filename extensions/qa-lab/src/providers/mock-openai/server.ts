@@ -1098,11 +1098,11 @@ async function buildResponsesPayload(
     return buildAssistantEvents(`${perTurnSendBudget.marker}-FINAL`);
   }
   // Per-turn send-budget REPEAT fixture (QA-PTSB-REPEAT): emit the SAME `message`
-  // send twice in ONE response (identical planned call_id, item id, and args) on
-  // the opening round, then finalize with text once the copies have run. Proves
-  // the runtime disambiguates a model-repeated send so a per-turn cap blocks the
-  // second copy instead of admitting it as an idempotent replay. Placed beside
-  // QA-PTSB-SEND so its unique marker wins before the scenario chain.
+  // send twice in ONE response (byte-identical args, distinct call_id/item id) on
+  // the opening round, then finalize with text once the copies have run. Proves a
+  // per-turn cap blocks the second byte-identical send (distinct idempotency key)
+  // instead of admitting it as an idempotent replay. Placed beside QA-PTSB-SEND so
+  // its unique marker wins before the scenario chain.
   const perTurnSendBudgetRepeat = extractPerTurnSendBudgetRepeatDirective(allInputText);
   if (perTurnSendBudgetRepeat && hasDeclaredTool(body, "message")) {
     const priorMessageSends = input.filter(
