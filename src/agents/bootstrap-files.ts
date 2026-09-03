@@ -3,6 +3,7 @@
  * bounded context files.
  */
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ChatType } from "../channels/chat-type.js";
 import { readRecentSessionTranscriptActiveEvents } from "../config/sessions/session-accessor.js";
@@ -301,6 +302,10 @@ type BootstrapFileResolutionParams = {
   contextMode?: BootstrapContextMode;
   runKind?: BootstrapContextRunKind;
   readOnlyState?: boolean;
+  onBootstrapSubstageTiming?: (
+    name: "workspace-file-load" | "hook-overrides",
+    durationMs: number,
+  ) => void;
 };
 
 /** Prepare the same bounded workspace facts without invoking run-owned bootstrap hooks. */
@@ -330,12 +335,14 @@ async function resolveBootstrapFiles(
     params.workspaceDir,
     params.readOnlyState,
   );
+  const fileLoadStartedAt = performance.now();
   const rawFiles = params.sessionKey
     ? await getOrLoadBootstrapFiles({
         workspaceDir: params.workspaceDir,
         sessionKey: params.sessionKey,
       })
     : await loadWorkspaceBootstrapFiles(params.workspaceDir);
+  params.onBootstrapSubstageTiming?.("workspace-file-load", performance.now() - fileLoadStartedAt);
   const ineligibleAutomaticMemoryFiles = await resolveIneligibleAutomaticMemoryFiles({
     files: rawFiles,
     workspaceDir: params.workspaceDir,
@@ -369,16 +376,24 @@ async function resolveBootstrapFiles(
     runKind: params.runKind,
   });
 
-  const updated = applyHooks
-    ? await applyBootstrapHookOverrides({
-        files: bootstrapFiles,
-        workspaceDir: params.workspaceDir,
-        config: params.config,
-        sessionKey: params.sessionKey,
-        sessionId: params.sessionId,
-        agentId: params.agentId,
-      })
-    : bootstrapFiles;
+  let updated: WorkspaceBootstrapFile[];
+  if (applyHooks) {
+    const hookOverridesStartedAt = performance.now();
+    updated = await applyBootstrapHookOverrides({
+      files: bootstrapFiles,
+      workspaceDir: params.workspaceDir,
+      config: params.config,
+      sessionKey: params.sessionKey,
+      sessionId: params.sessionId,
+      agentId: params.agentId,
+    });
+    params.onBootstrapSubstageTiming?.(
+      "hook-overrides",
+      performance.now() - hookOverridesStartedAt,
+    );
+  } else {
+    updated = bootstrapFiles;
+  }
   const filteredUpdated = filterCompletedWorkspaceBootstrapFile(
     filterBootstrapFilesAfterHooks({
       files: updated,
