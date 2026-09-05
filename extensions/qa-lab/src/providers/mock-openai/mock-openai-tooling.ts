@@ -163,6 +163,7 @@ export function buildDuplicateToolCallEventsWithArgs(
     type: "response.completed",
     response: {
       id: responseId,
+      object: "response",
       status: "completed",
       output,
       usage: { input_tokens: 64, output_tokens: 24, total_tokens: 88 },

@@ -1,7 +1,10 @@
 import type { IncomingMessage } from "node:http";
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import type { McpLoopbackRequestContext } from "./mcp-grant-store.js";
+import {
+  type McpLoopbackRequestContext,
+  resolveMcpLoopbackClientGrant,
+} from "./mcp-grant-store.js";
 import { resolveMcpRequestContext } from "./mcp-http.request.js";
 
 // A request may carry spoofable delivery headers, but the routable messaging
@@ -19,15 +22,22 @@ function reqWithSpoofedTarget(): IncomingMessage {
 
 describe("resolveMcpRequestContext currentMessagingTarget authority", () => {
   it("keeps the bound-context routable target; a spoofed header cannot override it", () => {
-    const boundContext: McpLoopbackRequestContext = {
+    const context: McpLoopbackRequestContext = {
       sessionKey: "agent:main:slack:dm:U123",
       senderIsOwner: true,
       currentChannelId: "D123",
       currentMessagingTarget: "user:U123",
     };
+    // The Gateway-minted client grant is the only carrier of a bound routable
+    // target. resolveMcpRequestContext returns the grant context verbatim on
+    // this path and never reads request headers, so a minimal grant stub proves
+    // the authority: the bound value wins and the spoofed header stays inert.
+    const boundClientGrant = {
+      context,
+    } as NonNullable<ReturnType<typeof resolveMcpLoopbackClientGrant>>;
     const ctx = resolveMcpRequestContext(reqWithSpoofedTarget(), {} as OpenClawConfig, {
       senderIsOwner: true,
-      boundContext,
+      boundClientGrant,
     });
     expect(ctx.currentMessagingTarget).toBe("user:U123");
     expect(ctx.currentChannelId).toBe("D123");
