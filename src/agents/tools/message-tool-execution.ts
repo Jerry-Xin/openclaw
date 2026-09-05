@@ -6,10 +6,6 @@ import {
   GATEWAY_CLIENT_IDS,
   GATEWAY_CLIENT_MODES,
 } from "../../../packages/gateway-protocol/src/client-info.js";
-import type { SourceReplyDeliveryMode } from "../../auto-reply/get-reply-options.types.js";
-import type { ChatType } from "../../channels/chat-type.js";
-import type { InboundEventKind } from "../../channels/inbound-event/kind.js";
-import type { ConversationReadInvocationOrigin } from "../../channels/plugins/conversation-read-origin.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
 import type { PreparedMessageToolCatalog } from "../../channels/plugins/message-action-discovery.js";
 import type { ChannelMessageActionName } from "../../channels/plugins/types.public.js";
@@ -17,7 +13,6 @@ import { resolveCommandSecretRefsViaGateway } from "../../cli/command-secret-gat
 import { getScopedChannelsCommandSecretTargets } from "../../cli/command-secret-targets.js";
 import { resolveMessageSecretScope } from "../../cli/message-secret-scope.js";
 import { getRuntimeConfig } from "../../config/config.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import * as messageActionTurnCapability from "../../gateway/message-action-turn-capability.js";
 import { createAbortError } from "../../infra/abort-signal.js";
 import { resolveMessageChannelSelection } from "../../infra/outbound/channel-selection.js";
@@ -45,7 +40,6 @@ import {
   projectEmbeddedMessageDeliveryFact,
 } from "../embedded-agent-message-delivery.js";
 import { createSandboxBridgeReadFile } from "../sandbox-media-paths.js";
-import type { SandboxFsBridge } from "../sandbox/fs-bridge.js";
 import { type AnyAgentTool, jsonResult, readToolStringParam } from "./common.js";
 import {
   readGatewayCallOptions,
@@ -62,6 +56,7 @@ import {
   resolveEffectiveCurrentChannelContext,
   resolveMessageToolActionSchemaActions,
 } from "./message-tool-discovery.js";
+import type { MessageToolOptions } from "./message-tool-execution-options.js";
 import { createMessageToolExplicitTargetGuard } from "./message-tool-explicit-target.js";
 import { deriveMessageToolIdempotency } from "./message-tool-idempotency.js";
 import { resolveOutboundActionRoute } from "./message-tool-outbound-route.js";
@@ -111,46 +106,7 @@ const recentPollVoteBySession = new Map<
   { option: string; route: string; recordedAt: number }
 >();
 
-type MessageToolOptions = {
-  agentAccountId?: string;
-  agentSessionKey?: string;
-  runSessionKey?: string;
-  runId?: string;
-  sessionId?: string;
-  agentId?: string;
-  config?: OpenClawConfig;
-  preparedMessageToolCatalog?: PreparedMessageToolCatalog;
-  getRuntimeConfig?: () => OpenClawConfig;
-  getScopedChannelsCommandSecretTargets?: typeof getScopedChannelsCommandSecretTargets;
-  resolveCommandSecretRefsViaGateway?: typeof resolveCommandSecretRefsViaGateway;
-  runMessageAction?: typeof runMessageAction;
-  currentChannelId?: string;
-  currentChatType?: ChatType;
-  currentMessagingTarget?: string;
-  messageActionTurnCapability?: string;
-  currentChannelProvider?: string;
-  currentThreadTs?: string;
-  agentThreadId?: string | number;
-  currentMessageId?: string | number;
-  currentInboundAudio?: boolean;
-  hasCurrentInboundAudio?: () => boolean;
-  replyToMode?: "off" | "first" | "all" | "batched";
-  hasRepliedRef?: { value: boolean };
-  sameChannelThreadRequired?: boolean;
-  sandboxRoot?: string;
-  sandboxContainerWorkdir?: string;
-  sandboxFsBridge?: SandboxFsBridge;
-  sandboxWorkspaceMediaReadAllowed?: boolean;
-  requireExplicitTarget?: boolean;
-  sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
-  /** Process-local completion authority: send only to the current source route. */
-  sourceReplyOnly?: boolean;
-  inboundEventKind?: InboundEventKind;
-  requesterSenderId?: string;
-  senderIsOwner?: boolean;
-  conversationReadOrigin?: ConversationReadInvocationOrigin;
-  workspaceDir?: string;
-};
+export type { MessageToolOptions } from "./message-tool-execution-options.js";
 
 export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
   const loadConfigForTool = options?.getRuntimeConfig ?? getRuntimeConfig;
