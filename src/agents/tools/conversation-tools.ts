@@ -4,7 +4,6 @@ import { Type } from "typebox";
 // Keep Gateway wire schemas as the single owner so Code Mode never advertises a divergent shape.
 import {
   ConversationListResultSchema,
-  ConversationSendResultSchema,
   ConversationTurnResultSchema,
   type ConversationListResult,
   type ConversationSendResult,
@@ -64,6 +63,31 @@ const ConversationsTurnSchema = Type.Object(
     conversationRef: Type.String({ pattern: CONVERSATION_REF_PATTERN.source }),
     message: Type.String({ minLength: 1 }),
     timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })),
+  },
+  { additionalProperties: false },
+);
+
+// Tool-local closed output schema for conversations_send: every field of the
+// Gateway ConversationSendResultSchema plus an optional turnSendNotice. Code Mode
+// projects a tool's details to the guest and validates them against this declared
+// schema (assertCatalogOutputMatchesSchema); the send-budget guidance must ride in
+// a declared details field to survive that projection, since content is dropped.
+// It intentionally stays a superset of the Gateway result rather than mutating the
+// public protocol schema, so no wire/SDK surface changes. Keep the shape aligned
+// with ConversationSendResultSchema in packages/gateway-protocol.
+export const ConversationSendToolResultSchema = Type.Object(
+  {
+    status: Type.Union([
+      Type.Literal("sent"),
+      Type.Literal("queued"),
+      Type.Literal("suppressed"),
+      Type.Literal("unknown"),
+    ]),
+    conversationRef: Type.String({ pattern: CONVERSATION_REF_PATTERN.source }),
+    channel: Type.String({ minLength: 1 }),
+    messageId: Type.Optional(Type.String({ minLength: 1 })),
+    queueId: Type.Optional(Type.String({ minLength: 1 })),
+    turnSendNotice: Type.Optional(Type.String({ minLength: 1 })),
   },
   { additionalProperties: false },
 );
@@ -220,7 +244,7 @@ export function createConversationsSendTool(
     description:
       "Send directly through a conversationRef. This performs channel delivery; it does not run the local agent in the backing session.",
     parameters: ConversationsSendSchema,
-    outputSchema: ConversationSendResultSchema,
+    outputSchema: ConversationSendToolResultSchema,
     execute: async (toolCallId, args, signal) => {
       requireOwner(options);
       const params = args as Record<string, unknown>;
@@ -259,18 +283,18 @@ export function createConversationsSendTool(
         ? reserveTurnSend(budgetContext, { maxPerTurn, operationId })
         : undefined;
       if (reservation?.status === "exhausted" && budgetContext) {
-        // conversations_send declares the closed ConversationSendResultSchema, so
-        // the details must stay within it (status/conversationRef/channel). The
-        // human-readable block reason rides in the text content, not details, or
-        // Code Mode's output-schema check (assertCatalogOutputMatchesSchema) throws.
-        return textResult(
-          `Blocked: already sent ${maxPerTurn} message(s) to this conversation this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
-          {
-            status: "suppressed" as const,
-            conversationRef,
-            channel: budgetContext.channel,
-          },
-        );
+        // conversations_send declares the tool-local ConversationSendToolResultSchema,
+        // which is the closed Gateway send result plus an optional turnSendNotice. The
+        // block reason rides in that declared details field (not only text content) so
+        // it survives Code Mode's details projection while Code Mode's output-schema
+        // check (assertCatalogOutputMatchesSchema) still passes.
+        const blockedNotice = `Blocked: already sent ${maxPerTurn} message(s) to this conversation this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`;
+        return textResult(blockedNotice, {
+          status: "suppressed" as const,
+          conversationRef,
+          channel: budgetContext.channel,
+          turnSendNotice: blockedNotice,
+        });
       }
       let result: ConversationSendResult;
       try {
@@ -316,15 +340,21 @@ export function createConversationsSendTool(
               agentId: resolveToolAgentId(options),
             })?.turnSendNudge !== false;
           if (sendCount >= 2 && nudgeEnabled) {
+            // Carry the reminder in both the presentation content (direct tool
+            // callers) and the declared details.turnSendNotice, so a Code Mode guest
+            // — which only receives the projected details — still sees it. The two
+            // strings are identical by construction.
+            const turnSendNotice = `You have already sent ${sendCount} messages to this conversation this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`;
             return {
               ...base,
               content: [
                 ...base.content,
                 {
                   type: "text" as const,
-                  text: `You have already sent ${sendCount} messages to this conversation this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`,
+                  text: turnSendNotice,
                 },
               ],
+              details: { ...result, turnSendNotice },
             };
           }
         }

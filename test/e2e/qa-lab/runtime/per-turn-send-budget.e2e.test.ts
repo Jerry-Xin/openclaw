@@ -27,7 +27,10 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { createQaBusState, startQaBusServer } from "../../../../extensions/qa-lab/api.js";
 import { createQaLiveLaneGateway } from "../../../../extensions/qa-lab/runtime-api.js";
 import { ConversationSendResultSchema } from "../../../../packages/gateway-protocol/src/schema/agent.js";
-import { createConversationsSendTool } from "../../../../src/agents/tools/conversation-tools.js";
+import {
+  ConversationSendToolResultSchema,
+  createConversationsSendTool,
+} from "../../../../src/agents/tools/conversation-tools.js";
 import {
   buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
@@ -488,20 +491,23 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
 
       // Second send to the SAME conversation this turn with a NEW toolCallId (a distinct
       // operationId, not an idempotent replay): the pre-Gateway hard cap fires and returns a
-      // schema-valid suppressed result carrying only status/conversationRef/channel, with the
-      // human-readable block reason in the text content (never in details).
+      // suppressed result. The block reason rides in both the text content and the declared
+      // turnSendNotice details field (so it survives Code Mode's details projection), which
+      // is why the result validates against the tool-local superset rather than the closed
+      // Gateway wire schema.
       const secondResult = await tool.execute(
         "s2-B",
         { conversationRef: conversation.conversationRef, message: "S2-CAP-BETA" },
         undefined,
       );
-      const secondSchemaValid = Value.Check(ConversationSendResultSchema, secondResult.details);
+      const secondSchemaValid = Value.Check(ConversationSendToolResultSchema, secondResult.details);
       const secondText = toolResultText(secondResult);
       const secondNotice = secondText.includes("Blocked: already sent 1 message");
       expect(secondResult.details).toEqual({
         status: "suppressed",
         conversationRef: conversation.conversationRef,
         channel: conversation.channel,
+        turnSendNotice: expect.stringContaining("Blocked: already sent 1 message"),
       });
       expect(secondSchemaValid).toBe(true);
       expect(secondNotice).toBe(true);
@@ -765,7 +771,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const suppressedResult = suppressedResults[0]!;
       const sentSchemaValid = Value.Check(ConversationSendResultSchema, sentResult.details);
       const suppressedSchemaValid = Value.Check(
-        ConversationSendResultSchema,
+        ConversationSendToolResultSchema,
         suppressedResult.details,
       );
       const blockTextPresent = toolResultText(suppressedResult).includes(
@@ -773,10 +779,14 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       );
       expect(sentSchemaValid).toBe(true);
       expect(suppressedSchemaValid).toBe(true);
+      // The suppressed result carries the block reason in the declared turnSendNotice
+      // details field (plus the text content), so it validates against the tool-local
+      // superset rather than the closed Gateway wire schema.
       expect(suppressedResult.details).toEqual({
         status: "suppressed",
         conversationRef: conversation.conversationRef,
         channel: conversation.channel,
+        turnSendNotice: expect.stringContaining("Blocked: already sent 1 message"),
       });
       expect(blockTextPresent).toBe(true);
 

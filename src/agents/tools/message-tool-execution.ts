@@ -1,3 +1,4 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
@@ -764,6 +765,16 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       if (appendedNotices.length === 0) {
         return attachEmbeddedMessageDeliveryFact(baseResult, messageDelivery);
       }
+      // The message tool declares no outputSchema, but Code Mode still projects a
+      // tool's details (not its content) to the guest. Carry the send-budget reminder
+      // in details.turnSendNotice for this successful send so a Code Mode guest sees
+      // it too; the content append is unchanged. Only turnSendNotice rides in details
+      // (the normalization notice stays presentation-only), and only when the result
+      // already carries a plain-object details to extend.
+      const detailsWithNotice =
+        turnSendNotice && isRecord(baseResult.details)
+          ? { ...baseResult.details, turnSendNotice }
+          : baseResult.details;
       return attachEmbeddedMessageDeliveryFact(
         {
           ...baseResult,
@@ -771,6 +782,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             ...baseResult.content,
             ...appendedNotices.map((text) => ({ type: "text" as const, text })),
           ],
+          details: detailsWithNotice,
         },
         messageDelivery,
       );

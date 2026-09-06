@@ -5423,11 +5423,21 @@ describe("per-turn send budget", () => {
   it("appends a soft reminder from the second send to the same target this turn", async () => {
     stubSend();
     const tool = createBudgetTool();
-    await send(tool, "first");
+    const first = await send(tool, "first");
     const second = await send(tool, "second variant");
     const third = await send(tool, "third variant");
     expect(softNotice(second)).toContain("already sent 2 messages");
     expect(softNotice(third)).toContain("already sent 3 messages");
+    // The reminder also rides in the projected details so a Code Mode guest, which
+    // only receives details (content is dropped), still sees it. The details string
+    // matches the content notice by construction.
+    expect(first.details).not.toMatchObject({ turnSendNotice: expect.any(String) });
+    expect(second.details).toMatchObject({
+      turnSendNotice: expect.stringContaining("already sent 2 messages"),
+    });
+    expect(third.details).toMatchObject({
+      turnSendNotice: expect.stringContaining("already sent 3 messages"),
+    });
     // Never blocks without an opt-in cap.
     expect(second.details).not.toMatchObject({ status: "suppressed" });
     expect(mocks.runMessageAction).toHaveBeenCalledTimes(3);

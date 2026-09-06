@@ -13,14 +13,19 @@ import {
   GATEWAY_OWNER_ONLY_CORE_TOOLS,
 } from "../../security/dangerous-tools.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
+import { runBridgeRequest } from "../code-mode-bridge.js";
+import { createCodeModeCatalogProjection } from "../code-mode-catalog.js";
 import { compactToolOutputHint } from "../tool-schema-hints.js";
+import { compactToolSearchCatalogEntry } from "../tool-search-catalog.js";
 import { ToolSearchRuntime } from "../tool-search-runtime.js";
+import type { ToolSearchCatalogRef } from "../tool-search-types.js";
 import {
   createToolSearchCatalogRef,
   registerHeadlessToolSearchCatalog,
   resolveToolSearchConfig,
 } from "../tool-search.js";
 import {
+  ConversationSendToolResultSchema,
   createConversationsListTool,
   createConversationsSendTool,
   createConversationsTurnTool,
@@ -149,7 +154,10 @@ describe("conversation tools", () => {
     });
 
     expect(list.outputSchema).toBe(ConversationListResultSchema);
-    expect(send.outputSchema).toBe(ConversationSendResultSchema);
+    // conversations_send declares a tool-local superset of the Gateway send result
+    // (adds the optional turnSendNotice) so Code Mode can project the send-budget
+    // guidance; the Gateway protocol schema itself is unchanged.
+    expect(send.outputSchema).toBe(ConversationSendToolResultSchema);
     expect(turn.outputSchema).toBe(ConversationTurnResultSchema);
     expect(Value.Check(list.outputSchema!, listResult.details)).toBe(true);
     expect(Value.Check(send.outputSchema!, sendResult.details)).toBe(true);
@@ -158,11 +166,32 @@ describe("conversation tools", () => {
       '{ conversations: Array<{ accountId: string; channel: string; conversationRef: string; firstSeenAt: number; kind: "direct" | "group" | "channel"; lastSeenAt: number; target: string; label?: string; threadId?: string }> }',
     );
     expect(compactToolOutputHint(send.outputSchema)).toBe(
-      '{ channel: string; conversationRef: string; status: "sent" | "queued" | "suppressed" | "unknown"; messageId?: string; queueId?: string }',
+      '{ channel: string; conversationRef: string; status: "sent" | "queued" | "suppressed" | "unknown"; messageId?: string; queueId?: string; turnSendNotice?: string }',
     );
     expect(compactToolOutputHint(turn.outputSchema)).toBe(
       '{ channel: string; conversationRef: string; correlationPersisted: boolean; messageId: string; reply: { conversationRef: string; messageId: string; text: string; timestamp: number; replyToId?: string; threadId?: string; transcriptArtifactId?: string; transcriptMessageId?: string }; status: "replied" } | { channel: string; conversationRef: string; correlationPersisted: boolean; messageId: string; status: "timeout" } | { channel: string; conversationRef: string; correlationPersisted: boolean; error: string; status: "sent" | "queued" | "suppressed" | "unknown"; messageId?: string }',
     );
+  });
+
+  it("keeps the conversations_send tool schema a strict superset of the Gateway send result", () => {
+    // The tool-local schema is hand-maintained (the Gateway wire schema is not mutated),
+    // so guard against silent drift: it must mirror every Gateway field with an identical
+    // JSON-schema definition and add only the optional turnSendNotice. Without this, an
+    // upstream field addition/tightening would surface only as a runtime throw in Code
+    // Mode's output-schema check (assertCatalogOutputMatchesSchema), never in CI.
+    const gatewayProps = (ConversationSendResultSchema as { properties: Record<string, unknown> })
+      .properties;
+    const toolProps = (ConversationSendToolResultSchema as { properties: Record<string, unknown> })
+      .properties;
+    for (const key of Object.keys(gatewayProps)) {
+      expect(JSON.stringify(toolProps[key])).toBe(JSON.stringify(gatewayProps[key]));
+    }
+    expect(Object.keys(toolProps).filter((key) => !(key in gatewayProps))).toEqual([
+      "turnSendNotice",
+    ]);
+    expect(
+      (ConversationSendToolResultSchema as { additionalProperties?: unknown }).additionalProperties,
+    ).toBe(false);
   });
 
   it("lists opaque external addresses independently from sessions", async () => {
@@ -362,20 +391,27 @@ describe("conversations_send per-turn send budget", () => {
       .find((text) => text.startsWith("Blocked:"));
   }
 
-  // conversations_send declares the closed ConversationSendResultSchema, so a capped
-  // send must return schema-valid details (status/conversationRef/channel only) and
-  // carry the human-readable block reason in text content, not details.
+  // conversations_send declares the tool-local ConversationSendToolResultSchema
+  // (the closed Gateway send result plus an optional turnSendNotice). A capped send
+  // must return details valid under that schema and carry the block reason in the
+  // declared turnSendNotice field so it survives Code Mode's details projection,
+  // while still keeping the human-readable reason in the text content.
   function expectSchemaValidCappedResult(result: {
     content: Array<{ type: string; text?: string }>;
     details: unknown;
   }) {
-    expect(Value.Check(ConversationSendResultSchema, result.details)).toBe(true);
+    const blockedText = blockedNotice(result);
+    expect(blockedText).toContain("already sent");
+    expect(Value.Check(ConversationSendToolResultSchema, result.details)).toBe(true);
+    // The declared extra field is intentionally outside the closed Gateway schema;
+    // this is exactly why conversations_send wires the tool-local superset.
+    expect(Value.Check(ConversationSendResultSchema, result.details)).toBe(false);
     expect(result.details).toEqual({
       status: "suppressed",
       conversationRef: conversation.conversationRef,
       channel: "reef",
+      turnSendNotice: blockedText,
     });
-    expect(blockedNotice(result)).toContain("already sent");
   }
 
   it("returns a schema-valid capped result with the block reason in text, not details", async () => {
@@ -426,7 +462,14 @@ describe("conversations_send per-turn send budget", () => {
     const second = await tool.execute("c2", args);
     expect(softNotice(first)).toBeUndefined();
     expect(softNotice(second)).toContain("already sent 2 messages");
-    expect(second.details).toMatchObject({ status: "sent" });
+    // The reminder also rides in declared details so a Code Mode guest (which only
+    // receives the projected details) sees it; the two strings are identical.
+    expect(second.details).toMatchObject({
+      status: "sent",
+      turnSendNotice: expect.stringContaining("already sent 2 messages"),
+    });
+    expect(Value.Check(ConversationSendToolResultSchema, second.details)).toBe(true);
+    expect(first.details).not.toHaveProperty("turnSendNotice");
   });
 
   it.each(["suppressed", "queued", "unknown"] as const)(
@@ -700,14 +743,172 @@ describe("message and conversations_send share the per-turn budget", () => {
       conversationRef: conversation.conversationRef,
       message: "hello again",
     });
-    // conversations_send returns the closed-schema suppressed shape (no reason field);
-    // the block reason rides in the text content.
+    // conversations_send returns the tool-local suppressed shape; the block reason
+    // rides in both the text content and the declared turnSendNotice details field.
     expect(blocked.details).toEqual({
       status: "suppressed",
       conversationRef: conversation.conversationRef,
       channel: "reef",
+      turnSendNotice: expect.stringContaining("already sent 1 message(s)"),
     });
     // The blocked send never reached the Gateway.
     expect(deps.callGatewayMock).not.toHaveBeenCalled();
+  });
+});
+
+// Drives the REAL Code Mode bridge projection (runBridgeRequest -> callValue ->
+// `called.result.details`) with a real ToolSearchRuntime and catalog registration,
+// asserting directly on the value a Code Mode guest receives — not the tool envelope.
+// Presentation content is dropped by the projection, so the send-budget guidance
+// only survives if it rides in the declared details.turnSendNotice field.
+describe("Code Mode bridge projects the send-budget notice into the guest value", () => {
+  const sessionKey = "agent:main:reef:direct:operator";
+  const runId = "run-bridge-1";
+  const peerTarget = conversation.target;
+  let bridgeSeq = 0;
+
+  function buildRuntime(tools: Parameters<typeof registerHeadlessToolSearchCatalog>[0]["tools"]) {
+    const catalogRef: ToolSearchCatalogRef = createToolSearchCatalogRef();
+    registerHeadlessToolSearchCatalog({ catalogRef, tools });
+    const runtime = new ToolSearchRuntime(
+      { catalogRef },
+      resolveToolSearchConfig({ tools: { toolSearch: { enabled: true, mode: "code" } } } as never),
+    );
+    return { catalogRef, runtime };
+  }
+
+  // Resolve the callable name from the runtime's own catalog so the binding id the
+  // bridge dispatches (callExactId) is exactly the registered entry's id.
+  async function projectViaBridge(params: {
+    runtime: ToolSearchRuntime;
+    catalogRef: ToolSearchCatalogRef;
+    toolName: string;
+    input: unknown;
+  }) {
+    const projection = createCodeModeCatalogProjection(
+      (params.catalogRef.current?.entries ?? []).map(compactToolSearchCatalogEntry),
+    );
+    const binding = projection.bindings.find((entry) => entry.name === params.toolName);
+    if (!binding) {
+      throw new Error(`missing catalog binding for ${params.toolName}`);
+    }
+    return runBridgeRequest({
+      runtime: params.runtime,
+      catalogProjection: projection,
+      namespaceRuntime: {} as never,
+      parentToolCallId: "bridge-send-budget",
+      codeModeRunId: "cm-send-budget",
+      maxOutputBytes: 1_000_000,
+      remainingMs: 60_000,
+      ctx: { catalogRef: params.catalogRef },
+      request: {
+        id: `bridge-${(bridgeSeq += 1)}`,
+        method: "callValue",
+        args: [binding.callableName, params.input],
+      },
+    });
+  }
+
+  function expectProjectedValue(settled: Awaited<ReturnType<typeof projectViaBridge>>) {
+    expect(settled.ok).toBe(true);
+    if (!settled.ok) {
+      throw new Error(settled.error);
+    }
+    // The guest value is the projected details only; the tool's presentation content
+    // (the text node carrying the same notice) must never reach the guest.
+    expect(settled.value).not.toHaveProperty("content");
+    return settled.value as Record<string, unknown>;
+  }
+
+  function createBridgeMessageTool(config: Record<string, unknown>) {
+    return createMessageTool({
+      currentChannelProvider: "reef",
+      currentChannelId: "reef:operator",
+      agentAccountId: "default",
+      agentSessionKey: sessionKey,
+      runId,
+      sourceReplyDeliveryMode: "message_tool_only",
+      config: config as never,
+      runMessageAction: (async () =>
+        ({
+          kind: "send",
+          action: "send",
+          channel: "reef",
+          to: peerTarget,
+          handledBy: "plugin",
+          payload: {},
+          dryRun: false,
+        }) satisfies MessageActionResult) as never,
+      resolveCommandSecretRefsViaGateway: (async ({ config: cfg }: { config: unknown }) => ({
+        resolvedConfig: cfg,
+        diagnostics: [],
+      })) as never,
+      getScopedChannelsCommandSecretTargets: (() => ({ targetIds: new Set<string>() })) as never,
+    });
+  }
+
+  it("projects the conversations_send nudge into the guest value on the second send", async () => {
+    const deps = createDeps();
+    const tool = createConversationsSendTool(
+      { agentId: "main", agentSessionKey: sessionKey, runId, config: {} },
+      deps,
+    );
+    const { catalogRef, runtime } = buildRuntime([tool]);
+    const input = { conversationRef: conversation.conversationRef, message: "hi" };
+
+    const first = expectProjectedValue(
+      await projectViaBridge({ runtime, catalogRef, toolName: "conversations_send", input }),
+    );
+    expect(first).not.toHaveProperty("turnSendNotice");
+
+    const second = expectProjectedValue(
+      await projectViaBridge({ runtime, catalogRef, toolName: "conversations_send", input }),
+    );
+    expect(second).toMatchObject({
+      status: "sent",
+      turnSendNotice: expect.stringContaining("already sent 2 messages"),
+    });
+  });
+
+  it("projects the conversations_send cap block into the guest value", async () => {
+    const deps = createDeps();
+    const tool = createConversationsSendTool(
+      {
+        agentId: "main",
+        agentSessionKey: sessionKey,
+        runId,
+        config: { tools: { message: { maxMessagesPerTurnPerTarget: 1 } } },
+      },
+      deps,
+    );
+    const { catalogRef, runtime } = buildRuntime([tool]);
+    const input = { conversationRef: conversation.conversationRef, message: "hi" };
+
+    await projectViaBridge({ runtime, catalogRef, toolName: "conversations_send", input });
+    const capped = expectProjectedValue(
+      await projectViaBridge({ runtime, catalogRef, toolName: "conversations_send", input }),
+    );
+    expect(capped).toMatchObject({
+      status: "suppressed",
+      turnSendNotice: expect.stringContaining("Finalize your reply"),
+    });
+  });
+
+  it("projects the message-tool nudge into the guest value on the second send", async () => {
+    const messageTool = createBridgeMessageTool({});
+    const { catalogRef, runtime } = buildRuntime([messageTool]);
+    const input = { action: "send", channel: "reef", to: peerTarget, message: "hi" };
+
+    const first = expectProjectedValue(
+      await projectViaBridge({ runtime, catalogRef, toolName: "message", input }),
+    );
+    expect(first).not.toHaveProperty("turnSendNotice");
+
+    const second = expectProjectedValue(
+      await projectViaBridge({ runtime, catalogRef, toolName: "message", input }),
+    );
+    expect(second).toMatchObject({
+      turnSendNotice: expect.stringContaining("already sent 2 messages"),
+    });
   });
 });
