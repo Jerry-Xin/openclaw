@@ -15,6 +15,7 @@ import {
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { runBridgeRequest } from "../code-mode-bridge.js";
 import { createCodeModeCatalogProjection } from "../code-mode-catalog.js";
+import type { AgentToolResult } from "../runtime/index.js";
 import { compactToolOutputHint } from "../tool-schema-hints.js";
 import { compactToolSearchCatalogEntry } from "../tool-search-catalog.js";
 import { ToolSearchRuntime } from "../tool-search-runtime.js";
@@ -192,6 +193,20 @@ describe("conversation tools", () => {
     expect(
       (ConversationSendToolResultSchema as { additionalProperties?: unknown }).additionalProperties,
     ).toBe(false);
+    // Per-property JSON ignores TypeBox optionality (OptionalKind lives in the
+    // top-level `required` array, not the property schema), so also compare the
+    // normalized required sets. The only added field (turnSendNotice) is optional,
+    // so the tool schema's required set must equal the Gateway's exactly — an
+    // optional<->required flip on any mirrored field (or on turnSendNotice) diverges
+    // here instead of surfacing only as a Code Mode output-schema throw at runtime.
+    const sortedRequired = (schema: unknown) =>
+      ((schema as { required?: string[] }).required ?? []).toSorted();
+    const gatewayRequired = sortedRequired(ConversationSendResultSchema);
+    const toolRequired = sortedRequired(ConversationSendToolResultSchema);
+    expect(toolRequired).toEqual(gatewayRequired);
+    // turnSendNotice must stay optional so a details-less or normalization-only send
+    // still validates against the declared schema.
+    expect(toolRequired).not.toContain("turnSendNotice");
   });
 
   it("lists opaque external addresses independently from sessions", async () => {
@@ -820,7 +835,10 @@ describe("Code Mode bridge projects the send-budget notice into the guest value"
     return settled.value as Record<string, unknown>;
   }
 
-  function createBridgeMessageTool(config: Record<string, unknown>) {
+  function createBridgeMessageTool(
+    config: Record<string, unknown>,
+    options: { toolResult?: AgentToolResult<unknown> } = {},
+  ) {
     return createMessageTool({
       currentChannelProvider: "reef",
       currentChannelId: "reef:operator",
@@ -837,6 +855,7 @@ describe("Code Mode bridge projects the send-budget notice into the guest value"
           to: peerTarget,
           handledBy: "plugin",
           payload: {},
+          ...(options.toolResult ? { toolResult: options.toolResult } : {}),
           dryRun: false,
         }) satisfies MessageActionResult) as never,
       resolveCommandSecretRefsViaGateway: (async ({ config: cfg }: { config: unknown }) => ({
@@ -909,6 +928,48 @@ describe("Code Mode bridge projects the send-budget notice into the guest value"
     );
     expect(second).toMatchObject({
       turnSendNotice: expect.stringContaining("already sent 2 messages"),
+    });
+  });
+
+  it("projects the whole details-less plugin result rather than undefined when a nudge is appended", async () => {
+    // A plugin toolResult with content but no `details` key at all. The SDK helpers
+    // always set details, but a plugin returning a raw envelope need not, and the cast
+    // deliberately models that details-less runtime shape. The notice-append path must
+    // not materialize `details: undefined` on such an envelope: Code Mode's projection
+    // discriminates on presence (`"details" in result`), so an added undefined details
+    // key would surface to the guest as `undefined` instead of the real envelope.
+    const detailsLessToolResult = {
+      content: [{ type: "text" as const, text: "delivered via plugin" }],
+    } as AgentToolResult<unknown>;
+    const messageTool = createBridgeMessageTool({}, { toolResult: detailsLessToolResult });
+    const { catalogRef, runtime } = buildRuntime([messageTool]);
+    const input = { action: "send", channel: "reef", to: peerTarget, message: "hi" };
+
+    // First send: no nudge. With no details to project, the guest receives the whole
+    // envelope, so the value is defined.
+    const first = await projectViaBridge({ runtime, catalogRef, toolName: "message", input });
+    expect(first.ok).toBe(true);
+    if (!first.ok) {
+      throw new Error(first.error);
+    }
+    expect(first.value).toBeDefined();
+
+    // Second send: a turn-send nudge is appended. Before the fix this materialized
+    // `details: undefined` and the guest saw `undefined`; now the details-less
+    // envelope is preserved and carries the appended nudge in its content.
+    const second = await projectViaBridge({ runtime, catalogRef, toolName: "message", input });
+    expect(second.ok).toBe(true);
+    if (!second.ok) {
+      throw new Error(second.error);
+    }
+    expect(second.value).toBeDefined();
+    expect(second.value).toMatchObject({
+      content: expect.arrayContaining([
+        expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining("already sent 2 messages"),
+        }),
+      ]),
     });
   });
 });

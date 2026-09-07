@@ -771,10 +771,17 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       // it too; the content append is unchanged. Only turnSendNotice rides in details
       // (the normalization notice stays presentation-only), and only when the result
       // already carries a plain-object details to extend.
+      //
+      // Replace details only when there is a real record to augment. `...baseResult`
+      // already carries the producer's original details key exactly (present or
+      // absent); adding an explicit `details: undefined` here would materialize a key
+      // that Code Mode's presence-based projection ("details" in result) then returns
+      // as undefined, so a details-less plugin result would reach the guest as
+      // undefined instead of its real envelope.
       const detailsWithNotice =
         turnSendNotice && isRecord(baseResult.details)
           ? { ...baseResult.details, turnSendNotice }
-          : baseResult.details;
+          : undefined;
       return attachEmbeddedMessageDeliveryFact(
         {
           ...baseResult,
@@ -782,7 +789,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             ...baseResult.content,
             ...appendedNotices.map((text) => ({ type: "text" as const, text })),
           ],
-          details: detailsWithNotice,
+          ...(detailsWithNotice ? { details: detailsWithNotice } : {}),
         },
         messageDelivery,
       );
