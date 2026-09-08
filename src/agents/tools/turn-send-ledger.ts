@@ -30,6 +30,14 @@ import { normalizeAccountId } from "../../routing/account-id.js";
 import { normalizeMessageChannel } from "../../utils/message-channel-normalize.js";
 
 type TurnSendSlot = {
+  // Monotonic identity of this exact slot instance. Every reserve that opens a slot for a
+  // (session, run) pair stamps the next generation; the terminal clear deletes the slot,
+  // so a later turn reusing the same logical key (an isolated cron reuses its durable
+  // session id as runId) opens a distinct generation. A reservation captures the generation
+  // it reserved against and settles only while it still matches — so a settlement that
+  // arrives after its slot was cleared, or after a newer turn reopened the key, is a no-op
+  // and can neither resurrect a cleared slot nor mutate a newer one's counts.
+  generation: number;
   // Sends that have landed this turn, per target. Admission compares committed +
   // pending against the cap; peek and the nudge read this committed count.
   committed: Map<string, number>;
@@ -52,6 +60,13 @@ type TurnSendSlot = {
 // runId is folded into the key — keying by sessionKey alone would let a later run's
 // reserve/commit evict an earlier still-live run's counts.
 const turnSendBySession = new Map<string, TurnSendSlot>();
+
+// Process-monotonic slot generation, never reset (not even by the test reset below): a
+// stamped generation must stay globally unique for the process lifetime so a reservation
+// captured before a reset can never collide with a fresh slot that happens to reuse a
+// recycled counter value. Only ever incremented, so two distinct slot instances — even for
+// the same logical key across turns — always carry different generations.
+let nextSlotGeneration = 1;
 
 // The map key `${sessionKey}\0${runId}`. The NUL separator can't appear in either
 // component, so distinct (session, run) pairs never collide.
@@ -127,19 +142,24 @@ export function buildTurnSendTargetKey(params: {
   return `${channel}\0${normalizeAccountId(params.accountId)}\0${target}`;
 }
 
-// The (session, run) slot, or a fresh one when that pair has no entry. A different run
-// on the same session is a distinct key, so it naturally gets its own fresh slot instead
-// of evicting this one. Shared by reserve and commit so committed counts, pending
-// reservations, and seen-operation ids live — and reset only at the run's terminal
-// boundary — together. Callers mutate the returned slot and reseat it via storeSlot.
-function liveSlotForTurn(sessionKey: string, runId: string): TurnSendSlot {
-  return (
-    turnSendBySession.get(ledgerKey(sessionKey, runId)) ?? {
-      committed: new Map<string, number>(),
-      pending: new Map<string, number>(),
-      seenOperations: new Set<string>(),
-    }
-  );
+// The live (session, run) slot, or a fresh one — with the next generation stamped — when
+// that pair has no entry yet. Only reserveTurnSend calls this: a reservation is the one
+// event that may open a slot, and only its reserved branch stores the fresh slot, so a
+// rejected reserve (replay/exhausted) never leaves an empty slot behind. commit/release/peek
+// never open a slot; they read the stored instance and no-op when it is absent, so a
+// settlement can't resurrect a slot the terminal already cleared. A different run on the same
+// session is a distinct key, so it naturally opens its own slot instead of evicting this one.
+function openSlotForReservation(sessionKey: string, runId: string): TurnSendSlot {
+  const existing = turnSendBySession.get(ledgerKey(sessionKey, runId));
+  if (existing) {
+    return existing;
+  }
+  return {
+    generation: nextSlotGeneration++,
+    committed: new Map<string, number>(),
+    pending: new Map<string, number>(),
+    seenOperations: new Set<string>(),
+  };
 }
 
 type ReservationState = "reserved" | "committed" | "released";
@@ -149,11 +169,15 @@ type ReservationState = "reserved" | "committed" | "released";
  * across the awaited delivery, then settle it exactly once — commitTurnSend when the
  * send landed, releaseTurnSend when it did not. The mutable `state` makes a second
  * settle a no-op, so a double commit/release or a commit-after-release cannot corrupt
- * the counts.
+ * the counts. `generation` pins the reservation to the exact slot instance it reserved
+ * against: a settle whose slot was cleared at its terminal, or replaced by a newer turn
+ * reusing the same logical key, no longer matches and is discarded — the counts of a
+ * cleared or newer slot are never touched.
  */
 export type TurnSendReservation = {
   readonly key: TurnSendKey;
   readonly operationId: string | undefined;
+  readonly generation: number;
   state: ReservationState;
 };
 
@@ -189,9 +213,8 @@ export function reserveTurnSend(
   options: { maxPerTurn?: number; operationId?: string },
 ): TurnSendReserveResult {
   const storeKey = ledgerKey(key.sessionKey, key.runId);
-  const slot = liveSlotForTurn(key.sessionKey, key.runId);
+  const slot = openSlotForReservation(key.sessionKey, key.runId);
   if (options.operationId !== undefined && slot.seenOperations.has(options.operationId)) {
-    storeSlot(storeKey, slot);
     return { status: "replay" };
   }
   const committed = slot.committed.get(key.targetKey) ?? 0;
@@ -205,7 +228,12 @@ export function reserveTurnSend(
   storeSlot(storeKey, slot);
   return {
     status: "reserved",
-    reservation: { key, operationId: options.operationId, state: "reserved" },
+    reservation: {
+      key,
+      operationId: options.operationId,
+      generation: slot.generation,
+      state: "reserved",
+    },
   };
 }
 
@@ -213,17 +241,22 @@ export function reserveTurnSend(
  * Settles a reservation whose delivery landed: moves it from pending to committed,
  * records its operationId so an idempotent replay is admitted past the cap without
  * recounting, and returns the resulting committed send count for the target (>= 2 means
- * the caller should nudge). Settles against the same (session, run) slot no matter how
- * long the awaited delivery took — the slot lives for the whole run. Idempotent: a
- * repeat call — or a commit after release — neither re-increments committed nor
- * re-decrements pending and simply reports the current committed count.
+ * the caller should nudge). Settles against the same slot instance it reserved against no
+ * matter how long the awaited delivery took — the slot lives for the whole run. Idempotent:
+ * a repeat call — or a commit after release — neither re-increments committed nor
+ * re-decrements pending and simply reports the current committed count. A settlement whose
+ * slot was already cleared at its terminal, or replaced by a newer turn reusing the same
+ * logical key (generation mismatch), is discarded: it returns 0 without opening or mutating
+ * any slot, so it can neither resurrect a cleared slot nor fire a nudge off a newer turn's
+ * counts.
  */
 export function commitTurnSend(reservation: TurnSendReservation): number {
   const { sessionKey, runId, targetKey } = reservation.key;
-  const storeKey = ledgerKey(sessionKey, runId);
-  const slot = liveSlotForTurn(sessionKey, runId);
+  const slot = turnSendBySession.get(ledgerKey(sessionKey, runId));
+  if (!slot || slot.generation !== reservation.generation) {
+    return 0;
+  }
   if (reservation.state !== "reserved") {
-    storeSlot(storeKey, slot);
     return slot.committed.get(targetKey) ?? 0;
   }
   reservation.state = "committed";
@@ -233,7 +266,6 @@ export function commitTurnSend(reservation: TurnSendReservation): number {
   if (reservation.operationId !== undefined) {
     slot.seenOperations.add(reservation.operationId);
   }
-  storeSlot(storeKey, slot);
   return committed;
 }
 
@@ -242,21 +274,23 @@ export function commitTurnSend(reservation: TurnSendReservation): number {
  * broadcast, or a throw): decrements only the pending count, leaving committed and the
  * seen-operation set untouched, so a failed send neither consumes the cap nor fires a
  * nudge. Idempotent and double-release safe via the reservation `state`; a no-op once
- * the reservation is committed or the turn's slot has already been cleared.
+ * the reservation is committed, once the turn's slot has already been cleared, or once a
+ * newer turn reopened the same logical key (generation mismatch) — a stale release must
+ * never decrement a newer slot's pending.
  */
 export function releaseTurnSend(reservation: TurnSendReservation): void {
   if (reservation.state !== "reserved") {
     return;
   }
-  reservation.state = "released";
   const { sessionKey, runId, targetKey } = reservation.key;
-  const storeKey = ledgerKey(sessionKey, runId);
-  const slot = turnSendBySession.get(storeKey);
-  if (!slot) {
+  const slot = turnSendBySession.get(ledgerKey(sessionKey, runId));
+  if (!slot || slot.generation !== reservation.generation) {
+    // The slot was cleared or replaced; the pending count this reservation took is already
+    // gone. Leave state "reserved" untouched — there is no live slot to release against.
     return;
   }
+  reservation.state = "released";
   releasePending(slot, targetKey);
-  storeSlot(storeKey, slot);
 }
 
 // Decrement one pending reservation for `targetKey`, dropping the map entry at zero so
@@ -286,29 +320,39 @@ export function peekTurnSendCount({ sessionKey, runId, targetKey }: TurnSendKey)
 }
 
 /**
- * Deletes the exact (session, run) slot at a logical run's terminal boundary, freeing
- * its per-target counts, pending reservations, and seen-operation ids. The logical-run
- * owner calls this from the fallback-chain `finally` in run-entry.ts after all owned
- * tool work has settled, so the budget survives internal retries and provider fallbacks
- * (same runId) and resets only when the run truly ends. Rebuilds the canonical ledger
- * session key the send tools write under (buildTurnSendLedgerSessionKey), so the deleted
- * composite key is byte-identical to theirs; deleting only the (session, run) pair
- * leaves a concurrent run on the same session — a distinct runId, hence a distinct key —
- * untouched. A missing agent id or session key, or an already-absent slot, is a harmless
- * no-op. This is the ledger's only delete path — nothing else ever removes a slot, so a
- * live run's counts can never be reclaimed out from under it; the terminal `finally` in
- * run-entry.ts guarantees every owned run reaches this boundary.
+ * A per-turn ledger slot's canonical scope: the exact (agentId, sessionKey, runId) the
+ * send tools wrote it under. `sessionKey` here is the already-canonicalized value the
+ * loopback grant resolved (canonicalizeMainSessionAlias), not a raw identity — the two
+ * can differ by main-alias folding, an empty-session `"main"` fallback, or an agent id
+ * derived from the session key, so a terminal owner must not reconstruct it from its own
+ * raw identity.
  */
-export function clearTurnSendLedgerForRun(args: {
+export type TurnSendLedgerScope = {
   sessionKey: string;
   runId: string;
   agentId?: string;
-}): void {
+};
+
+/**
+ * Deletes the exact (session, run) slot at a logical run's terminal boundary, freeing
+ * its per-target counts, pending reservations, and seen-operation ids. The logical-run owner
+ * calls this from the fallback-chain `finally` in run-entry.ts (and the cron terminal)
+ * after all owned tool work has settled, so the budget survives internal retries and
+ * provider fallbacks (same runId) and resets only when the run truly ends. Rebuilds the
+ * canonical ledger session key the send tools write under (buildTurnSendLedgerSessionKey).
+ * Callers must pass the prepared canonical scope rather than reconstructing raw identity;
+ * deleting only this runId's slot leaves a
+ * concurrent run on the same session — a distinct runId, hence a distinct key — untouched.
+ * A missing agent id or session key, or an already-absent slot, is a harmless no-op. This
+ * is the ledger's only delete path — nothing else ever removes a slot, so a live run's
+ * counts can never be reclaimed out from under it; the terminal `finally` in run-entry.ts
+ * guarantees every owned run reaches this boundary.
+ */
+export function clearTurnSendLedgerForRun(args: TurnSendLedgerScope): void {
   const ledgerSessionKey = buildTurnSendLedgerSessionKey(args.agentId, args.sessionKey);
-  if (!ledgerSessionKey) {
-    return;
+  if (ledgerSessionKey) {
+    turnSendBySession.delete(ledgerKey(ledgerSessionKey, args.runId));
   }
-  turnSendBySession.delete(ledgerKey(ledgerSessionKey, args.runId));
 }
 
 export function resetTurnSendLedgerForTest(): void {

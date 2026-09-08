@@ -241,6 +241,7 @@ async function runEmbeddedAgentViaCliBackend(
       timeoutMs: params.timeoutMs,
       runTimeoutOverrideMs: params.runTimeoutOverrideMs ?? params.timeoutMs,
       runId: params.runId,
+      onDeferredTurnSendLedgerScope: params.onDeferredTurnSendLedgerScope,
       lifecycleGeneration: params.lifecycleGeneration,
       lane: params.lane,
       extraSystemPrompt: params.extraSystemPrompt,

@@ -273,5 +273,53 @@ describe("runEmbeddedAgentEntry", () => {
       // The finally runs on the throw path too, so the run's slot is still cleared.
       expect(peekTurnSendCount(key)).toBe(0);
     });
+
+    it("drains a dispatched CLI candidate's canonical scope the raw identity cannot rebuild", async () => {
+      // A CLI candidate dispatched inside this embedded run commits under the loopback grant's
+      // canonical scope — a possibly agent-shifted, main-alias-folded key — and defers cleanup
+      // to run-entry through the owner callback. run-entry's terminal reconstructs
+      // only its own raw (agentId, sessionKey||sessionId) scope, which cannot resolve the
+      // canonical slot; the runId-keyed deferred drain in clearTurnSendLedgerForRun deletes it.
+      const runId = "ledger-cleanup-dispatched";
+      const grantAgentId = "reef";
+      const grantSession = "agent:reef:main";
+      const grantLedgerSessionKey = buildTurnSendLedgerSessionKey(grantAgentId, grantSession)!;
+      const grantKey = { sessionKey: grantLedgerSessionKey, runId, targetKey };
+      const { runEmbeddedAgentEntry } = await import("./run-entry.js");
+
+      await runEmbeddedAgentEntry({
+        selection: { cfg: {}, provider: "primary-provider", model: "primary-model" },
+        identity: { runId, agentId: "main", sessionId: "session-1" },
+        harness: {
+          workspaceDir: "/tmp/workspace",
+          preparation: { kind: "direct" },
+          resolveRuntimeOverride: () => undefined,
+        },
+        behavior: { kind: "command-rpc", hasCommittedSideEffect: () => false },
+        sessionOverride: { kind: "preserve" },
+        runCandidate: async (provider, model, options) => {
+          // The dispatched loopback tool commits under the canonical grant slot, then the
+          // candidate's CLI settlement defers its scope to this run's owner.
+          const reserved = reserveTurnSend(grantKey, {});
+          if (reserved.status === "reserved") {
+            commitTurnSend(reserved.reservation);
+          }
+          options.onDeferredTurnSendLedgerScope({
+            agentId: grantAgentId,
+            sessionKey: grantSession,
+            runId,
+          });
+          return makeResult({
+            provider,
+            model,
+            classification: options.isFinalFallbackAttempt ? undefined : "empty",
+          });
+        },
+      });
+
+      // run-entry's raw scope (agent "main", session "session-1") never resolves the canonical
+      // slot, yet the terminal drained it by runId.
+      expect(peekTurnSendCount(grantKey)).toBe(0);
+    });
   });
 });

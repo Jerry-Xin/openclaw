@@ -416,7 +416,7 @@ describe("conversations_send per-turn send budget", () => {
     details: unknown;
   }) {
     const blockedText = blockedNotice(result);
-    expect(blockedText).toContain("already sent");
+    expect(blockedText).toContain("configured limit");
     expect(Value.Check(ConversationSendToolResultSchema, result.details)).toBe(true);
     // The declared extra field is intentionally outside the closed Gateway schema;
     // this is exactly why conversations_send wires the tool-local superset.
@@ -764,7 +764,7 @@ describe("message and conversations_send share the per-turn budget", () => {
       status: "suppressed",
       conversationRef: conversation.conversationRef,
       channel: "reef",
-      turnSendNotice: expect.stringContaining("already sent 1 message(s)"),
+      turnSendNotice: expect.stringContaining("configured limit of 1 message(s)"),
     });
     // The blocked send never reached the Gateway.
     expect(deps.callGatewayMock).not.toHaveBeenCalled();

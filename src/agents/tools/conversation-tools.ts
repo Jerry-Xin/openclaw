@@ -288,7 +288,10 @@ export function createConversationsSendTool(
         // block reason rides in that declared details field (not only text content) so
         // it survives Code Mode's details projection while Code Mode's output-schema
         // check (assertCatalogOutputMatchesSchema) still passes.
-        const blockedNotice = `Blocked: already sent ${maxPerTurn} message(s) to this conversation this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`;
+        // Report the configured per-turn limit, not a delivered count: admission is
+        // blocked on committed + in-flight pending reaching the cap, so the number actually
+        // delivered to this conversation may be fewer than `maxPerTurn`.
+        const blockedNotice = `Blocked: reached this turn's configured limit of ${maxPerTurn} message(s) to this conversation (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`;
         return textResult(blockedNotice, {
           status: "suppressed" as const,
           conversationRef,

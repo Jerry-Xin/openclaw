@@ -4,7 +4,10 @@ import {
   createAgentRunRestartAbortError,
   resolveAgentRunErrorLifecycleFields,
 } from "../../agents/run-termination.js";
-import { clearTurnSendLedgerForRun } from "../../agents/tools/turn-send-ledger.js";
+import {
+  clearTurnSendLedgerForRun,
+  type TurnSendLedgerScope,
+} from "../../agents/tools/turn-send-ledger.js";
 import { createAgentLifecycleTerminalBackstop } from "../../auto-reply/reply/agent-lifecycle-terminal.js";
 import { cleanupBrowserSessionsForLifecycleEnd } from "../../browser-lifecycle-cleanup.js";
 import { canonicalizeMainSessionAlias } from "../../config/sessions/main-session.js";
@@ -93,6 +96,7 @@ export async function runCronIsolatedAgentTurn(
   const abortReason = () =>
     resolveCronAbortReasonText(abortSignal?.reason) ?? "cron: job execution timed out";
   const isFastTestEnv = isFastTestRuntimeEnv();
+  const deferredTurnSendLedgerScopes = new Set<TurnSendLedgerScope>();
   let prepared: Awaited<ReturnType<typeof prepareCronRunContext>>;
   try {
     prepared = await prepareCronRunContext({
@@ -271,6 +275,7 @@ export async function runCronIsolatedAgentTurn(
               runTimeoutOverrideMs: prepared.context.runTimeoutOverrideMs,
               suppressExecNotifyOnExit: prepared.context.suppressExecNotifyOnExit,
               executionIdentity: params.executionIdentity,
+              onDeferredTurnSendLedgerScope: (scope) => deferredTurnSendLedgerScopes.add(scope),
             };
             const execution = await prepared.context.sessionWorkAdmission.run(() =>
               withAgentRunLifecycleGeneration(runLifecycleGeneration, () =>
@@ -416,13 +421,9 @@ export async function runCronIsolatedAgentTurn(
     try {
       preparedRuntimeLease.release();
     } finally {
-      // Guarantee the per-turn send budget is released at the cron logical-run terminal,
-      // even if a candidate deferred its own cleanup (a non-final fallback failure) and the
-      // fallback chain then threw before a later candidate settled. Cron reuses its durable
-      // session id as the runId, so a leaked slot would suppress the next scheduled turn's
-      // genuine send. The key mirrors the loopback grant exactly (resolveCliMcpSessionKey
-      // canonicalizes the main alias); the CLI settlement terminal clears the same slot on
-      // ordinary success/failure, so this is a bounded safety net, not the primary owner.
+      // Release the native scope plus every exact prepared CLI scope deferred by a
+      // non-final candidate. Cron reuses its durable session id as runId, so leaked counts
+      // would suppress the next scheduled turn.
       try {
         clearTurnSendLedgerForRun({
           agentId: prepared.context.agentId,
@@ -433,6 +434,9 @@ export async function runCronIsolatedAgentTurn(
           }),
           runId: initialSessionId,
         });
+        for (const scope of deferredTurnSendLedgerScopes) {
+          clearTurnSendLedgerForRun(scope);
+        }
       } catch (ledgerError) {
         logWarn(
           `[cron:${params.job.id}] Failed to clear per-turn send ledger during cleanup: ${String(ledgerError)}`,

@@ -71,6 +71,7 @@ import type { RootedExecutionRequest } from "../rooted-run-params.js";
 import type { ScheduledToolPolicyContext } from "../scheduled-tool-policy.js";
 import type { SessionManager } from "../sessions/index.js";
 import type { SilentReplyPromptMode } from "../system-prompt.types.js";
+import type { TurnSendLedgerScope } from "../tools/turn-send-ledger.js";
 
 export type NodeClaudePlacement = { nodeId: string; cwd?: string };
 
@@ -87,6 +88,8 @@ type CliSessionRetryParams = {
 
 /** Input contract for one CLI-backed agent run. */
 export type RunCliAgentParams = {
+  /** Gives the logical-run owner the exact prepared scope to clear at its terminal. */
+  onDeferredTurnSendLedgerScope?: (scope: TurnSendLedgerScope) => void;
   admittedRunContext?: AdmittedRunContext;
   preparedRunAdmission?: PreparedAgentRunAdmission;
   /** Core lifecycle owner; never forwarded to the plugin execution context. */
@@ -427,5 +430,5 @@ export type PreparedCliRunContext = {
   // isolated cron durable-session-id-as-runId case — does not inherit a prior turn's
   // committed counts or seen operationIds. Absent when no loopback grant was minted
   // (no OpenClaw tools ran, so nothing was written).
-  turnSendLedgerScope?: { agentId?: string; sessionKey: string; runId: string };
+  turnSendLedgerScope?: TurnSendLedgerScope;
 };

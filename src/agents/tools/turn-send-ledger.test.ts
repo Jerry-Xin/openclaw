@@ -431,3 +431,46 @@ describe("turn-send-ledger run terminal cleanup", () => {
     expect(() => clearTurnSendLedgerForRun({ sessionKey: session, runId: "run-X" })).not.toThrow();
   });
 });
+
+describe("turn-send-ledger stale settlement across a slot generation", () => {
+  const agentId = "main";
+  const session = "agent:main:a";
+  const ledger = buildTurnSendLedgerSessionKey(agentId, session)!;
+  const key = { sessionKey: ledger, runId: "run-X", targetKey: "tg:a" };
+
+  it("discards a commit that lands after its slot was cleared, never resurrecting it", () => {
+    // A send is admitted (pending) and the run's terminal clears the slot while it is still
+    // in flight. When delivery finally lands, the commit must be discarded: pre-fix,
+    // commitTurnSend recreated a fresh slot and set committed=1, resurrecting a run whose
+    // budget had already been released.
+    const reservation = expectReserved(reserveTurnSend(key, {}));
+    clearTurnSendLedgerForRun({ agentId, sessionKey: session, runId: "run-X" });
+    expect(commitTurnSend(reservation)).toBe(0);
+    expect(peekTurnSendCount(key)).toBe(0);
+  });
+
+  it("discards a commit from an old reservation after the same key reopened for a new turn", () => {
+    // Turn 1 admits a send that is still in flight; its terminal clears the slot. Turn 2
+    // reuses the same logical key (an isolated cron reuses its durable session id as runId)
+    // and commits its own send. Turn 1's delayed delivery then lands — it must NOT mutate
+    // turn 2's slot. Pre-fix, the shared logical key let the stale commit push turn 2's
+    // committed count to 2; the generation guard discards it and the count stays 1.
+    const stale = expectReserved(reserveTurnSend(key, {}));
+    clearTurnSendLedgerForRun({ agentId, sessionKey: session, runId: "run-X" });
+    expect(commitOne(key, {})).toBe(1);
+    expect(commitTurnSend(stale)).toBe(0);
+    expect(peekTurnSendCount(key)).toBe(1);
+  });
+
+  it("discards a release from an old reservation, leaving the new turn's pending intact", () => {
+    // Same generation boundary, but the stale settlement is a release. It must not decrement
+    // the new turn's pending — otherwise a stale rollback would free a cap slot the new
+    // turn's in-flight send is holding, admitting a send past a positive cap.
+    const stale = expectReserved(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-old" }));
+    clearTurnSendLedgerForRun({ agentId, sessionKey: session, runId: "run-X" });
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-new" }).status).toBe("reserved");
+    releaseTurnSend(stale);
+    // The new turn's pending still occupies the single cap slot: a distinct op is exhausted.
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "op-2" }).status).toBe("exhausted");
+  });
+});

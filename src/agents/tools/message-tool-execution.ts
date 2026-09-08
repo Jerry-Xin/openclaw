@@ -556,7 +556,10 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         return jsonResult({
           status: "suppressed",
           reason: "turn_send_budget_exhausted",
-          message: `Blocked: already sent ${maxPerTurn} message(s) to this target this turn (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
+          // Report the configured per-turn limit, not a delivered count: admission is
+          // blocked on committed + in-flight pending reaching the cap, so the number
+          // actually delivered this turn may be fewer than `maxPerTurn`.
+          message: `Blocked: reached this turn's configured limit of ${maxPerTurn} message(s) to this target (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
         });
       }
       const hasCurrentMessageId =
@@ -733,14 +736,15 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       // this target onward, appends a one-line soft reminder unless turnSendNudge is
       // explicitly disabled. A `dry-run` result (e.g. no gateway) never counts.
       //
-      // A core send can return deliveryStatus "suppressed" (e.g. no_visible_payload)
-      // without reaching the peer; that must not consume the cap or fire a false
-      // nudge, so it releases the reservation instead. Only "suppressed" is checked
-      // because "failed"/"partial_failed" already throw upstream (message.ts) and never
-      // reach here, and plugin/gateway sends carry kind:"send" with no sendResult
-      // (deliveryStatus undefined) — those still count because delivery happened
-      // remotely. A `replay` reservation is left unsettled (the Gateway deduped it to
-      // the completed receipt), so it neither re-commits nor nudges.
+      // A core send can return deliveryStatus "suppressed" (e.g. no_visible_payload) or a
+      // best-effort "failed" (a delivery that did not reach the peer but was not raised as a
+      // throw) without reaching the peer; neither must consume the cap or fire a false
+      // nudge, so both release the reservation instead of committing. "partial_failed" and
+      // the throwing "failed" path already reject upstream (message.ts) and never reach here;
+      // plugin/gateway sends carry kind:"send" with no sendResult (deliveryStatus undefined)
+      // — those still count because delivery happened remotely. A `replay` reservation is
+      // left unsettled (the Gateway deduped it to the completed receipt), so it neither
+      // re-commits nor nudges.
       const deliveryStatus = result.kind === "send" ? result.sendResult?.deliveryStatus : undefined;
       const deliveredNothing = deliveryStatus === "suppressed" || deliveryStatus === "failed";
       let turnSendNotice: string | undefined;

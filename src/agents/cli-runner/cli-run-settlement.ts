@@ -105,33 +105,35 @@ export function isClaudeCliBackend(provider: string): boolean {
   return provider.trim().toLowerCase() === "claude-cli";
 }
 
-// The per-turn send budget spans the whole logical turn, including provider
-// fallbacks that reuse the runId (turn-send-ledger.ts). A prepared CLI run is one
-// fallback candidate, so settlement may delete the slot only at the turn's true
-// terminal:
-//   - A direct CLI owner (cron) drives its own runWithModelFallback and forwards
-//     isFinalFallbackAttempt to every candidate. Clear on a success (the chain stops
-//     on the first success) or the final attempt's failure; a non-final failure hands
-//     off to the next candidate, which must inherit the committed counts.
-//   - A CLI candidate dispatched inside an embedded/command-rpc run does NOT forward
-//     isFinalFallbackAttempt (it is undefined). Its logical terminal is owned by the
-//     embedded runner's fallback-chain finally (run-entry.ts), which clears the same
-//     slot after the whole chain. Deferring here keeps exactly one cleanup owner per
-//     terminal and never clears between that run's candidates.
-// Undefined therefore means "an outer owner will clear" (dispatch) or "no send tool
-// ran" (isolated completion, compaction), so settlement defers in both.
-// `threw` is settlement's real exceptional exit, not merely a failed run(): a post-run
-// settlement throw (e.g. auth-profile settlement) is a non-terminal exit for a
-// non-final candidate and must defer, exactly like a non-final run failure.
-function shouldClearTurnSendLedgerAtCliTerminal(
-  context: PreparedCliRunContext,
-  threw: boolean,
-): boolean {
-  const { isFinalFallbackAttempt } = context.params;
-  if (isFinalFallbackAttempt === undefined) {
-    return false;
-  }
-  return !threw || isFinalFallbackAttempt;
+// The per-turn send budget spans the whole logical turn, including provider fallbacks that
+// reuse the runId (turn-send-ledger.ts). A prepared CLI run is one fallback candidate, so
+// per-candidate settlement is the ledger's terminal owner ONLY for the final candidate of a
+// chain that forwards isFinalFallbackAttempt to its candidates and marks the last one true.
+// Two owners drive such a chain: cron (its own runWithModelFallback in isolated-agent/run.ts)
+// and auto-reply channel delivery (which re-forwards the flag into the CLI runParams via
+// agent-runner-cli-candidate.ts). Every other candidate defers to an outer logical-run owner
+// and must NOT clear:
+//   - isFinalFallbackAttempt === false — a non-final candidate of a flag-forwarding chain. A
+//     later candidate reuses this runId and must inherit the committed counts. Even a candidate
+//     that returns without throwing is not terminal: runWithModelFallback may reclassify a
+//     "successful" result as retryable and drive another candidate, so a non-throwing non-final
+//     candidate is NOT evidence the chain stopped. The enclosing owner's `finally` clears after
+//     the whole chain and covers an early success that does end it.
+//   - isFinalFallbackAttempt === undefined — a CLI candidate dispatched inside an
+//     embedded/command-rpc run (cli-backend-dispatch.ts strips the flag), or a run with no send
+//     tool. It never forwards the flag; the embedded runner's fallback-chain `finally`
+//     (run-entry.ts) owns the terminal and clears the same runId after the whole chain.
+// Every one of these paths — cron, auto-reply, and embedded dispatch — has an enclosing owner
+// whose terminal `finally` clears this runId (isolated-agent/run.ts or run-entry.ts), so a
+// deferred candidate always reaches one. It hands its prepared canonical scope to that owner via
+// the owner callback so it deletes the exact loopback-written slot it cannot rebuild from its
+// own raw identity. On the final candidate the self-clear here and the
+// enclosing finally overlap on one runId — a harmless double-delete, since the final candidate
+// runs last with no later send. Clearing was previously gated on `!threw`, which wrongly treated
+// a non-throwing but retryable non-final candidate as terminal and wiped the counts the next
+// candidate needed.
+function isCliSettlementTurnSendLedgerTerminal(context: PreparedCliRunContext): boolean {
+  return context.params.isFinalFallbackAttempt === true;
 }
 
 export async function assertCliRuntimeBinding(context: PreparedCliRunContext): Promise<void> {
@@ -203,11 +205,6 @@ export async function settlePreparedCliRun(params: {
   const runParams = context.params;
   let result: EmbeddedAgentRunResult | undefined;
   let runError: unknown;
-  // Tracks whether settlement reached its normal return. `runError` only records a
-  // failed run(); an exception raised by post-run settlement (e.g. auth-profile
-  // settlement) leaves it undefined even though we exit exceptionally, so the
-  // finally must gate on real control flow, not on `runError`.
-  let completedNormally = false;
   try {
     result = await run();
   } catch (error) {
@@ -290,21 +287,21 @@ export async function settlePreparedCliRun(params: {
     if (runError) {
       throw runError instanceof Error ? runError : new Error(formatErrorMessage(runError));
     }
-    completedNormally = true;
     return result as EmbeddedAgentRunResult;
   } finally {
-    // Delete the exact per-turn send slot at the logical-run terminal so a reused
-    // runId (isolated cron reuses its durable session id) starts the next turn with
-    // a fresh budget. Gated to the true terminal so fallback candidates that hand
-    // off to the next attempt keep the turn's committed counts intact. `threw` is the
-    // real exceptional exit (`!completedNormally`), so a post-run settlement failure
-    // on a non-final candidate defers like a non-final run failure instead of wiping
-    // the turn's counts mid-chain.
-    if (
-      context.turnSendLedgerScope &&
-      shouldClearTurnSendLedgerAtCliTerminal(context, !completedNormally)
-    ) {
-      clearTurnSendLedgerForRun(context.turnSendLedgerScope);
+    // Release the per-turn send slot at the logical-run terminal so a reused runId
+    // (isolated cron reuses its durable session id) starts the next turn with a fresh
+    // budget. Only the final candidate of a directly-driven chain is terminal here; every
+    // other candidate hands its prepared canonical scope to the outer logical-run owner
+    // (cron's isolated-agent/run.ts finally, or the embedded run-entry.ts finally) so that
+    // owner deletes the exact loopback-written slot at the true terminal — never mid-chain,
+    // where a later candidate still needs the committed counts.
+    if (context.turnSendLedgerScope) {
+      if (isCliSettlementTurnSendLedgerTerminal(context)) {
+        clearTurnSendLedgerForRun(context.turnSendLedgerScope);
+      } else {
+        context.params.onDeferredTurnSendLedgerScope?.(context.turnSendLedgerScope);
+      }
     }
   }
 }
