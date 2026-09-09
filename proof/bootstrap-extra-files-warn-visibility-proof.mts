@@ -12,12 +12,14 @@
  *
  * PART A — bootstrap-extra-files resolution warn (src/hooks/bundled/bootstrap-extra-files/handler.ts):
  *   A genuine non-ENOENT glob fault (the same EACCES injection handler.test.ts:167
- *   uses) makes resolveExtraBootstrapPatternPaths rethrow -> the loader records an
+ *   uses) makes fs.glob itself throw, so resolveExtraBootstrapPatternPaths hits its
+ *   top-level outer catch and rethrows the non-ENOENT fault -> the loader records an
  *   `io` diagnostic -> the handler routes io/security to log.warn. Proven visible at
  *   the default info level; benign "missing" skips stay at log.debug and stay hidden.
- *   This also exercises the non-ENOENT matched-path propagation in
+ *   This drives the top-level walk-failure path in
  *   src/agents/workspace-extra-bootstrap-walker.ts (throw error -> outer catch ->
- *   loader io diagnostic).
+ *   loader io diagnostic), which stays a rethrow under per-match isolation; the
+ *   per-matched-path branch instead records each failure without aborting the walk.
  *
  * PART B — slow bootstrap-context substage breakdown (src/agents/embedded-agent-runner/run/attempt-bootstrap-prepare.ts):
  *   When bootstrap-context assembly exceeds 2000ms the runner now emits the

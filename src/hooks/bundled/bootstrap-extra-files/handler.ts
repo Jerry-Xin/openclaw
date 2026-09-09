@@ -25,18 +25,15 @@ const bootstrapExtraFilesHook: HookHandler = async (event) => {
     const failures = diagnostics.filter((d) => d.reason === "io" || d.reason === "security");
     const benign = diagnostics.filter((d) => d.reason !== "io" && d.reason !== "security");
     if (failures.length > 0) {
-      log.warn(
-        `bootstrap extra-file resolution failed for ${failures.length} configured pattern(s)`,
-        {
-          failed: failures.length,
-          reasons: {
-            io: failures.filter((d) => d.reason === "io").length,
-            security: failures.filter((d) => d.reason === "security").length,
-          },
-          paths: failures.map((d) => d.path),
-          hint: "check hook bootstrap paths, workspace containment, and file permissions",
+      log.warn(`bootstrap extra-file resolution failed for ${failures.length} path(s)`, {
+        failed: failures.length,
+        reasons: {
+          io: failures.filter((d) => d.reason === "io").length,
+          security: failures.filter((d) => d.reason === "security").length,
         },
-      );
+        paths: failures.map((d) => d.path),
+        hint: "check hook bootstrap paths, workspace containment, and file permissions",
+      });
     }
     if (benign.length > 0) {
       log.debug("skipped extra bootstrap candidates", {

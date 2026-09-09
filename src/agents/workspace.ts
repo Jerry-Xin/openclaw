@@ -37,12 +37,12 @@ import {
   readWorkspaceBootstrapFile,
 } from "./workspace-bootstrap-read.js";
 import { DEFAULT_AGENT_WORKSPACE_DIR } from "./workspace-default.js";
-import { readWorkspaceFileCache, writeWorkspaceFileCache } from "./workspace-file-cache.js";
 import {
   hasGlobPattern,
   patternWalkRootStaysInWorkspace,
   resolveExtraBootstrapPatternPaths,
 } from "./workspace-extra-bootstrap-walker.js";
+import { readWorkspaceFileCache, writeWorkspaceFileCache } from "./workspace-file-cache.js";
 import {
   assertNoUnmigratedWorkspaceState,
   LEGACY_WORKSPACE_STATE_CURRENT_FILENAME,
@@ -1444,9 +1444,19 @@ export async function loadExtraBootstrapFilesWithDiagnostics(
     }
     try {
       if (hasGlobPattern(pattern)) {
-        const matches = await resolveExtraBootstrapPatternPaths(resolvedDir, pattern);
+        const { matches, failures } = await resolveExtraBootstrapPatternPaths(resolvedDir, pattern);
         for (const match of matches) {
           resolvedPaths.add(match);
+        }
+        // Per-match isolation: a readable match loads normally while each match
+        // that failed canonicalization surfaces as its own `io` diagnostic keyed
+        // to that path, instead of one failing match discarding the whole pattern.
+        for (const failure of failures) {
+          diagnostics.push({
+            path: path.resolve(resolvedDir, failure.path),
+            reason: "io",
+            detail: failure.detail,
+          });
         }
       } else {
         // A pattern with no `? * { }` is a literal path — square brackets stay

@@ -329,13 +329,28 @@ async function* walkFallbackMatches(
   }
 }
 
+// A matched path the resolver could not canonicalize (a non-ENOENT realpath
+// fault: EACCES/ELOOP/…). Recorded per match instead of aborting the walk, so a
+// readable sibling still resolves; the loader surfaces each as its own `io`
+// diagnostic keyed to `path` (workspace-relative POSIX, matching the returned
+// match keys). `detail` carries the underlying fs error message.
+export type ExtraBootstrapMatchFailure = { path: string; detail: string };
+
+// Resolver result: readable matches plus per-match canonicalization failures.
+// The failures list preserves the specific unreadable matched paths so the
+// loader reports each individually rather than collapsing a whole pattern.
+export type ExtraBootstrapResolution = {
+  matches: string[];
+  failures: ExtraBootstrapMatchFailure[];
+};
+
 // Resolve a glob pattern to workspace-relative POSIX paths, keeping only matches
 // whose realpath stays inside the workspace root. fs.glob owns matching where
 // available; a runtime without it uses the local Minimatch walk fallback.
 export async function resolveExtraBootstrapPatternPaths(
   workspaceDir: string,
   pattern: string,
-): Promise<string[]> {
+): Promise<ExtraBootstrapResolution> {
   const normalizedPattern = normalizeWorkspacePatternPath(pattern);
   // Canonical workspace root bounds containment: a symlinked workspace dir
   // (macOS /var -> /private/var) must compare against its realpath, not its
@@ -347,6 +362,7 @@ export async function resolveExtraBootstrapPatternPaths(
     workspaceRealpath = path.resolve(workspaceDir);
   }
   const matches = new Set<string>();
+  const failures: ExtraBootstrapMatchFailure[] = [];
   // Capability branch: fs.glob is the matcher wherever it exists; the local walk
   // keeps configured patterns resolving where it is absent. Narrow by design — it
   // switches on the missing API only and never swallows a real fs.glob error.
@@ -368,17 +384,20 @@ export async function resolveExtraBootstrapPatternPaths(
       } catch (error) {
         // ENOENT here is a benign delete-race: the entry vanished between
         // fs.glob yielding it and this realpath, so skip that one match. Any
-        // other failure (EACCES/ELOOP/…) is a real fault on a matched file and
-        // is rethrown so the outer catch reaches the loader, which surfaces a
-        // per-pattern `io` diagnostic instead of a silently empty match set.
-        // Tradeoff: one failing match degrades its whole pattern to that io
-        // diagnostic; per-match surfacing would need a wider return signature,
-        // deliberately out of scope.
+        // other failure (EACCES/ELOOP/…) is a real fault on this matched file,
+        // recorded against its own path and skipped so readable sibling matches
+        // still resolve. The loader turns each recorded failure into its own
+        // operator-visible `io` diagnostic keyed to that matched path — per-match
+        // isolation, replacing the earlier all-or-nothing pattern-level throw.
         // SAFETY: Node fs failures carry an ErrnoException-shaped `code`; the cast only reads that property.
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
           continue;
         }
-        throw error;
+        failures.push({
+          path: toPortableMatchPath(relativeMatch),
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        continue;
       }
       if (isPathInside(workspaceRealpath, realpath)) {
         matches.add(toPortableMatchPath(relativeMatch));
@@ -395,7 +414,7 @@ export async function resolveExtraBootstrapPatternPaths(
       throw error;
     }
   }
-  return [...matches];
+  return { matches: [...matches], failures };
 }
 
 // Loader security pre-gate: reject a pattern whose leading literal directory
