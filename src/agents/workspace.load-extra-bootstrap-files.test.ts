@@ -99,13 +99,15 @@ describe("loadExtraBootstrapFilesWithDiagnostics", () => {
     }
   });
 
-  it("surfaces an io diagnostic when a matched path fails realpath for a non-ENOENT reason", async () => {
+  it("surfaces a per-match io diagnostic keyed to the matched path when its realpath fails (non-ENOENT)", async () => {
     // F1 (matched-path branch): fs.glob yields a match but its per-match
     // fs.realpath fails with a non-ENOENT error (EACCES). That is a real fault on
-    // a matched bootstrap file, so the walker rethrows and the loader surfaces an
-    // operator-visible `io` diagnostic instead of swallowing it into an empty
-    // match set. Pre-fix the inner catch continued on every error, dropping the
-    // match silently with no diagnostic.
+    // a matched bootstrap file, so per-match isolation records it and surfaces an
+    // operator-visible `io` diagnostic keyed to THAT matched path (not the whole
+    // pattern). Here the only match fails, so no files load; the mixed-success
+    // case below proves readable siblings still load. Pre-fix the inner catch
+    // rethrew, collapsing the whole pattern to one io diagnostic keyed to the
+    // pattern path rather than the matched file.
     const workspaceDir = await createWorkspaceDir("realpath-io-failure");
     await fs.mkdir(path.join(workspaceDir, "pkg"), { recursive: true });
     await fs.writeFile(path.join(workspaceDir, "pkg", "AGENTS.md"), "agents", "utf-8");
@@ -133,11 +135,101 @@ describe("loadExtraBootstrapFilesWithDiagnostics", () => {
       expect(files).toHaveLength(0);
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0]?.reason).toBe("io");
+      // The diagnostic names the specific matched path, not the configured pattern.
+      expect(diagnostics[0]?.path).toBe(path.join(workspaceDir, "pkg", "AGENTS.md"));
       expect(diagnostics[0]?.detail).toContain("simulated realpath EACCES");
     } finally {
       realpathSpy.mockRestore();
       globSpy.mockRestore();
     }
+  });
+
+  it("loads readable sibling matches while surfacing a per-match io diagnostic for an unreadable match", async () => {
+    // Per-match isolation (Option 1), native fs.glob path: a pattern matches a
+    // readable file AND an unreadable one (EACCES on realpath). The readable
+    // sibling still LOADS; the failed match surfaces as its OWN io diagnostic
+    // keyed to that path. Pre-fix the walker rethrew on the first bad match, so
+    // the readable sibling was silently discarded and the loader reported a
+    // single io diagnostic keyed to the pattern — the all-or-nothing regression.
+    const workspaceDir = await createWorkspaceDir("mixed-success-native");
+    await fs.mkdir(path.join(workspaceDir, "good"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "bad"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "good", "AGENTS.md"), "good agents", "utf-8");
+    await fs.writeFile(path.join(workspaceDir, "bad", "AGENTS.md"), "bad agents", "utf-8");
+
+    const globSpy = vi.spyOn(fs, "glob").mockImplementation((() =>
+      (async function* () {
+        yield path.join("good", "AGENTS.md");
+        yield path.join("bad", "AGENTS.md");
+      })()) as unknown as typeof fs.glob);
+    const realpathError = Object.assign(new Error("simulated realpath EACCES"), { code: "EACCES" });
+    const realpathSpy = vi.spyOn(fs, "realpath").mockImplementation((async (
+      target: Parameters<typeof fs.realpath>[0],
+    ) => {
+      if (target.toString().includes(`${path.sep}bad${path.sep}`)) {
+        throw realpathError;
+      }
+      return target.toString();
+    }) as unknown as typeof fs.realpath);
+
+    try {
+      const { files, diagnostics } = await loadExtraBootstrapFilesWithDiagnostics(workspaceDir, [
+        "**/AGENTS.md",
+      ]);
+      expect(
+        files.map((file) => path.relative(workspaceDir, file.path).replaceAll(path.sep, "/")),
+      ).toStrictEqual(["good/AGENTS.md"]);
+      expect(files[0]?.content).toBe("good agents");
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]?.reason).toBe("io");
+      expect(diagnostics[0]?.path).toBe(path.join(workspaceDir, "bad", "AGENTS.md"));
+      expect(diagnostics[0]?.detail).toContain("simulated realpath EACCES");
+    } finally {
+      realpathSpy.mockRestore();
+      globSpy.mockRestore();
+    }
+  });
+
+  it("isolates a per-match failure under the fs.glob-absent fallback walk (parity)", async () => {
+    // The per-match isolation lives in the ONE shared realpath-containment filter
+    // that BOTH the native fs.glob path and the capability fallback walk feed
+    // through, so the fallback must show the same mixed-success outcome: the
+    // readable sibling loads and the failed match becomes its own io diagnostic.
+    await withoutFsGlob(async () => {
+      const workspaceDir = await createWorkspaceDir("mixed-success-fallback");
+      await fs.mkdir(path.join(workspaceDir, "good"), { recursive: true });
+      await fs.mkdir(path.join(workspaceDir, "bad"), { recursive: true });
+      await fs.writeFile(path.join(workspaceDir, "good", "AGENTS.md"), "good agents", "utf-8");
+      await fs.writeFile(path.join(workspaceDir, "bad", "AGENTS.md"), "bad agents", "utf-8");
+
+      const realpathError = Object.assign(new Error("simulated realpath EACCES"), {
+        code: "EACCES",
+      });
+      const realpathSpy = vi.spyOn(fs, "realpath").mockImplementation((async (
+        target: Parameters<typeof fs.realpath>[0],
+      ) => {
+        if (target.toString().includes(`${path.sep}bad${path.sep}`)) {
+          throw realpathError;
+        }
+        return target.toString();
+      }) as unknown as typeof fs.realpath);
+
+      try {
+        const { files, diagnostics } = await loadExtraBootstrapFilesWithDiagnostics(workspaceDir, [
+          "**/AGENTS.md",
+        ]);
+        expect(
+          files.map((file) => path.relative(workspaceDir, file.path).replaceAll(path.sep, "/")),
+        ).toStrictEqual(["good/AGENTS.md"]);
+        expect(files[0]?.content).toBe("good agents");
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0]?.reason).toBe("io");
+        expect(diagnostics[0]?.path).toBe(path.join(workspaceDir, "bad", "AGENTS.md"));
+        expect(diagnostics[0]?.detail).toContain("simulated realpath EACCES");
+      } finally {
+        realpathSpy.mockRestore();
+      }
+    });
   });
 
   it("resolves a missing workspace cwd to no matches without a diagnostic (ENOENT)", async () => {

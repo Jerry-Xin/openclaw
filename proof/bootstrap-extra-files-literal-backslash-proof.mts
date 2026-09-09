@@ -151,7 +151,7 @@ async function main(): Promise<void> {
 
   try {
     // -- CHECK 1: the resolver returns the backslash match with the byte intact --
-    const matches = await resolveExtraBootstrapPatternPaths(workspace, "**/AGENTS.md");
+    const { matches } = await resolveExtraBootstrapPatternPaths(workspace, "**/AGENTS.md");
     const matchesSorted = [...matches].toSorted();
     const backslashByteIntact =
       matches.includes(expectedBackslashMatch) &&

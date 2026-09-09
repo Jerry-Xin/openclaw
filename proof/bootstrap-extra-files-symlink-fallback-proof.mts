@@ -184,7 +184,9 @@ async function main(): Promise<void> {
     w("");
 
     // -- CHECK 1: the fallback resolver descends the symlink and returns the match --
-    const matches = (await resolveExtraBootstrapPatternPaths(workspace, PATTERN)).toSorted();
+    const matches = (
+      await resolveExtraBootstrapPatternPaths(workspace, PATTERN)
+    ).matches.toSorted();
     check1 = matches.includes("pkg/linked/AGENTS.md") && !matches.some((m) => m.includes("escape")); // the escaping link contributes nothing
 
     w("-- CHECK 1: fallback resolver descends pkg/linked and returns its contained match --");
@@ -232,7 +234,10 @@ async function main(): Promise<void> {
 
     // -- CHECK 3: the escaping symlink is discarded by containment (no out-of-tree read) --
     const escapePattern = "**/pkg/escape/**/AGENTS.md";
-    const escapeMatches = await resolveExtraBootstrapPatternPaths(workspace, escapePattern);
+    const { matches: escapeMatches } = await resolveExtraBootstrapPatternPaths(
+      workspace,
+      escapePattern,
+    );
     const escapeLoaded = await loadExtraBootstrapFilesWithDiagnostics(workspace, [escapePattern]);
     const leakedOutside = escapeLoaded.files.some((f) => f.content === "SECRET-OUTSIDE");
     check3 = escapeMatches.length === 0 && !leakedOutside;

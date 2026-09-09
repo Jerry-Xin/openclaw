@@ -262,7 +262,9 @@ async function main(): Promise<void> {
       configurable: true,
       writable: true,
     });
-    const nativeMatches = (await resolveExtraBootstrapPatternPaths(ws2, "pkg/*")).toSorted();
+    const nativeMatches = (
+      await resolveExtraBootstrapPatternPaths(ws2, "pkg/*")
+    ).matches.toSorted();
     if (originalGlobDescriptor) {
       Object.defineProperty(fsp, "glob", originalGlobDescriptor);
     }
@@ -303,7 +305,7 @@ async function main(): Promise<void> {
     parityCase(
       "CHECK 2 directory full match",
       "pkg/*",
-      await resolveExtraBootstrapPatternPaths(ws2, "pkg/*"),
+      (await resolveExtraBootstrapPatternPaths(ws2, "pkg/*")).matches,
       oracle2,
       ["pkg/core", "pkg/notes.md"],
     );
@@ -311,7 +313,7 @@ async function main(): Promise<void> {
     // -- CHECK 3: TRAILING-SLASH DIRECTORY-ONLY. Note: the matcher tests the slash-
     //    terminated candidate key `pkg/core/` internally, but the public result is
     //    the native-compatible key `pkg/core` (no trailing slash). --
-    const c3 = (await resolveExtraBootstrapPatternPaths(ws2, "pkg/*/")).toSorted();
+    const c3 = (await resolveExtraBootstrapPatternPaths(ws2, "pkg/*/")).matches.toSorted();
     parityCase("CHECK 3 trailing-slash directory-only", "pkg/*/", c3, oracle3, ["pkg/core"], {
       note: "public key has no trailing slash (native-compatible)",
       ok: c3.includes("pkg/core") && !c3.includes("pkg/core/"),
@@ -322,7 +324,7 @@ async function main(): Promise<void> {
       parityCase(
         "CHECK 4 descended directory-symlink full match",
         "**/pkg/linked",
-        await resolveExtraBootstrapPatternPaths(ws4, "**/pkg/linked"),
+        (await resolveExtraBootstrapPatternPaths(ws4, "**/pkg/linked")).matches,
         oracle4,
         ["pkg/linked"],
       );
@@ -334,7 +336,7 @@ async function main(): Promise<void> {
 
     // -- CHECK 5: NEGATIVE PREFIX — full match only, never the partial-prefix descent
     //    gate: `pkg/core/inner` present, prefix `pkg/core` absent. --
-    const c5 = (await resolveExtraBootstrapPatternPaths(ws5, "pkg/*/inner")).toSorted();
+    const c5 = (await resolveExtraBootstrapPatternPaths(ws5, "pkg/*/inner")).matches.toSorted();
     parityCase("CHECK 5 negative prefix", "pkg/*/inner", c5, oracle5, ["pkg/core/inner"], {
       note: "prefix pkg/core absent (full-match only)",
       ok: c5.includes("pkg/core/inner") && !c5.includes("pkg/core"),
@@ -345,7 +347,7 @@ async function main(): Promise<void> {
     //    duplicates through a Set, so this confirms the descend-and-yield path surfaces
     //    the directory as a single resolved entry in parity with fs.glob; it cannot
     //    observe a raw generator double-yield (the Set would absorb one). --
-    const c6 = (await resolveExtraBootstrapPatternPaths(ws6, "pkg/*")).toSorted();
+    const c6 = (await resolveExtraBootstrapPatternPaths(ws6, "pkg/*")).matches.toSorted();
     parityCase("CHECK 6 descended full-match resolves once", "pkg/*", c6, oracle6, ["pkg/core"], {
       note: "resolved pkg/core entries == 1",
       ok: c6.filter((m) => m === "pkg/core").length === 1,
@@ -355,7 +357,7 @@ async function main(): Promise<void> {
     //    reached dir symlink `pkg/leaf` is a valid leaf under `pkg/*` (control), but a
     //    directory-only `pkg/*/` does not slash-match the undescended leaf: == [] . --
     if (ws7Ok) {
-      const c7ctrl = (await resolveExtraBootstrapPatternPaths(ws7, "pkg/*")).toSorted();
+      const c7ctrl = (await resolveExtraBootstrapPatternPaths(ws7, "pkg/*")).matches.toSorted();
       parityCase(
         "CHECK 7a control (leaf matches non-directory pattern)",
         "pkg/*",
@@ -363,7 +365,7 @@ async function main(): Promise<void> {
         oracle7ctrl,
         ["pkg/leaf"],
       );
-      const c7 = (await resolveExtraBootstrapPatternPaths(ws7, "pkg/*/")).toSorted();
+      const c7 = (await resolveExtraBootstrapPatternPaths(ws7, "pkg/*/")).matches.toSorted();
       parityCase(
         "CHECK 7b directory-only excludes undescended symlink leaf",
         "pkg/*/",

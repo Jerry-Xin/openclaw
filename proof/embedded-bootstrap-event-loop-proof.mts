@@ -459,7 +459,10 @@ async function main(): Promise<void> {
     // sync-open contribution instead of lumping open+read into one number. This
     // is the measurement an owner-scoped follow-up would use to decide whether an
     // async pinned-open primitive is worth adding.
-    const matchRel = await resolveExtraBootstrapPatternPaths(workspace, "**/AGENTS.md");
+    const { matches: matchRel } = await resolveExtraBootstrapPatternPaths(
+      workspace,
+      "**/AGENTS.md",
+    );
     let guardedOpenMs = 0;
     let readAllocMs = 0;
     let openedFiles = 0;
@@ -496,7 +499,7 @@ async function main(): Promise<void> {
     probe = startProbe();
     await settle(60);
     const globStart = performance.now();
-    const matches = await resolveExtraBootstrapPatternPaths(workspaceGlob, "**/AGENTS.md");
+    const { matches } = await resolveExtraBootstrapPatternPaths(workspaceGlob, "**/AGENTS.md");
     const resolveMs = performance.now() - globStart;
     await settle(20);
     globOnly = { matches: matches.length, resolveMs, probe: probe.stop() };

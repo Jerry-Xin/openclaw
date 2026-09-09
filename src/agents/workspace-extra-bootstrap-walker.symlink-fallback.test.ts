@@ -127,7 +127,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "**/pkg/linked/**/AGENTS.md";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["pkg/linked/AGENTS.md", "pkg/linked/nested/AGENTS.md"]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -153,7 +155,7 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       }
 
       await withoutNativeGlobApis(async () => {
-        const matches = await resolveExtraBootstrapPatternPaths(
+        const { matches } = await resolveExtraBootstrapPatternPaths(
           workspaceDir,
           "**/pkg/linked/**/AGENTS.md",
         );
@@ -181,7 +183,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "*/loop/**/AGENTS.md";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["pkg/loop/AGENTS.md"]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -208,7 +212,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "dir/a/**/AGENTS.md";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual([]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -235,7 +241,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "self/**/AGENTS.md";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["self/AGENTS.md", "self/sub/AGENTS.md"]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -270,7 +278,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "pkg/{link-a,link-b}/**/AGENTS.md";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual([
           "pkg/link-a/AGENTS.md",
           "pkg/link-a/nested/AGENTS.md",
@@ -316,7 +326,7 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
         try {
           const matches = (
             await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
-          ).toSorted();
+          ).matches.toSorted();
           expect(matches).toStrictEqual(["pkg/linked/AGENTS.md"]);
           expect(matches).toStrictEqual(oracle);
           // The out-of-pattern subtree was never read: boundedness, not luck.
@@ -352,7 +362,7 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       // reaches the file.
       const pattern = "**/pkg/linked/**/AGENTS.md";
       await withoutNativeGlobApis(async () => {
-        const matches = await resolveExtraBootstrapPatternPaths(workspaceDir, pattern);
+        const { matches } = await resolveExtraBootstrapPatternPaths(workspaceDir, pattern);
         expect(matches).toStrictEqual(["pkg/linked/AGENTS.md"]);
         // The yielded relative path resolves (through the link) to the real file.
         const resolved = await fs.realpath(path.resolve(workspaceDir, matches[0]!));
@@ -409,7 +419,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "**/mods/linked/AGENTS.md";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["mods/linked/AGENTS.md"]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -435,7 +447,7 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       }
 
       await withoutNativeGlobApis(async () => {
-        const matches = await resolveExtraBootstrapPatternPaths(
+        const { matches } = await resolveExtraBootstrapPatternPaths(
           workspaceDir,
           "**/mods/linked/AGENTS.md",
         );
@@ -459,7 +471,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "**/AGENTS.md";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["AGENTS.md", "a/b/AGENTS.md"]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -509,7 +523,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "pkg/*";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["pkg/core", "pkg/notes.md"]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -530,7 +546,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "pkg/*/";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["pkg/core"]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -557,7 +575,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "**/pkg/linked";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["pkg/linked"]);
         expect(matches).toStrictEqual(oracle);
       });
@@ -577,7 +597,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "pkg/*/inner";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["pkg/core/inner"]);
         expect(matches).toStrictEqual(oracle);
         // The prefix directory `pkg/core` is only a partial match and must not appear.
@@ -601,7 +623,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
       const pattern = "pkg/*";
       const oracle = await nodeGlobRelative(workspaceDir, pattern);
       await withoutNativeGlobApis(async () => {
-        const matches = (await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)).toSorted();
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
         expect(matches).toStrictEqual(["pkg/core"]);
         expect(matches).toStrictEqual(oracle);
         expect(matches.filter((m) => m === "pkg/core")).toHaveLength(1);
