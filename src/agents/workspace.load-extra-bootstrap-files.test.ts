@@ -1061,7 +1061,10 @@ describe("loadExtraBootstrapFilesWithDiagnostics", () => {
   it.runIf(process.platform !== "win32")(
     "does not descend into unreadable branches that cannot satisfy a shallow pattern",
     async () => {
-      const workspaceDir = await createWorkspaceDir("strict-pruned");
+      // The fs.glob-absent fallback walk is pattern-aware: a shallow pattern like
+      // `packages/*/AGENTS.md` never descends into a deeper `node_modules` subtree,
+      // so an unreadable directory buried below the match depth is never even read.
+      const workspaceDir = await createWorkspaceDir("noglob-pruned");
       const privateDir = path.join(workspaceDir, "packages", "blocked", "node_modules", "private");
       const readableDir = path.join(workspaceDir, "packages", "readable");
       await fs.mkdir(privateDir, { recursive: true });
@@ -1069,55 +1072,46 @@ describe("loadExtraBootstrapFilesWithDiagnostics", () => {
       await fs.writeFile(path.join(privateDir, "AGENTS.md"), "irrelevant", "utf-8");
       await fs.writeFile(path.join(readableDir, "AGENTS.md"), "readable", "utf-8");
       await fs.chmod(privateDir, 0o000);
-      const glob = vi.spyOn(fs, "glob").mockImplementation(() => {
-        throw new Error("native glob failed");
-      });
       const readDirectory = vi.spyOn(fs, "readdir");
       try {
-        const result = await loadExtraBootstrapFilesWithDiagnostics(workspaceDir, [
-          "packages/*/AGENTS.md",
-        ]);
-        expect(result.diagnostics).toEqual([]);
-        expect(result.files).toEqual([
-          expect.objectContaining({ path: path.join(readableDir, "AGENTS.md") }),
-        ]);
-        expect(readDirectory).not.toHaveBeenCalledWith(privateDir, expect.anything());
+        await withoutFsGlob(async () => {
+          const result = await loadExtraBootstrapFilesWithDiagnostics(workspaceDir, [
+            "packages/*/AGENTS.md",
+          ]);
+          expect(result.diagnostics).toEqual([]);
+          expect(result.files).toEqual([
+            expect.objectContaining({ path: path.join(readableDir, "AGENTS.md") }),
+          ]);
+          expect(readDirectory).not.toHaveBeenCalledWith(privateDir, expect.anything());
+        });
       } finally {
         readDirectory.mockRestore();
-        glob.mockRestore();
         await fs.chmod(privateDir, 0o700);
       }
     },
   );
 
   it.runIf(process.platform !== "win32")(
-    "preserves strictPatternRead sibling semantics when fs.glob is absent",
+    "loads readable siblings through the fs.glob-absent fallback walk",
     async () => {
-      // The fs.glob-absent fallback must not alter strictPatternRead's
-      // sibling-directory behavior: an unreadable sibling package (EACCES) is still
-      // walked past, the readable sibling still loads, and no diagnostic is
-      // surfaced — identical to the fs.glob path proved by the test above. The local
-      // walk skips a subtree it cannot read exactly as fs.glob does.
-      const workspaceDir = await createWorkspaceDir("strict-unreadable-noglob");
+      // The fs.glob-absent fallback must skip a subtree it cannot read (EACCES)
+      // exactly as fs.glob does: an unreadable sibling package is walked past, the
+      // readable sibling still loads, and no diagnostic is surfaced.
+      const workspaceDir = await createWorkspaceDir("noglob-unreadable");
       const blockedDir = path.join(workspaceDir, "packages", "blocked");
       const readableDir = path.join(workspaceDir, "packages", "readable");
       await fs.mkdir(blockedDir, { recursive: true });
       await fs.mkdir(readableDir, { recursive: true });
-      await fs.writeFile(path.join(blockedDir, "TOOLS.md"), "blocked", "utf-8");
-      await fs.writeFile(path.join(readableDir, "TOOLS.md"), "readable", "utf-8");
+      await fs.writeFile(path.join(blockedDir, "AGENTS.md"), "blocked", "utf-8");
+      await fs.writeFile(path.join(readableDir, "AGENTS.md"), "readable", "utf-8");
       await fs.chmod(blockedDir, 0o000);
       try {
         await withoutFsGlob(async () => {
-          const result = await loadWorkspacePatternFilesWithDiagnostics(
-            workspaceDir,
-            ["packages/*/TOOLS.md"],
-            {
-              acceptedBasenames: new Set(["TOOLS.md"]),
-              strictPatternRead: true,
-            },
-          );
+          const result = await loadExtraBootstrapFilesWithDiagnostics(workspaceDir, [
+            "packages/*/AGENTS.md",
+          ]);
           expect(result.files).toEqual([
-            expect.objectContaining({ path: path.join(readableDir, "TOOLS.md") }),
+            expect.objectContaining({ path: path.join(readableDir, "AGENTS.md") }),
           ]);
           expect(result.diagnostics).toEqual([]);
         });
