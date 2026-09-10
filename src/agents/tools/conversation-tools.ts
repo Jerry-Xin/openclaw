@@ -75,7 +75,10 @@ const ConversationsTurnSchema = Type.Object(
 // It intentionally stays a superset of the Gateway result rather than mutating the
 // public protocol schema, so no wire/SDK surface changes. Keep the shape aligned
 // with ConversationSendResultSchema in packages/gateway-protocol.
-export const ConversationSendToolResultSchema = Type.Object(
+// Module-private: production wires it only through the send tool's outputSchema
+// below, and tests read it back from that tool rather than importing the symbol,
+// so it needs no export.
+const ConversationSendToolResultSchema = Type.Object(
   {
     status: Type.Union([
       Type.Literal("sent"),

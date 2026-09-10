@@ -27,10 +27,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { createQaBusState, startQaBusServer } from "../../../../extensions/qa-lab/api.js";
 import { createQaLiveLaneGateway } from "../../../../extensions/qa-lab/runtime-api.js";
 import { ConversationSendResultSchema } from "../../../../packages/gateway-protocol/src/schema/agent.js";
-import {
-  ConversationSendToolResultSchema,
-  createConversationsSendTool,
-} from "../../../../src/agents/tools/conversation-tools.js";
+import { createConversationsSendTool } from "../../../../src/agents/tools/conversation-tools.js";
 import {
   buildTurnSendLedgerSessionKey,
   buildTurnSendTargetKey,
@@ -42,6 +39,11 @@ import { stopQaGatewayFixture } from "../../../helpers/qa-gateway-cleanup.js";
 const PRIMARY_MODEL = "mock-openai/gpt-5.6-luna";
 const ALTERNATE_MODEL = "mock-openai/gpt-5.6-luna-alt";
 const SCENARIO_TIMEOUT_MS = 120_000;
+
+// conversations_send declares its output schema inline (the Gateway send result
+// plus an optional turnSendNotice). The schema is module-private, so read it back
+// from the tool's outputSchema — every instance points to the same module const.
+const conversationSendToolResultSchema = createConversationsSendTool().outputSchema!;
 
 type BusState = ReturnType<typeof createQaBusState>;
 type BusServer = Awaited<ReturnType<typeof startQaBusServer>>;
@@ -500,7 +502,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         { conversationRef: conversation.conversationRef, message: "S2-CAP-BETA" },
         undefined,
       );
-      const secondSchemaValid = Value.Check(ConversationSendToolResultSchema, secondResult.details);
+      const secondSchemaValid = Value.Check(conversationSendToolResultSchema, secondResult.details);
       const secondText = toolResultText(secondResult);
       const secondNotice = secondText.includes(
         "Blocked: reached this turn's configured limit of 1 message(s)",
@@ -775,7 +777,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const suppressedResult = suppressedResults[0]!;
       const sentSchemaValid = Value.Check(ConversationSendResultSchema, sentResult.details);
       const suppressedSchemaValid = Value.Check(
-        ConversationSendToolResultSchema,
+        conversationSendToolResultSchema,
         suppressedResult.details,
       );
       const blockTextPresent = toolResultText(suppressedResult).includes(

@@ -28,13 +28,17 @@ import {
   resolveToolSearchConfig,
 } from "../tool-search.js";
 import {
-  ConversationSendToolResultSchema,
   createConversationsListTool,
   createConversationsSendTool,
   createConversationsTurnTool,
 } from "./conversation-tools.js";
 import { createMessageTool } from "./message-tool-execution.js";
 import { resetTurnSendLedgerForTest } from "./turn-send-ledger.js";
+
+// conversations_send declares its output schema inline (the Gateway send result
+// plus an optional turnSendNotice). The schema is module-private, so read it back
+// from the tool's outputSchema — every instance points to the same module const.
+const conversationSendToolResultSchema = createConversationsSendTool().outputSchema!;
 
 afterEach(() => {
   resetTurnSendLedgerForTest();
@@ -160,7 +164,7 @@ describe("conversation tools", () => {
     // conversations_send declares a tool-local superset of the Gateway send result
     // (adds the optional turnSendNotice) so Code Mode can project the send-budget
     // guidance; the Gateway protocol schema itself is unchanged.
-    expect(send.outputSchema).toBe(ConversationSendToolResultSchema);
+    expect(send.outputSchema).toBe(conversationSendToolResultSchema);
     expect(turn.outputSchema).toBe(ConversationTurnResultSchema);
     expect(Value.Check(list.outputSchema!, listResult.details)).toBe(true);
     expect(Value.Check(send.outputSchema!, sendResult.details)).toBe(true);
@@ -184,7 +188,7 @@ describe("conversation tools", () => {
     // Mode's output-schema check (assertCatalogOutputMatchesSchema), never in CI.
     const gatewayProps = (ConversationSendResultSchema as { properties: Record<string, unknown> })
       .properties;
-    const toolProps = (ConversationSendToolResultSchema as { properties: Record<string, unknown> })
+    const toolProps = (conversationSendToolResultSchema as { properties: Record<string, unknown> })
       .properties;
     for (const key of Object.keys(gatewayProps)) {
       expect(JSON.stringify(toolProps[key])).toBe(JSON.stringify(gatewayProps[key]));
@@ -193,7 +197,7 @@ describe("conversation tools", () => {
       "turnSendNotice",
     ]);
     expect(
-      (ConversationSendToolResultSchema as { additionalProperties?: unknown }).additionalProperties,
+      (conversationSendToolResultSchema as { additionalProperties?: unknown }).additionalProperties,
     ).toBe(false);
     // Per-property JSON ignores TypeBox optionality (OptionalKind lives in the
     // top-level `required` array, not the property schema), so also compare the
@@ -204,7 +208,7 @@ describe("conversation tools", () => {
     const sortedRequired = (schema: unknown) =>
       ((schema as { required?: string[] }).required ?? []).toSorted();
     const gatewayRequired = sortedRequired(ConversationSendResultSchema);
-    const toolRequired = sortedRequired(ConversationSendToolResultSchema);
+    const toolRequired = sortedRequired(conversationSendToolResultSchema);
     expect(toolRequired).toEqual(gatewayRequired);
     // turnSendNotice must stay optional so a details-less or normalization-only send
     // still validates against the declared schema.
@@ -419,7 +423,7 @@ describe("conversations_send per-turn send budget", () => {
   }) {
     const blockedText = blockedNotice(result);
     expect(blockedText).toContain("configured limit");
-    expect(Value.Check(ConversationSendToolResultSchema, result.details)).toBe(true);
+    expect(Value.Check(conversationSendToolResultSchema, result.details)).toBe(true);
     // The declared extra field is intentionally outside the closed Gateway schema;
     // this is exactly why conversations_send wires the tool-local superset.
     expect(Value.Check(ConversationSendResultSchema, result.details)).toBe(false);
@@ -485,7 +489,7 @@ describe("conversations_send per-turn send budget", () => {
       status: "sent",
       turnSendNotice: expect.stringContaining("already sent 2 messages"),
     });
-    expect(Value.Check(ConversationSendToolResultSchema, second.details)).toBe(true);
+    expect(Value.Check(conversationSendToolResultSchema, second.details)).toBe(true);
     expect(first.details).not.toHaveProperty("turnSendNotice");
   });
 
