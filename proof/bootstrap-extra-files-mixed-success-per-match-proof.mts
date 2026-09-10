@@ -301,9 +301,11 @@ async function main(): Promise<void> {
     fs.mkdirSync(controlDir, { recursive: true });
     const controlFileAbs = path.join(controlDir, "AGENTS.md");
     fs.writeFileSync(controlFileAbs, CONTROL_CONTENT);
-    const controlLoaded = await loadExtraBootstrapFilesWithDiagnostics(workspace, [
-      "clean/AGENTS.md",
-    ]);
+    // Glob form (`clean/*.md`, not the literal `clean/AGENTS.md`) so the loader
+    // takes the glob branch and actually drives resolveExtraBootstrapPatternPaths.
+    // A literal would skip the resolver entirely, leaving the control unable to
+    // rule out an always-recording resolver — the very mode it exists to exclude.
+    const controlLoaded = await loadExtraBootstrapFilesWithDiagnostics(workspace, ["clean/*.md"]);
     const controlFile = controlLoaded.files.find((f) => f.path === controlFileAbs);
     check4 =
       controlFile !== undefined &&
