@@ -232,6 +232,57 @@ describe("loadExtraBootstrapFilesWithDiagnostics", () => {
     });
   });
 
+  it("collapses a per-match failure shared by overlapping patterns into one io diagnostic", async () => {
+    // Dedup parity with matches: matches flow through the loader's resolvedPaths
+    // Set, so a file matched by two overlapping patterns loads once. A FAILING
+    // match must dedupe the same way — otherwise the same unreadable file, matched
+    // by two patterns, emits two identical io diagnostics and inflates the hook's
+    // "failed for N path(s)" count. Here `**/AGENTS.md` and `bad/*.md` both match
+    // the EACCES-faulting bad/AGENTS.md; the readable good sibling still loads and
+    // the fault surfaces as exactly ONE diagnostic keyed to that path.
+    const workspaceDir = await createWorkspaceDir("dedup-overlap");
+    await fs.mkdir(path.join(workspaceDir, "good"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "bad"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "good", "AGENTS.md"), "good agents", "utf-8");
+    await fs.writeFile(path.join(workspaceDir, "bad", "AGENTS.md"), "bad agents", "utf-8");
+
+    // The recursive pattern yields both siblings; the `bad`-scoped pattern yields
+    // only the faulting one, so bad/AGENTS.md is recorded as a failure under both.
+    const globSpy = vi.spyOn(fs, "glob").mockImplementation(((pattern: string) =>
+      (async function* () {
+        if (pattern.includes("**")) {
+          yield path.join("good", "AGENTS.md");
+        }
+        yield path.join("bad", "AGENTS.md");
+      })()) as unknown as typeof fs.glob);
+    const realpathError = Object.assign(new Error("simulated realpath EACCES"), { code: "EACCES" });
+    const realpathSpy = vi.spyOn(fs, "realpath").mockImplementation((async (
+      target: Parameters<typeof fs.realpath>[0],
+    ) => {
+      if (target.toString().includes(`${path.sep}bad${path.sep}`)) {
+        throw realpathError;
+      }
+      return target.toString();
+    }) as unknown as typeof fs.realpath);
+
+    try {
+      const { files, diagnostics } = await loadExtraBootstrapFilesWithDiagnostics(workspaceDir, [
+        "**/AGENTS.md",
+        "bad/*.md",
+      ]);
+      expect(
+        files.map((file) => path.relative(workspaceDir, file.path).replaceAll(path.sep, "/")),
+      ).toStrictEqual(["good/AGENTS.md"]);
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]?.reason).toBe("io");
+      expect(diagnostics[0]?.path).toBe(path.join(workspaceDir, "bad", "AGENTS.md"));
+      expect(diagnostics[0]?.detail).toContain("simulated realpath EACCES");
+    } finally {
+      realpathSpy.mockRestore();
+      globSpy.mockRestore();
+    }
+  });
+
   it("resolves a missing workspace cwd to no matches without a diagnostic (ENOENT)", async () => {
     // F1 boundary: a missing cwd makes fs.glob throw ENOENT, which legitimately
     // means "no matches" rather than an error to surface — no files, no diagnostic.

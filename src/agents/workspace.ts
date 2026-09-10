@@ -1433,6 +1433,12 @@ export async function loadExtraBootstrapFilesWithDiagnostics(
   const resolvedDir = resolveUserPath(dir);
   const diagnostics: ExtraBootstrapLoadDiagnostic[] = [];
   const resolvedPaths = new Set<string>();
+  // Failure paths already surfaced as an `io` diagnostic. Failures dedupe on the
+  // same workspace-relative key that `resolvedPaths` uses for matches, so a file
+  // that faults under two overlapping patterns — or a fallback double-yield within
+  // one — surfaces a single diagnostic. This keeps the handler's "failed for N
+  // path(s)" count a true distinct-path count rather than a pattern/yield multiple.
+  const failedPaths = new Set<string>();
   for (const pattern of extraPatterns) {
     if (!(await patternWalkRootStaysInWorkspace(resolvedDir, pattern))) {
       diagnostics.push({
@@ -1452,6 +1458,10 @@ export async function loadExtraBootstrapFilesWithDiagnostics(
         // that failed canonicalization surfaces as its own `io` diagnostic keyed
         // to that path, instead of one failing match discarding the whole pattern.
         for (const failure of failures) {
+          if (failedPaths.has(failure.path)) {
+            continue;
+          }
+          failedPaths.add(failure.path);
           diagnostics.push({
             path: path.resolve(resolvedDir, failure.path),
             reason: "io",
