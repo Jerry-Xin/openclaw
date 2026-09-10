@@ -435,8 +435,13 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       );
       expect(sendDeliveries.map((message) => message.text).toSorted()).toEqual(["SBM-1", "SBM-2"]);
 
-      // The runtime feeds the soft nudge back to the model on the 2nd send; read it from
-      // the mock provider's recorded requests (the actual model-facing tool result).
+      // The runtime feeds the soft nudge back to the model on the 2nd send, but that
+      // model-facing tool result only lands in a follow-up request after SBM-2's delivery
+      // is observed on the bus. Wait for the nudge to appear in the mock's recorded
+      // requests rather than sampling once (which races the follow-up request).
+      await waitForMockRequestText(live.mock!.baseUrl, (text) =>
+        text.includes("already sent 2 messages to this target this turn"),
+      );
       const mockTexts = await fetchMockRequestTexts(live.mock!.baseUrl);
       const noticePresent = mockTexts.some((text) =>
         text.includes("already sent 2 messages to this target this turn"),
@@ -602,7 +607,12 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       ]);
 
       // The nudge fires on the 2nd COUNTED send. Because the suppressed send in between
-      // did not charge the budget, the count is 2 (not 3) when SBM3-3 is delivered.
+      // did not charge the budget, the count is 2 (not 3) when SBM3-3 is delivered. The
+      // nudge lands in a follow-up model request after SBM3-3's bus delivery, so wait for
+      // it rather than sampling once (which races that request).
+      await waitForMockRequestText(live.mock!.baseUrl, (text) =>
+        text.includes("already sent 2 messages to this target this turn"),
+      );
       const mockTexts = await fetchMockRequestTexts(live.mock!.baseUrl);
       const nudgeAtTwo = mockTexts.some((text) =>
         text.includes("already sent 2 messages to this target this turn"),
