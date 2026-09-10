@@ -350,6 +350,7 @@ export async function runCliFallbackCandidate(
             userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
             contextEngineLogicalTurnLease: params.contextEngineLogicalTurnLease,
             onContextEngineTurnCandidate: params.onContextEngineTurnCandidate,
+            onDeferredTurnSendLedgerScope: params.onDeferredTurnSendLedgerScope,
             onUserMessagePersisted: params.notifyUserMessagePersisted,
             prepareAssistantTranscriptMessage: turn.opts?.prepareAssistantTranscriptMessage,
             persistAssistantTranscript:
