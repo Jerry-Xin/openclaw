@@ -15,6 +15,8 @@ import {
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { runBridgeRequest } from "../code-mode-bridge.js";
 import { createCodeModeCatalogProjection } from "../code-mode-catalog.js";
+import { CodeModeProgramDataInbox } from "../code-mode-program-data.js";
+import { resolveCodeModeConfig } from "../code-mode-runtime.js";
 import type { AgentToolResult } from "../runtime/index.js";
 import { compactToolOutputHint } from "../tool-schema-hints.js";
 import { compactToolSearchCatalogEntry } from "../tool-search-catalog.js";
@@ -799,7 +801,7 @@ describe("Code Mode bridge projects the send-budget notice into the guest value"
     catalogRef: ToolSearchCatalogRef;
     toolName: string;
     input: unknown;
-  }) {
+  }): Promise<{ ok: true; value: unknown } | { ok: false; error: string }> {
     const projection = createCodeModeCatalogProjection(
       (params.catalogRef.current?.entries ?? []).map(compactToolSearchCatalogEntry),
     );
@@ -807,21 +809,36 @@ describe("Code Mode bridge projects the send-budget notice into the guest value"
     if (!binding) {
       throw new Error(`missing catalog binding for ${params.toolName}`);
     }
-    return runBridgeRequest({
-      runtime: params.runtime,
-      catalogProjection: projection,
-      namespaceRuntime: {} as never,
-      parentToolCallId: "bridge-send-budget",
-      codeModeRunId: "cm-send-budget",
-      maxOutputBytes: 1_000_000,
-      remainingMs: 60_000,
-      ctx: { catalogRef: params.catalogRef },
-      request: {
-        id: `bridge-${(bridgeSeq += 1)}`,
-        method: "callValue",
-        args: [binding.callableName, params.input],
-      },
-    });
+    // The bridge now settles the guest value through a reply lease and returns
+    // void; the projected details are read back via reply.take()/json.
+    const id = `bridge-${(bridgeSeq += 1)}`;
+    const inbox = new CodeModeProgramDataInbox(resolveCodeModeConfig({}));
+    const reply = inbox.createReply(id);
+    try {
+      await runBridgeRequest({
+        runtime: params.runtime,
+        catalogProjection: projection,
+        namespaceRuntime: {} as never,
+        parentToolCallId: "bridge-send-budget",
+        codeModeRunId: "cm-send-budget",
+        reply,
+        remainingMs: 60_000,
+        ctx: { catalogRef: params.catalogRef },
+        request: {
+          id,
+          method: "callValue",
+          args: [binding.callableName, params.input],
+        },
+      });
+      const settled = reply.take();
+      const value = JSON.parse(settled.json) as unknown;
+      return settled.ok
+        ? { ok: true, value }
+        : { ok: false, error: typeof value === "string" ? value : JSON.stringify(value) };
+    } finally {
+      reply.release();
+      inbox.close();
+    }
   }
 
   function expectProjectedValue(settled: Awaited<ReturnType<typeof projectViaBridge>>) {
