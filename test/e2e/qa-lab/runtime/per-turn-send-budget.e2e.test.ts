@@ -502,12 +502,16 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       );
       const secondSchemaValid = Value.Check(ConversationSendToolResultSchema, secondResult.details);
       const secondText = toolResultText(secondResult);
-      const secondNotice = secondText.includes("Blocked: already sent 1 message");
+      const secondNotice = secondText.includes(
+        "Blocked: reached this turn's configured limit of 1 message(s)",
+      );
       expect(secondResult.details).toEqual({
         status: "suppressed",
         conversationRef: conversation.conversationRef,
         channel: conversation.channel,
-        turnSendNotice: expect.stringContaining("Blocked: already sent 1 message"),
+        turnSendNotice: expect.stringContaining(
+          "Blocked: reached this turn's configured limit of 1 message(s)",
+        ),
       });
       expect(secondSchemaValid).toBe(true);
       expect(secondNotice).toBe(true);
@@ -775,7 +779,7 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         suppressedResult.details,
       );
       const blockTextPresent = toolResultText(suppressedResult).includes(
-        "Blocked: already sent 1 message",
+        "Blocked: reached this turn's configured limit of 1 message(s)",
       );
       expect(sentSchemaValid).toBe(true);
       expect(suppressedSchemaValid).toBe(true);
@@ -786,7 +790,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         status: "suppressed",
         conversationRef: conversation.conversationRef,
         channel: conversation.channel,
-        turnSendNotice: expect.stringContaining("Blocked: already sent 1 message"),
+        turnSendNotice: expect.stringContaining(
+          "Blocked: reached this turn's configured limit of 1 message(s)",
+        ),
       });
       expect(blockTextPresent).toBe(true);
 
@@ -905,7 +911,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         suppressedResult.status === "suppressed" &&
         suppressedResult.reason === "turn_send_budget_exhausted" &&
         typeof suppressedResult.message === "string" &&
-        suppressedResult.message.includes("Blocked: already sent 1 message");
+        suppressedResult.message.includes(
+          "Blocked: reached this turn's configured limit of 1 message(s)",
+        );
       expect(suppressedSchemaValid).toBe(true);
 
       // (c) The two executions carried DISTINCT tool-call ids with byte-identical
