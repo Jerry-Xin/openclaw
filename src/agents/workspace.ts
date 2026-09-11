@@ -1303,12 +1303,22 @@ export async function loadWorkspaceBootstrapFiles(
     (name) => names === undefined || names.includes(name),
   ).map((name) => ({ name, filePath: path.join(resolvedDir, name) }));
 
+  // Phase 1: resolve existence prechecks (USER/MEMORY only) before any guarded
+  // read, so the read dispatch in phase 2 cannot race ahead of a pending
+  // exists-check. Other entries are always eligible for the read.
+  const eligible = await Promise.all(
+    entries.map((entry) =>
+      entry.name === DEFAULT_MEMORY_FILENAME || entry.name === DEFAULT_USER_FILENAME
+        ? exactWorkspaceEntryExists(resolvedDir, entry.name)
+        : Promise.resolve(true),
+    ),
+  );
+
+  // Phase 2: reads overlap, but each closure calls readWorkspaceFileWithGuards
+  // without awaiting first, so guarded-read dispatch follows entries order.
   const results = await Promise.all(
-    entries.map(async (entry): Promise<WorkspaceBootstrapFile | null> => {
-      if (
-        (entry.name === DEFAULT_MEMORY_FILENAME || entry.name === DEFAULT_USER_FILENAME) &&
-        !(await exactWorkspaceEntryExists(resolvedDir, entry.name))
-      ) {
+    entries.map(async (entry, index): Promise<WorkspaceBootstrapFile | null> => {
+      if (!eligible[index]) {
         return null;
       }
       const loaded = await readWorkspaceFileWithGuards({
