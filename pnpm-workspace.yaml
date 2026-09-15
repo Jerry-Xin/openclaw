@@ -13,6 +13,8 @@ minimumReleaseAgeStrict: true
 minimumReleaseAgeExclude:
   - "@openai/codex"
   - "@openai/codex-*"
+  # Pinned baseline for the srt-sandbox backend (extensions/srt-sandbox).
+  - "@anthropic-ai/sandbox-runtime@0.0.76"
   # Solid itself is exempt from the release-age gate (Peter, 2026-10-11).
   - "solid-js"
   - "@solidjs/*"
