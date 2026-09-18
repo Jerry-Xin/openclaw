@@ -38,6 +38,7 @@ import {
 import type { SkillLibraryAuthoringCapability } from "../skills/library/authoring.js";
 import type { McpLoopbackRequestContext } from "./mcp-grant-store.js";
 import { buildMcpToolSchema } from "./mcp-http.schema.js";
+import { angleSchema, objectSchema } from "./mcp-http.test-support.js";
 import type { resolveGatewayScopedTools } from "./tool-resolution.js";
 
 type MockGatewayTool = {
@@ -567,18 +568,6 @@ function expectMcpResultText(payload: McpToolResultPayload, text: string, isErro
     expect(payload.result?.isError).toBe(isError);
   }
   expect(payload.result?.content?.[0]?.text).toBe(text);
-}
-
-function objectSchema(properties: Record<string, unknown>, required?: string[]) {
-  return {
-    type: "object",
-    properties,
-    ...(required ? { required } : {}),
-  };
-}
-
-function angleSchema(property: unknown, required: string[] = []) {
-  return objectSchema({ angle: property }, required);
 }
 
 function getScopedToolsCall(index: number): ScopedToolsCall {

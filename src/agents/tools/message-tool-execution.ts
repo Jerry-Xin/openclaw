@@ -3,7 +3,6 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import { getChannelPlugin } from "../../channels/plugins/index.js";
 import { isScheduledMessageWriteAction } from "../../channels/plugins/message-action-dispatch.js";
 import type { ChannelMessageActionName } from "../../channels/plugins/types.public.js";
 import { resolveCommandSecretRefsViaGateway } from "../../cli/command-secret-gateway.js";
@@ -21,10 +20,6 @@ import type { MessageActionResult } from "../../infra/outbound/message-action-co
 import { projectGatewayQueuedDeliveryResult } from "../../infra/outbound/message-action-execution.js";
 import { hasAcceptedMessageActionResult } from "../../infra/outbound/message-action-result-acceptance.js";
 import { getToolResult, runMessageAction } from "../../infra/outbound/message-action-runner.js";
-import {
-  resolveEffectiveMessageToolsConfig,
-  shouldApplyCrossContextMarker,
-} from "../../infra/outbound/outbound-policy.js";
 import { isDeliveredCurrentSourceReplyAsync } from "../../infra/outbound/source-reply-mirror.js";
 import { readBooleanParam } from "../../plugin-sdk/boolean-param.js";
 import { stringifyRouteThreadId } from "../../plugin-sdk/channel-route.js";
@@ -68,17 +63,16 @@ import {
 } from "./message-tool-source-policy.js";
 import { createMessageToolTurnAuthority } from "./message-tool-turn-authority.js";
 import {
+  prepareMessageToolTurnSendBudget,
+  resolveTurnSendBudgetContext,
+} from "./message-tool-turn-send-budget.js";
+import {
   hasSanitizedSendPayloadContent,
   sanitizeMessageToolVisiblePayload,
   type VisibleTextSuppressionReason,
 } from "./message-tool-visible-content.js";
 import { isPollVoteEchoText, resolvePollVoteEchoRoute } from "./poll-vote-echo.js";
-import {
-  buildTurnSendLedgerSessionKey,
-  commitTurnSend,
-  releaseTurnSend,
-  reserveTurnSend,
-} from "./turn-send-ledger.js";
+import { buildTurnSendLedgerSessionKey } from "./turn-send-ledger.js";
 
 const POLL_VOTE_ECHO_TTL_MS = 30_000;
 
@@ -426,24 +420,13 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         currentChannelId: effectiveCurrentChannel.currentChannelId,
         currentMessagingTarget: effectiveCurrentChannel.currentMessagingTarget,
       });
-      // Per-turn send budget: the loop detector can't see reworded resends of the
-      // same answer (it hashes full params), so count successful sends per
-      // (turn, target) here and, from the second onward, nudge the model. This runs
-      // independently of loopDetection.enabled — it is on by default. A resolved
-      // context requires a single normalized target, a session key, and a run id;
-      // broadcast fan-out and dry-runs are excluded.
-      const budgetContext =
-        shouldApplyCrossContextMarker(action) &&
-        outboundActionRoute !== undefined &&
-        pollEchoSessionKey !== undefined &&
-        options?.runId !== undefined &&
-        !params.dryRun
-          ? {
-              sessionKey: pollEchoSessionKey,
-              runId: options.runId,
-              targetKey: outboundActionRoute,
-            }
-          : undefined;
+      const budgetContext = resolveTurnSendBudgetContext({
+        action,
+        outboundActionRoute,
+        sessionKey: pollEchoSessionKey,
+        runId: options?.runId,
+        isDryRun: Boolean(params.dryRun),
+      });
       const recentPollVote = pollEchoSessionKey
         ? recentPollVoteBySession.get(pollEchoSessionKey)
         : undefined;
@@ -527,37 +510,20 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       const actionParams = actionIdempotencyKey
         ? { ...params, idempotencyKey: actionIdempotencyKey }
         : params;
-      const effectiveMessageTools = resolveEffectiveMessageToolsConfig({
+      const turnSendBudget = prepareMessageToolTurnSendBudget({
+        budgetContext,
+        action,
         cfg: rawConfig,
         agentId: resolvedAgentId,
+        gatewayPresent: gateway !== undefined,
+        deliveryChannel: scope.channel ?? effectiveCurrentChannel.currentChannelProvider,
+        actionIdempotencyKey,
       });
-      const isMediaSendAction = action === "sendAttachment" || action === "upload-file";
-      const budgetDeliveryChannel = normalizeMessageChannel(
-        scope.channel ?? effectiveCurrentChannel.currentChannelProvider,
-      );
-      const budgetChannelPlugin =
-        budgetContext && budgetDeliveryChannel
-          ? getChannelPlugin(budgetDeliveryChannel)
-          : undefined;
-      const routeDedupsCompletedOperation =
-        gateway !== undefined &&
-        (budgetChannelPlugin?.actions?.resolveExecutionMode?.({ action }) === "gateway" ||
-          budgetChannelPlugin?.outbound?.deliveryMode === "gateway");
-      const reservation = budgetContext
-        ? reserveTurnSend(budgetContext, {
-            maxPerTurn: isMediaSendAction
-              ? undefined
-              : effectiveMessageTools?.maxMessagesPerTurnPerTarget,
-            operationId: routeDedupsCompletedOperation ? actionIdempotencyKey : undefined,
-            chargeCap: !isMediaSendAction,
-          })
-        : undefined;
-      if (reservation?.status === "exhausted") {
-        const max = effectiveMessageTools?.maxMessagesPerTurnPerTarget;
+      if (turnSendBudget.exhaustedMessage) {
         return jsonResult({
           status: "suppressed",
           reason: "turn_send_budget_exhausted",
-          message: `Blocked: reached this turn's configured limit of ${max} message(s) to this target (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
+          message: turnSendBudget.exhaustedMessage,
         });
       }
       const hasExactSourceTurn =
@@ -631,9 +597,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             if (partialResult) {
               result = partialResult;
             } else {
-              if (reservation?.status === "reserved") {
-                releaseTurnSend(reservation.reservation);
-              }
+              turnSendBudget.release();
               if (autogeneratedDeliveryFingerprint && actionIdempotencyKey) {
                 failedAutogeneratedIdempotencyKeys.set(
                   autogeneratedDeliveryFingerprint,
@@ -746,17 +710,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             !result.dryRun &&
             deliveryStatus !== "suppressed" &&
             deliveryStatus !== "failed";
-          let turnSendNotice: string | undefined;
-          if (reservation?.status === "reserved") {
-            if (landed) {
-              const sendCount = commitTurnSend(reservation.reservation);
-              if (sendCount >= 2 && effectiveMessageTools?.turnSendNudge !== false) {
-                turnSendNotice = `You have already sent ${sendCount} messages to this target this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`;
-              }
-            } else {
-              releaseTurnSend(reservation.reservation);
-            }
-          }
+          const turnSendNotice = turnSendBudget.commitAndResolveNotice(landed);
           const appendedNotices = [normalizationNotice, turnSendNotice].filter(
             (value): value is string => Boolean(value),
           );

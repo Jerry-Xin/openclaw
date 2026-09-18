@@ -1,5 +1,6 @@
 // Defines user-facing config field labels used by schema metadata.
 import { MEDIA_AUDIO_FIELD_LABELS } from "./media-audio-field-metadata.js";
+import { MESSAGE_TOOL_FIELD_LABELS } from "./schema.labels.message-tool.js";
 import { META_FIELD_LABELS } from "./schema.meta.js";
 import { NODE_CAPABILITY_FIELD_LABELS } from "./schema.node-capabilities.js";
 import { CLOUD_WORKER_FIELD_LABELS } from "./zod-schema.cloud-workers.js";
@@ -339,15 +340,7 @@ export const FIELD_LABELS: Record<string, string> = {
   "approvals.plugin.targets[].to": "Plugin Approval Target Destination",
   "approvals.plugin.targets[].accountId": "Plugin Approval Target Account ID",
   "approvals.plugin.targets[].threadId": "Plugin Approval Target Thread ID",
-  "tools.message.crossContext.allowWithinProvider": "Allow Cross-Context (Same Provider)",
-  "tools.message.crossContext.allowAcrossProviders": "Allow Cross-Context (Across Providers)",
-  "tools.message.crossContext.marker.enabled": "Cross-Context Marker",
-  "tools.message.crossContext.marker.prefix": "Cross-Context Marker Prefix",
-  "tools.message.crossContext.marker.suffix": "Cross-Context Marker Suffix",
-  "tools.message.broadcast.enabled": "Enable Message Broadcast",
-  "tools.message.maxMessagesPerTurnPerTarget": "Max Messages Per Turn Per Target",
-  "tools.message.turnSendNudge": "Turn Send Nudge",
-  "tools.message.actions.allow": "Message Action Allowlist",
+  ...MESSAGE_TOOL_FIELD_LABELS,
   "tools.web.search.enabled": "Enable Web Search Tool",
   "tools.web.search.provider": "Web Search Provider",
   "tools.web.search.maxResults": "Web Search Max Results",

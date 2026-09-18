@@ -142,8 +142,6 @@ import {
   hasToolErrorOutput,
   extractSessionStatusSessionKey,
   resolveHeartbeatPromptReply,
-  extractPerTurnSendBudgetDirective,
-  extractPerTurnSendBudgetRepeatDirective,
 } from "./mock-openai-directives.js";
 import {
   buildRemoteCompactionV2Events,
@@ -189,8 +187,10 @@ import {
   extractCurrentImageRequest,
   parseToolOutputJson,
 } from "./mock-openai-input.js";
+import { resolvePerTurnSendBudgetResponse } from "./mock-openai-per-turn-send-budget.js";
 import { attachQaMockResponsesWebSocketServer } from "./mock-openai-responses-websocket.js";
 import { resolveMockSubagentHandoff } from "./mock-openai-subagent-completion.js";
+import { findToolCallByCallId, parseToolCallArguments } from "./mock-openai-tool-call-input.js";
 import {
   readTargetFromPrompt,
   execCommandFromToolProgressPrompt,
@@ -460,27 +460,6 @@ function resolveCurrentToolDeclarationSurface(
         ...body,
         tools: [...(Array.isArray(body.tools) ? body.tools : []), ...additionalTools],
       };
-}
-
-function findToolCallByCallId(input: ResponsesInputItem[], callId: string) {
-  return input.toReversed().find((item) => {
-    const type = item.type;
-    return (type === "function_call" || type === "custom_tool_call") && item.call_id === callId;
-  });
-}
-
-function parseToolCallArguments(toolCall: ResponsesInputItem) {
-  if (typeof toolCall.arguments !== "string") {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(toolCall.arguments) as unknown;
-    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 function readProgressCommandOutput(input: ResponsesInputItem[], command: string, isPoll = false) {
@@ -1030,71 +1009,16 @@ async function buildResponsesPayload(
     )
       ? extractLatestToolOutput(input)
       : "");
-  // Per-turn send-budget fixture (QA-PTSB-SEND): emit one `message`/`conversations_send`
-  // per continuation round to the same target until `count` sends have been planned this
-  // turn, then finalize with text. Placed before the scenario chain so the unique marker
-  // wins outright; counting prior planned calls in `input` is how one turn fans out into
-  // several sequential sends that all charge the same run-scoped ledger slot.
-  const perTurnSendBudget = extractPerTurnSendBudgetDirective(allInputText);
-  if (perTurnSendBudget && hasDeclaredTool(body, perTurnSendBudget.tool)) {
-    const priorPlannedSends = input.filter(
-      (item) => item.type === "function_call" && item.name === perTurnSendBudget.tool,
-    ).length;
-    if (priorPlannedSends < perTurnSendBudget.count) {
-      const sequence = priorPlannedSends + 1;
-      // `suppress` emits an empty message so real core delivery returns
-      // deliveryStatus "suppressed" (no_visible_payload); that send must not charge
-      // the per-turn budget. Any other outcome sends a visible markered payload.
-      const outcome = perTurnSendBudget.outcomes?.[sequence - 1] ?? "ok";
-      const suppressed = outcome === "suppress";
-      const sendArgs =
-        perTurnSendBudget.tool === "conversations_send"
-          ? {
-              conversationRef: perTurnSendBudget.ref,
-              message: `${perTurnSendBudget.marker}-${sequence}`,
-            }
-          : {
-              action: "send",
-              message: suppressed ? "" : `${perTurnSendBudget.marker}-${sequence}`,
-              // In message_tool_only mode a delivered source-reply send with
-              // `final !== false` terminates the turn (resolveMessageToolSourceReplyFinal
-              // in embedded-agent-message-tool-source-reply.ts). This fixture fans out
-              // several sends in one turn, so each fan-out send marks itself non-final to
-              // keep the run looping; the turn ends when the FINAL assistant text is
-              // emitted after `count` sends. `final` is deleted before dispatch, so it
-              // never reaches delivery — it only gates turn termination.
-              final: false,
-            };
-      return buildToolCallEventsWithArgs(perTurnSendBudget.tool, sendArgs);
-    }
-    return buildAssistantEvents(`${perTurnSendBudget.marker}-FINAL`);
-  }
-  // Per-turn send-budget REPEAT fixture (QA-PTSB-REPEAT): emit the SAME `message`
-  // send twice in ONE response (byte-identical args, distinct call_id/item id) on
-  // the opening round, then finalize with text once the copies have run. Proves a
-  // per-turn cap blocks the second byte-identical send (distinct idempotency key)
-  // instead of admitting it as an idempotent replay. Placed beside QA-PTSB-SEND so
-  // its unique marker wins before the scenario chain.
-  const perTurnSendBudgetRepeat = extractPerTurnSendBudgetRepeatDirective(allInputText);
-  if (perTurnSendBudgetRepeat && hasDeclaredTool(body, "message")) {
-    const priorMessageSends = input.filter(
-      (item) => item.type === "function_call" && item.name === "message",
-    ).length;
-    if (priorMessageSends === 0) {
-      return buildDuplicateToolCallEventsWithArgs(
-        "message",
-        {
-          action: "send",
-          message: perTurnSendBudgetRepeat.marker,
-          // Non-final so the run keeps looping to the finalizer after both copies
-          // resolve; `final` is deleted before dispatch (see QA-PTSB-SEND) and so
-          // never reaches delivery or idempotency derivation.
-          final: false,
-        },
-        2,
-      );
-    }
-    return buildAssistantEvents(`${perTurnSendBudgetRepeat.marker}-FINAL`);
+  const perTurnSendBudgetResponse = resolvePerTurnSendBudgetResponse({
+    allInputText,
+    input,
+    hasDeclaredTool: (tool: string) => hasDeclaredTool(body, tool),
+    buildToolCallEventsWithArgs,
+    buildDuplicateToolCallEventsWithArgs,
+    buildAssistantEvents,
+  });
+  if (perTurnSendBudgetResponse) {
+    return perTurnSendBudgetResponse;
   }
   // The queued followup carries the stalled prompt in transcript history, so
   // current-turn dispatch must win before the persistent recovery fixture.
