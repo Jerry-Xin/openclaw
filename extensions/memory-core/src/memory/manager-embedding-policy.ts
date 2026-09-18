@@ -16,10 +16,6 @@ type MemoryEmbeddingChunk = {
   embeddingInput?: EmbeddingInput;
 };
 
-export function filterNonEmptyMemoryChunks<T extends MemoryEmbeddingChunk>(chunks: T[]): T[] {
-  return chunks.filter((chunk) => chunk.text.trim().length > 0);
-}
-
 export function buildMemoryEmbeddingBatches<T extends MemoryEmbeddingChunk>(
   chunks: T[],
   maxTokens: number,
@@ -60,8 +56,10 @@ const RETRYABLE_MEMORY_EMBEDDING_SERVICE_ERROR_RE = /\b5\d\d\b|cloudflare/i;
 const RETRYABLE_MEMORY_EMBEDDING_TRANSPORT_ERROR_RE =
   /(fetch failed|other side closed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|UND_ERR_|socket hang up|socket terminated|network error|read ECONN|timed out|connection (?:reset|refused|aborted|timed out)|EHOSTUNREACH|ENETUNREACH|ECONNABORTED|EAI_AGAIN)/i;
 
+// Zhipu's item cap says `input array max 64`. Require the whole count and
+// message boundary so per-item and token limits remain terminal.
 const SPLITTABLE_MEMORY_EMBEDDING_BATCH_ERROR_RE =
-  /(request_headers_too_large|request header fields too large|other side closed|ECONNRESET|EPIPE|UND_ERR_SOCKET|socket hang up|socket terminated|read ECONN|connection (?:reset|aborted)|\bembeddings (?:api input limit exceeded:\s*max\s+\d+\s*,\s*got\s+\d+|max input length is\s+\d+)\b|\bbatch size is invalid,?\s+it should not be larger than\s+\d+\b)/i;
+  /(request_headers_too_large|request header fields too large|other side closed|ECONNRESET|EPIPE|UND_ERR_SOCKET|socket hang up|socket terminated|read ECONN|connection (?:reset|aborted)|\bembeddings (?:api input limit exceeded:\s*max\s+\d+\s*,\s*got\s+\d+|max input length is\s+\d+)\b|\bbatch size is invalid,?\s+it should not be larger than\s+\d+\b|\binput array max\s+\d+(?=\s*(?:["'}]|$)))/i;
 
 const SHORT_MEMORY_EMBEDDING_RETRY_BUDGET = {
   attempts: 3,
@@ -176,12 +174,14 @@ export async function runMemoryEmbeddingBatchRetryWithSplit<TInput, TOutput>(par
   profile: MemoryEmbeddingRetryProfileName;
   items: TInput[];
   run: (items: TInput[]) => Promise<TOutput[]>;
+  onSuccess?: (items: TInput[], outputs: TOutput[]) => void | Promise<void>;
   isSplittable: (message: string) => boolean;
   waitForRetry: (delayMs: number) => Promise<void>;
   onSplit?: (info: { itemCount: number; splitAt: number; message: string }) => void;
 }): Promise<TOutput[]> {
+  let outputs: TOutput[];
   try {
-    return await runMemoryEmbeddingRetryLoop({
+    outputs = await runMemoryEmbeddingRetryLoop({
       profile: params.profile,
       run: async () => await params.run(params.items),
       waitForRetry: params.waitForRetry,
@@ -204,6 +204,8 @@ export async function runMemoryEmbeddingBatchRetryWithSplit<TInput, TOutput>(par
     });
     return [...left, ...right];
   }
+  await params.onSuccess?.(params.items, outputs);
+  return outputs;
 }
 
 export function buildTextEmbeddingInputs(chunks: MemoryEmbeddingChunk[]): EmbeddingInput[] {

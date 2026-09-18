@@ -405,12 +405,6 @@ function refreshPersistedPolicyState(
   };
 }
 
-export async function refreshPersistedInstalledPluginIndex(
-  params: RefreshInstalledPluginIndexParams & InstalledPluginIndexStoreOptions,
-): Promise<InstalledPluginIndex> {
-  return refreshPersistedInstalledPluginIndexSync(params);
-}
-
 function resolveRefreshedPersistedInstalledPluginIndex(
   params: RefreshInstalledPluginIndexParams & InstalledPluginIndexStoreOptions,
 ): InstalledPluginIndex {
@@ -439,11 +433,16 @@ function resolveRefreshedPersistedInstalledPluginIndex(
   });
 }
 
-export function refreshPersistedInstalledPluginIndexSync(
-  params: RefreshInstalledPluginIndexParams & InstalledPluginIndexStoreOptions,
+export function refreshPersistedInstalledPluginIndex(
+  params: RefreshInstalledPluginIndexParams &
+    InstalledPluginIndexStoreOptions & {
+      lease?: InstalledPluginIndexWriteLease;
+    },
 ): InstalledPluginIndex {
-  const index = resolveRefreshedPersistedInstalledPluginIndex(params);
-  writePersistedInstalledPluginIndexSync(index, params);
+  const { lease, ...storeParams } = params;
+  const index = resolveRefreshedPersistedInstalledPluginIndex(storeParams);
+  writePersistedInstalledPluginIndexToSqlite(index, storeParams, lease);
+  clearPersistedInstalledPluginIndexCaches();
   return index;
 }
 

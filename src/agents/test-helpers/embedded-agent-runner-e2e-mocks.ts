@@ -64,6 +64,7 @@ export function createEmptyPluginMetadataSnapshot(workspaceDir?: string): Plugin
       setupProviders: new Map(),
       commandAliases: new Map(),
       contracts: new Map(),
+      providerAuthContributions: [],
       modelIdNormalizationPolicies: new Map(),
     },
     metrics: {
@@ -97,6 +98,7 @@ function createEmptyPreparedModelRuntimeSnapshot(
     allowGatewaySubagentBinding: input.allowGatewaySubagentBinding === true,
     modelCatalog: { entries: [], routeVariants: [] },
     configuredRuntimeModels: [],
+    findConfiguredRuntimeModel: () => undefined,
     inlineProviderModels: [],
     createStores: () => ({
       authStorage: { setRuntimeApiKey: vi.fn() } as never,
@@ -170,7 +172,7 @@ export function installEmbeddedRunnerBaseE2eMocks(options?: {
       }
       return {
         snapshot: createEmptyPreparedModelRuntimeSnapshot(input, options?.pluginRegistry),
-        release: vi.fn(),
+        [Symbol.asyncDispose]: vi.fn(async () => {}),
       };
     };
     return {

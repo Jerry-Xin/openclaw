@@ -188,7 +188,12 @@ suite.define(() => {
       });
 
       await page.getByText("Advertised", { exact: true }).waitFor();
-      await page.getByText("Gateway restart required.", { exact: true }).waitFor();
+      await page
+        .getByText(
+          "Gateway restart required. After the Gateway restarts, build a snapshot from the Snapshots view.",
+          { exact: true },
+        )
+        .waitFor();
 
       await page.getByRole("button", { name: "Edit" }).click();
       await expect.poll(() => machineClass.inputValue()).toBe("standard");
@@ -545,7 +550,12 @@ suite.define(() => {
         hash: "cloud-workers-reconnect-3",
         config: { cloudWorkers: { profiles: { "reconnect-proof": savedProfile } } },
       });
-      await page.getByText("Gateway restart required.", { exact: true }).waitFor();
+      await page
+        .getByText(
+          "Gateway restart required. After the Gateway restarts, build a snapshot from the Snapshots view.",
+          { exact: true },
+        )
+        .waitFor();
       await expect.poll(() => page.getByLabel("Profile ID").count()).toBe(0);
     } finally {
       await context.close();
@@ -585,7 +595,7 @@ suite.define(() => {
       replacePaths: ["cloudWorkers.profiles.pending.settings.setupEnv"],
     },
   ])(
-    "preserves Advanced edits after $name and deletes project defaults",
+    "config.set preserves Advanced edits after $name and deletes project defaults",
     async ({ replacement, description, replacePaths }) => {
       const context = await suite.browser.newContext({ locale: "en-US", serviceWorkers: "block" });
       const page = await context.newPage();
@@ -700,7 +710,11 @@ suite.define(() => {
           "config.get",
           configResponse(savedConfig, "cloud-workers-raw-saved"),
         );
-        await gateway.resolveDeferred("config.set", { ok: true, hash: "cloud-workers-raw-saved" });
+        await gateway.resolveDeferred("config.set", {
+          ok: true,
+          hash: "cloud-workers-raw-saved",
+          config: savedConfig,
+        });
         await expect.poll(() => rawSave.isDisabled()).toBe(true);
         expect(await gateway.getRequests("config.set")).toHaveLength(1);
         await page.reload();

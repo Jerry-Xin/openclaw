@@ -6,8 +6,8 @@ import {
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { chatHistoryHandlers } from "./chat-history-handler.js";
+import { createHistoryReadContext } from "./chat-history.test-helpers.js";
 
 describe("chat history request byte budgets", () => {
   it.each(["chat.history", "chat.startup"] as const)(
@@ -22,12 +22,22 @@ describe("chat history request byte budgets", () => {
         await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
         const messages = Array.from({ length: 12 }, (_, index) => ({
           role: index % 2 === 0 ? "user" : "assistant",
-          content: [{ type: "text", text: `record-${index}: ${"x".repeat(3_000)}` }],
+          content:
+            index % 4 === 1
+              ? [
+                  { type: "toolcall", id: `call-${index}`, name: "Read", arguments: {} },
+                  {
+                    type: "tool_result",
+                    tool_use_id: `call-${index}`,
+                    content: `record-${index}: ${"x".repeat(3_000)}`,
+                  },
+                ]
+              : [{ type: "text", text: `record-${index}: ${"x".repeat(3_000)}` }],
         }));
         for (const message of messages) {
           await appendTranscriptMessage(scope, { message });
         }
-        const context = createDirectChatContext();
+        const context = await createHistoryReadContext();
         const request = async (params: Record<string, unknown>) => {
           let result: unknown;
           await expectDefined(

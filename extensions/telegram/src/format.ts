@@ -16,26 +16,21 @@ import {
   protectTelegramAssistantTranscriptRoleHeaders,
   TELEGRAM_ASSISTANT_TRANSCRIPT_PREFIX,
 } from "./format-assistant-transcript.js";
-import { decodeTelegramHtmlEntities, findTelegramHtmlEntityEnd } from "./format-html.js";
+import {
+  decodeTelegramHtmlEntities,
+  escapeTelegramHtml,
+  escapeTelegramHtmlAttr,
+  findTelegramHtmlEntityEnd,
+} from "./format-html.js";
 import { renderTelegramMarkdownIR } from "./format-render.js";
 import { renderTelegramMonospaceGrid } from "./text-width.js";
+
+export { escapeTelegramHtml } from "./format-html.js";
 
 export type TelegramFormattedChunk = {
   html: string;
   text: string;
 };
-
-export function escapeTelegramHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function escapeHtml(text: string): string {
-  return escapeTelegramHtml(text);
-}
-
-function escapeHtmlAttr(text: string): string {
-  return escapeHtml(text).replace(/"/g, "&quot;");
-}
 
 function isTelegramRichLinkHref(href: string): boolean {
   return /^(?:https?:\/\/|tg:\/\/|mailto:|tel:|#)/i.test(href);
@@ -74,7 +69,7 @@ function buildTelegramLink(
   if (context.origin === "linkify" && isAutoLinkedFileRef(href, label)) {
     return null;
   }
-  const safeHref = escapeHtmlAttr(href);
+  const safeHref = escapeTelegramHtmlAttr(href);
   return {
     start: link.start,
     end: link.end,
@@ -87,12 +82,12 @@ function buildTelegramCodeBlockOpen(span: { language?: string }): string {
   if (!span.language) {
     return "<pre><code>";
   }
-  return `<pre><code class="language-${escapeHtmlAttr(span.language)}">`;
+  return `<pre><code class="language-${escapeTelegramHtmlAttr(span.language)}">`;
 }
 
 function renderTelegramHtml(ir: MarkdownIR): string {
   return renderTelegramMarkdownIR(ir, {
-    escapeText: escapeHtml,
+    escapeText: escapeTelegramHtml,
     buildLink: buildTelegramLink,
     buildCodeBlockOpen: buildTelegramCodeBlockOpen,
   });
@@ -320,7 +315,7 @@ function escapeUnsupportedTelegramHtml(
       const end = text.indexOf(">", index + 1);
       if (end !== -1) {
         const rawTag = text.slice(index, end + 1);
-        result += preserveTelegramHtmlTag(rawTag, openTags, escapeHtml, support);
+        result += preserveTelegramHtmlTag(rawTag, openTags, escapeTelegramHtml, support);
         index = end + 1;
       } else {
         result += "&lt;";
@@ -354,21 +349,6 @@ export function resolveTelegramHtmlVisibleText(html: string): string {
   return stripTelegramHtmlForPlainText(html);
 }
 
-function encodePlainTextForTelegramHtmlStrip(text: string): string {
-  return text.replace(/[&<>]/g, (char) => {
-    switch (char) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      default:
-        return char;
-    }
-  });
-}
-
 export function telegramHtmlToPlainTextFallback(html: string): string {
   const withPlainTables = html.replace(TELEGRAM_RICH_HTML_TABLE_PATTERN, (tableHtml) => {
     const rows = parseTelegramRichHtmlTableRows(tableHtml);
@@ -389,11 +369,9 @@ export function telegramHtmlToPlainTextFallback(html: string): string {
       ).trim();
       const label = stripTelegramHtmlForPlainText(labelHtml).trim();
       if (!href) {
-        return encodePlainTextForTelegramHtmlStrip(label);
+        return escapeTelegramHtml(label);
       }
-      return encodePlainTextForTelegramHtmlStrip(
-        !label || label === href ? href : `${label} (${href})`,
-      );
+      return escapeTelegramHtml(!label || label === href ? href : `${label} (${href})`);
     },
   );
   return stripTelegramHtmlForPlainText(withPlainLinks);
@@ -416,6 +394,9 @@ function preserveSupportedTelegramHtmlTags(
   html: string,
   support: TelegramHtmlTagSupport = TELEGRAM_LEGACY_HTML_TAG_SUPPORT,
 ): string {
+  if (!html.includes("&lt;")) {
+    return html;
+  }
   let codeDepth = 0;
   let preDepth = 0;
   let result = "";
@@ -491,7 +472,7 @@ function wrapStandaloneFileRef(match: string, prefix: string, filename: string):
   if (/https?:\/\/$/i.test(prefix)) {
     return match;
   }
-  return `${prefix}<code>${escapeHtml(filename)}</code>`;
+  return `${prefix}<code>${escapeTelegramHtml(filename)}</code>`;
 }
 
 function wrapSegmentFileRefs(
@@ -500,12 +481,12 @@ function wrapSegmentFileRefs(
   preDepth: number,
   anchorDepth: number,
 ): string {
-  if (!text || codeDepth > 0 || preDepth > 0 || anchorDepth > 0) {
+  if (codeDepth > 0 || preDepth > 0 || anchorDepth > 0 || !text.includes(".")) {
     return text;
   }
   const wrappedStandalone = text.replace(getFileReferencePattern(), wrapStandaloneFileRef);
   return wrappedStandalone.replace(getOrphanedTldPattern(), (match, prefix: string, tld: string) =>
-    prefix === ">" ? match : `${prefix}<code>${escapeHtml(tld)}</code>`,
+    prefix === ">" ? match : `${prefix}<code>${escapeTelegramHtml(tld)}</code>`,
   );
 }
 
@@ -635,7 +616,7 @@ function renderTelegramRichHtmlRawTableFallback(
     rows.length > 0
       ? renderTelegramMonospaceGrid(rows)
       : stripTelegramHtmlForPlainText(tableHtml).trim();
-  return `<pre><code>${escapeHtml([caption, tableText].filter(Boolean).join("\n"))}</code></pre>\n\n`;
+  return `<pre><code>${escapeTelegramHtml([caption, tableText].filter(Boolean).join("\n"))}</code></pre>\n\n`;
 }
 
 type TelegramHtmlTag = {

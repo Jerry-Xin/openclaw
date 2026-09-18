@@ -164,7 +164,7 @@ Remote embeddings require an API key. Bedrock uses the AWS SDK default credentia
 | Bedrock        | AWS credential chain, or `AWS_BEARER_TOKEN_BEDROCK` | No API key needed                   |
 | DeepInfra      | `DEEPINFRA_API_KEY`                                 | `models.providers.deepinfra.apiKey` |
 | Gemini         | `GEMINI_API_KEY`                                    | `models.providers.google.apiKey`    |
-| GitHub Copilot | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`  | Auth profile via device login       |
+| GitHub Copilot | `COPILOT_GITHUB_TOKEN`                              | Auth profile via device login       |
 | Mistral        | `MISTRAL_API_KEY`                                   | `models.providers.mistral.apiKey`   |
 | Ollama         | `OLLAMA_API_KEY` (placeholder)                      | --                                  |
 | OpenAI         | `OPENAI_API_KEY`                                    | `models.providers.openai.apiKey`    |
@@ -737,7 +737,7 @@ For conceptual behavior and slash commands, see [Dreaming](/concepts/dreaming).
 | `frequency`                             | `string`  | `0 3 * * *`   | Optional cron cadence for the full dreaming sweep                                                                                |
 | `model`                                 | `string`  | default model | Optional Dream Diary subagent model override                                                                                     |
 | `phases.deep.maxPromotedSnippetTokens`  | `number`  | `160`         | Maximum estimated tokens kept from each short-term recall snippet promoted into `MEMORY.md`; provenance metadata remains visible |
-| `phases.deep.maxPriorEntryLossFraction` | `number`  | `0.25`        | Reject a consolidation rewrite that removes more than this fraction of prior entries                                             |
+| `phases.deep.maxPriorEntryLossFraction` | `number`  | `0.25`        | Reject consolidation or append compaction that removes more than this fraction of prior entries                                  |
 
 ### Example
 

@@ -33,7 +33,8 @@ a script launcher or registry key without a proven binary framing path.
 ## Install
 
 Launch Chrome at least once, then run this command on the machine that hosts
-Chrome:
+Chrome. See [`openclaw browser`](/cli/browser) for the full `browser extension`
+subcommand reference:
 
 ```bash
 openclaw browser extension install
@@ -167,7 +168,8 @@ Use the canonical IPv4 endpoint when pairing for standalone operation.
 
 Wake-up uses the port in the extension's existing canonical pairing. It does
 not switch to the first configured profile. The native host resolves current
-`browser.profiles` and permits only an extension-driver relay port, including
+[`browser.profiles`](/gateway/config-browser-ui-desktop#browser) and permits
+only an extension-driver relay port, including
 automatically allocated ports and explicit `cdpPort` pins. A removed profile
 or stale port fails closed. Correct the pairing to match the current profile.
 Gateway `/browser/extension` routes and remote pairings never trigger local
@@ -183,7 +185,8 @@ stop it while a CDP client remains connected. A later reconnect can wake it agai
 
 The standalone daemon defaults to **v2-only authentication**, independently of
 the Gateway relay's legacy default. Only an explicit
-`browser.extensionRelay.allowLegacyAuth=true` enables legacy authentication.
+[`browser.extensionRelay.allowLegacyAuth=true`](/gateway/config-browser-ui-desktop#browser)
+enables legacy authentication.
 An unset value, `false`, or a config-read failure never enables it. Prefer v2
 clients so the persistent key is not disclosed to a process occupying the port.
 
@@ -220,6 +223,7 @@ also requires Chrome's **Allow access to file URLs** setting.
 An agent-created tab may start at `about:blank` while a CDP client initializes
 it before navigating. The extension allows that specific initial tab, keeps it
 in the OpenClaw group, and applies the same pause and access-mode controls.
+Normal navigation keeps the tab available in either access mode.
 Existing blank tabs, manually grouped blanks, and other `about:` pages remain
 unavailable. Navigating away, replacing the tab, or restarting or reconnecting
 the extension ends the initial blank admission. Returning to `about:blank`
@@ -393,6 +397,12 @@ pending network requests are canceled. These paths do not change the access
 mode or paused tabs. Take a fresh snapshot after the target reattaches before
 using element refs. If a client no longer exposes the target, reconnect that
 client.
+
+If Chrome closes a native target while its tab remains accessible, the relay
+restores automatic attachments for clients that still subscribe to that tab.
+It rechecks current access and gives clients a fresh session; it never replays
+the failed command. Explicit client detach and Chrome's debugger Cancel action
+remain effective. Take a fresh snapshot before continuing after recovery.
 
 If native detach fails, the error is reported and cleanup debt stays with that
 exact attachment. Other tabs remain usable, but the affected tab cannot acquire

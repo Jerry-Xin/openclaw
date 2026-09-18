@@ -1,26 +1,28 @@
-// Plugin management Gateway handler tests cover DTO mapping, trust errors, and reload planning.
+// Plugin management read tests cover inventory, inspection, and catalog DTOs.
 
 import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { emptyInstalledPluginComponents } from "../../plugins/installed-plugin-components.js";
 import { ManagedPluginLifecycleError } from "../../plugins/management-lifecycle-error.js";
+import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
+import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-request-scope.js";
 
 const managementMocks = vi.hoisted(() => ({
   inspect: vi.fn(),
   list: vi.fn(),
-  refreshMetadata: vi.fn(),
 }));
 const searchMock = vi.hoisted(() => vi.fn());
+
 const catalogMocks = vi.hoisted(() => ({
-  allOfficial: vi.fn(),
   browse: vi.fn(),
   categories: vi.fn(),
+  overview: vi.fn(),
   detail: vi.fn(),
 }));
 
 vi.mock("../../plugins/management-service.js", () => ({
   inspectManagedPlugin: (...args: unknown[]) => managementMocks.inspect(...args),
   listManagedPlugins: (...args: unknown[]) => managementMocks.list(...args),
-  refreshManagedPluginMetadata: (...args: unknown[]) => managementMocks.refreshMetadata(...args),
 }));
 
 vi.mock("../../plugins/catalog-search.js", () => ({
@@ -28,14 +30,13 @@ vi.mock("../../plugins/catalog-search.js", () => ({
 }));
 
 vi.mock("../../infra/clawhub-plugin-catalog.js", () => ({
-  fetchAllOfficialClawHubPlugins: (...args: unknown[]) => catalogMocks.allOfficial(...args),
   fetchClawHubPluginCatalog: (...args: unknown[]) => catalogMocks.browse(...args),
   fetchClawHubPluginCategories: (...args: unknown[]) => catalogMocks.categories(...args),
+  fetchClawHubPluginOverview: (...args: unknown[]) => catalogMocks.overview(...args),
   fetchClawHubPluginDetail: (...args: unknown[]) => catalogMocks.detail(...args),
 }));
 
-const { pluginsHandlers: pluginReadHandlers } = await import("./plugins.js");
-const pluginsHandlers = pluginReadHandlers;
+const { pluginsHandlers } = await import("./plugins.js");
 
 async function callHandler(
   method: string,
@@ -45,28 +46,27 @@ async function callHandler(
   let ok: boolean | null = null;
   let response: unknown;
   let error: unknown;
-  await expectDefined(
-    pluginsHandlers[method],
-    "pluginsHandlers[method] test invariant",
-  )({
-    params,
-    req: {} as never,
-    client: null as never,
-    isWebchatConnect: () => false,
-    context: {
-      getRuntimeConfig: () => runtimeConfig,
-      notifyPluginMetadataChanged: pluginMetadataChanged,
-    } as never,
-    respond: (success, result, requestError) => {
-      ok = success;
-      response = result;
-      error = requestError;
-    },
-  });
+  await withPluginRuntimeRegistryScope(createEmptyPluginRegistry(), () =>
+    expectDefined(
+      pluginsHandlers[method],
+      "pluginsHandlers[method] test invariant",
+    )({
+      params,
+      req: {} as never,
+      client: null as never,
+      isWebchatConnect: () => false,
+      context: {
+        getRuntimeConfig: () => runtimeConfig,
+      } as never,
+      respond: (success, result, requestError) => {
+        ok = success;
+        response = result;
+        error = requestError;
+      },
+    }),
+  );
   return { ok, response, error };
 }
-
-const pluginMetadataChanged = vi.fn();
 
 const workboard = {
   id: "workboard",
@@ -82,48 +82,13 @@ const reviewToken = "a".repeat(64);
 
 describe("plugin management Gateway handlers", () => {
   beforeEach(() => {
-    pluginMetadataChanged.mockReset();
     managementMocks.inspect.mockReset();
     managementMocks.list.mockReset();
-    managementMocks.refreshMetadata.mockReset();
     searchMock.mockReset();
     catalogMocks.browse.mockReset();
-    catalogMocks.allOfficial.mockReset();
-    catalogMocks.allOfficial.mockResolvedValue([]);
     catalogMocks.categories.mockReset();
+    catalogMocks.overview.mockReset();
     catalogMocks.detail.mockReset();
-  });
-
-  it("signals that refreshed plugin metadata requires a Gateway restart", async () => {
-    const config = { plugins: { enabled: true } };
-    const result = await callHandler("plugins.refresh", {}, config);
-
-    expect(managementMocks.refreshMetadata).toHaveBeenCalledWith({ config });
-    expect(pluginMetadataChanged).toHaveBeenCalledOnce();
-    expect(result).toEqual({
-      ok: true,
-      response: { ok: true, restartRequired: true },
-      error: undefined,
-    });
-  });
-
-  it("reports inventory refresh failures while still requesting the required restart", async () => {
-    managementMocks.refreshMetadata.mockImplementationOnce(() => {
-      throw new Error("plugin index unavailable");
-    });
-
-    const result = await callHandler("plugins.refresh", {});
-
-    expect(pluginMetadataChanged).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({
-      ok: false,
-      error: {
-        code: "UNAVAILABLE",
-        message:
-          "Plugin inventory refresh failed: plugin index unavailable. Restart the Gateway to load updated plugins.",
-        details: { restartRequired: true },
-      },
-    });
   });
 
   it("returns cold Workboard inventory without claiming runtime loaded state", async () => {
@@ -137,7 +102,12 @@ describe("plugin management Gateway handlers", () => {
 
     expect(result).toEqual({
       ok: true,
-      response: { plugins: [workboard], diagnostics: [], mutationAllowed: true },
+      response: {
+        plugins: [{ ...workboard, runtime: { state: "unloaded" } }],
+        diagnostics: [],
+        mutationAllowed: true,
+        generation: undefined,
+      },
       error: undefined,
     });
   });
@@ -298,15 +268,7 @@ describe("plugin management Gateway handlers", () => {
         skills: [],
         dangerousConfigFlags: [],
       },
-      components: {
-        mapped: [],
-        skills: [],
-        mcpServers: [],
-        commands: [],
-        hooks: [],
-        lspServers: [],
-        unavailable: { capabilities: [], mcpServers: [], lspServers: [] },
-      },
+      components: emptyInstalledPluginComponents(),
       grants: {
         hooks: {
           allowPromptInjection: { effective: false },
@@ -492,8 +454,31 @@ describe("plugin management Gateway handlers", () => {
     });
   });
 
-  it("does not exhaust the official catalog for the initial All view", async () => {
-    catalogMocks.browse.mockResolvedValue({ items: [] });
+  it("loads the initial All view from one bounded ClawHub overview", async () => {
+    catalogMocks.overview.mockResolvedValue({
+      categories: [
+        {
+          slug: "memory",
+          label: "Memory",
+          description: "Long-term memory.",
+          icon: "database",
+          order: 0,
+        },
+      ],
+      items: [
+        {
+          packageName: "memory-plus",
+          displayName: "Memory Plus",
+          family: "code-plugin",
+          isOfficial: false,
+          categories: ["memory"],
+          featured: true,
+          featuredRank: 1,
+          trending: true,
+          trendingRank: 0,
+        },
+      ],
+    });
     managementMocks.list.mockResolvedValue({
       plugins: [],
       diagnostics: [],
@@ -503,8 +488,21 @@ describe("plugin management Gateway handlers", () => {
     const result = await callHandler("plugins.catalog.browse", { intent: "all" });
 
     expect(result.ok).toBe(true);
-    expect(catalogMocks.allOfficial).not.toHaveBeenCalled();
-    expect(catalogMocks.browse).toHaveBeenCalledOnce();
+    expect(catalogMocks.overview).toHaveBeenCalledOnce();
+    expect(catalogMocks.browse).not.toHaveBeenCalled();
+    expect(result.response).toMatchObject({
+      items: [
+        {
+          catalog: {
+            featured: true,
+            featuredRank: 1,
+            trending: true,
+            trendingRank: 0,
+          },
+        },
+      ],
+      categories: [expect.objectContaining({ slug: "memory" })],
+    });
   });
 
   it("returns canonical ClawHub categories unchanged", async () => {
@@ -587,8 +585,14 @@ describe("plugin management Gateway handlers", () => {
         mutationAllowed: true,
       });
       managementMocks.inspect.mockResolvedValue({
-        declared: { mcpServers: [], skills: ["Local planning"] },
-        components: { skills: ["Local planning"] },
+        declared: { mcpServers: ["workboard", "unsupported"], skills: ["Local planning"] },
+        components: {
+          ...emptyInstalledPluginComponents(),
+          mapped: ["skills", "mcpServers"],
+          skills: ["Local planning"],
+          mcpServers: ["workboard"],
+          unavailable: { capabilities: [], mcpServers: ["unsupported"], lspServers: [] },
+        },
       });
       catalogMocks.detail.mockRejectedValue(new Error("ClawHub offline"));
 
@@ -598,7 +602,11 @@ describe("plugin management Gateway handlers", () => {
       if (matches) {
         expect(result.response).toMatchObject({
           plugin: { local: { pluginId: "workboard", installed: true, action: "manage" } },
-          detail: { origin: "local", skills: [{ name: "Local planning" }] },
+          detail: {
+            origin: "local",
+            mcpServers: ["workboard"],
+            skills: [{ name: "Local planning" }],
+          },
         });
       } else {
         expect(result.response).toBeUndefined();
@@ -609,7 +617,7 @@ describe("plugin management Gateway handlers", () => {
   );
 
   it("does not misclassify local catalog entries when ordinary ClawHub browse fails", async () => {
-    catalogMocks.browse.mockRejectedValue(new Error("service unavailable"));
+    catalogMocks.overview.mockRejectedValue(new Error("service unavailable"));
     managementMocks.list.mockResolvedValue({
       plugins: [workboard],
       diagnostics: [],
@@ -652,94 +660,59 @@ describe("plugin management Gateway handlers", () => {
     });
   });
 
-  it("keeps ClawHub search results when bundled publication verification fails", async () => {
-    catalogMocks.allOfficial.mockRejectedValue(new Error("official catalog unavailable"));
-    catalogMocks.browse.mockResolvedValue({
-      items: [
-        {
-          packageName: "@alice/memory-plus",
-          displayName: "Memory Plus",
-          family: "code-plugin",
-          isOfficial: false,
-          categories: ["memory"],
-        },
-      ],
-    });
-    managementMocks.list.mockResolvedValue({
-      plugins: [
-        {
-          id: "memory-bundle",
-          name: "Memory Bundle",
-          origin: "bundled",
-          installed: false,
-          enabled: false,
-          state: "not-installed",
-        },
-      ],
-      diagnostics: [],
-      mutationAllowed: true,
-    });
+  it.each([undefined, "openclaw-control-ui"])(
+    "keeps local results private while forwarding catalog search attribution: %s",
+    async (searchSource) => {
+      const remote = {
+        packageName: "@alice/memory-plus",
+        displayName: "Memory Plus",
+        family: "code-plugin" as const,
+        isOfficial: false,
+        categories: ["memory"],
+        runtimeId: "memory-plus",
+      };
+      catalogMocks.browse.mockResolvedValue({ items: [remote] });
+      managementMocks.list.mockResolvedValue({
+        plugins: [
+          {
+            id: "memory-bundle",
+            name: "Memory Bundle",
+            packageName: "@openclaw/memory-bundle",
+            origin: "bundled",
+            installed: false,
+            enabled: false,
+            state: "not-installed",
+          },
+        ],
+        diagnostics: [],
+        mutationAllowed: true,
+      });
 
-    const result = await callHandler("plugins.catalog.browse", { query: "memory" });
+      const result = await callHandler("plugins.catalog.browse", {
+        query: "memory",
+        intent: "all",
+        pageSize: 25,
+        ...(searchSource ? { searchSource } : {}),
+      });
 
-    expect(result.response).toMatchObject({
-      items: [{ catalog: { name: "Memory Plus", publishedToClawHub: true } }],
-      remoteError:
-        "ClawHub is unavailable: official catalog unavailable. Bundled publication status could not be verified.",
-    });
-  });
-
-  it("unifies All search with unpublished bundled results before ClawHub matches", async () => {
-    const remote = {
-      packageName: "@alice/memory-plus",
-      displayName: "Memory Plus",
-      family: "code-plugin" as const,
-      isOfficial: false,
-      categories: ["memory"],
-      runtimeId: "memory-plus",
-    };
-    const published = { ...remote, packageName: "@openclaw/published" };
-    catalogMocks.allOfficial.mockResolvedValue([published]);
-    catalogMocks.browse.mockResolvedValue({ items: [remote] });
-    managementMocks.list.mockResolvedValue({
-      plugins: [
-        {
-          id: "memory-bundle",
-          name: "Memory Bundle",
-          packageName: "@openclaw/memory-bundle",
-          origin: "bundled",
-          installed: false,
-          enabled: false,
-          state: "not-installed",
-        },
-      ],
-      diagnostics: [],
-      mutationAllowed: true,
-    });
-
-    const result = await callHandler("plugins.catalog.browse", {
-      query: "memory",
-      intent: "all",
-      pageSize: 25,
-    });
-
-    expect(catalogMocks.browse).toHaveBeenCalledWith({
-      query: "memory",
-      intent: "all",
-      category: undefined,
-      cursor: undefined,
-      limit: 25,
-    });
-    expect(result.response).toMatchObject({
-      items: [
-        { catalog: { name: "Memory Bundle", publishedToClawHub: false } },
-        { catalog: { name: "Memory Plus", publishedToClawHub: true } },
-      ],
-    });
-  });
+      expect(catalogMocks.browse).toHaveBeenCalledWith({
+        query: "memory",
+        intent: "all",
+        category: undefined,
+        cursor: undefined,
+        limit: 25,
+        ...(searchSource ? { searchSource } : {}),
+      });
+      expect(result.response).toMatchObject({
+        items: [
+          { catalog: { name: "Memory Bundle", publishedToClawHub: false } },
+          { catalog: { name: "Memory Plus", publishedToClawHub: true } },
+        ],
+      });
+    },
+  );
 
   it("keeps queried Bundled requests limited to unpublished bundled plugins", async () => {
-    catalogMocks.allOfficial.mockResolvedValue([]);
     managementMocks.list.mockResolvedValue({
       plugins: [
         {
@@ -836,7 +809,7 @@ describe("plugin management Gateway handlers", () => {
         skills: ["Workboard planning"],
         dangerousConfigFlags: [],
       },
-      components: { skills: ["Workboard planning"] },
+      components: emptyInstalledPluginComponents(),
       grants: {
         hooks: {
           allowPromptInjection: { effective: false },
@@ -866,8 +839,8 @@ describe("plugin management Gateway handlers", () => {
       detail: {
         origin: "local",
         packageName: "@openclaw/workboard",
-        mcpServers: ["workboard"],
-        skills: [{ name: "Workboard planning" }],
+        mcpServers: [],
+        skills: [],
       },
     });
   });

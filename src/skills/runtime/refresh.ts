@@ -26,6 +26,7 @@ import {
 } from "../loading/workspace-skill-roots.js";
 import { resolveWorkshopWatchRoots } from "../workshop/skills-root.js";
 import { areOrderedArraysEqual } from "./ordered-array-equality.js";
+import { createRawSkillFileScheduler } from "./refresh-file-stability.js";
 import {
   bumpSkillsSnapshotVersion,
   clearSkillsSnapshotVersionForWorkspace,
@@ -39,6 +40,7 @@ type SkillsPathWatchState = {
   watcher: FSWatcher;
   watchRoot: string;
   depth: number;
+  initialScan: "pending" | "ready" | "error";
   timer?: ReturnType<typeof setTimeout>;
   pendingPath?: string;
   readonly subscribers: Set<string>;
@@ -55,11 +57,6 @@ type WatchTargetCacheEntry = {
   targets: WatchTarget[];
 };
 
-type FileStabilitySnapshot = {
-  size: number;
-  mtimeMs: number;
-};
-
 const log = createSubsystemLogger("gateway/skills");
 // Gateway startup imports this owner before serving turns. Shared watcher handles,
 // including later rebuilds, must inherit that lifetime rather than the triggering turn.
@@ -69,7 +66,6 @@ const CONFIGURED_ROOT_WATCH_DEPTH = 2;
 const MAX_SYMLINK_WATCH_TARGETS_PER_ROOT = 100;
 const MAX_SYMLINK_WATCH_DIRECTORY_SCANS_PER_ROOT = 200;
 const MAX_SYMLINK_WATCH_RAW_ENTRIES_PER_ROOT = 2_000;
-const RAW_SKILL_FILE_POLL_INTERVAL_MS = 100;
 const SKILLS_WATCH_DEBOUNCE_MS = 250;
 // One watcher per unique watched directory. Agent workspaces that include the
 // same shared skill root (the global skills dir, the home skills dir, or a
@@ -77,6 +73,8 @@ const SKILLS_WATCH_DEBOUNCE_MS = 250;
 // opening its own, so open file descriptors scale with distinct directories
 // rather than with agent count.
 const pathWatchers = new Map<string, SkillsPathWatchState>();
+// Retired roots leave pathWatchers before their asynchronous native closes settle.
+const pendingWatcherCloses = new Set<Promise<void>>();
 let nativeWatchCapacityFailed = false;
 // Watch targets each workspace is currently subscribed to, used to reconcile
 // subscriptions and to detect watch-target changes across calls.
@@ -92,6 +90,7 @@ const workspaceWatchLastEnsuredAt = new Map<string, number>();
 // Session turns re-ensure their workspace; entries older than this are treated
 // as abandoned subscriptions and evicted by the next ensure call.
 const SKILLS_WORKSPACE_WATCH_IDLE_TTL_MS = 60 * 60_000;
+const MAX_SKILLS_WORKSPACE_WATCH_STATES = 128;
 
 setSkillsChangeListenerErrorHandler((err) => {
   log.warn(`skills change listener failed: ${String(err)}`);
@@ -389,11 +388,11 @@ function shouldIgnoreSkillsWatchPath(
 }
 
 function isSkillFileWatchPath(watchPath: string): boolean {
-  if (DEFAULT_SKILLS_WATCH_IGNORED.some((re) => re.test(watchPath))) {
-    return false;
-  }
   const normalized = watchPath.replaceAll("\\", "/");
-  return path.posix.basename(normalized) === "SKILL.md";
+  return (
+    path.posix.basename(normalized) === "SKILL.md" &&
+    !DEFAULT_SKILLS_WATCH_IGNORED.some((re) => re.test(watchPath))
+  );
 }
 
 function getRawWatchedPath(details: unknown): string | undefined {
@@ -423,52 +422,12 @@ function resolveRawSkillsWatchPath(rawPath: string, details: unknown): string | 
   return watchedPath ? path.join(watchedPath, rawPath) : undefined;
 }
 
-function readFileStabilitySnapshot(filePath: string): FileStabilitySnapshot | undefined {
-  try {
-    const stat = fs.statSync(filePath);
-    return stat.isFile() ? { size: stat.size, mtimeMs: stat.mtimeMs } : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function waitForStableSkillFile(
-  filePath: string,
-  stabilityMs: number,
-  watcher: FSWatcher,
-): Promise<void> {
-  if (watcher.closed || stabilityMs <= 0) {
-    return;
-  }
-  let previous = readFileStabilitySnapshot(filePath);
-  if (!previous) {
-    return;
-  }
-  let stableForMs = 0;
-  while (stableForMs < stabilityMs) {
-    const delayMs = Math.min(RAW_SKILL_FILE_POLL_INTERVAL_MS, stabilityMs - stableForMs);
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, delayMs);
-    });
-    // Closing a watcher retires raw polling, even while the file keeps changing.
-    const next = watcher.closed ? undefined : readFileStabilitySnapshot(filePath);
-    if (!next) {
-      return;
-    }
-    if (next.size === previous.size && next.mtimeMs === previous.mtimeMs) {
-      stableForMs += delayMs;
-      continue;
-    }
-    previous = next;
-    stableForMs = 0;
-  }
-}
-
 function resolveSkillsWatcherUsePolling(): boolean {
   const envPolling = process.env.CHOKIDAR_USEPOLLING;
   if (envPolling === undefined) {
     const platform: string = process.platform;
-    return platform === "os400";
+    // Remove the Bun default after oven-sh/bun#34160 fixes native watcher registration scaling.
+    return platform === "os400" || Boolean(process.versions.bun);
   }
   const normalized = envPolling.toLowerCase();
   return Boolean(normalized) && normalized !== "false" && normalized !== "0";
@@ -503,7 +462,39 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
     watcher,
     watchRoot: target.watchRoot,
     depth: target.depth,
+    initialScan: "pending",
     subscribers: new Set<string>(),
+  };
+
+  const publishChange = (watcherKey: string, changedPath?: string) => {
+    workspaceWatchTargetCache.delete(watcherKey);
+    bumpSkillsSnapshotVersion({
+      workspaceDir: workspaceWatchOwnerDirs.get(watcherKey) ?? watcherKey,
+      reason: "watch",
+      changedPath,
+    });
+  };
+  const settleInitialScan = (result: "ready" | "error") => {
+    if (
+      watcher.closed ||
+      pathWatchers.get(target.path) !== state ||
+      state.initialScan === "ready" ||
+      state.initialScan === result
+    ) {
+      return;
+    }
+    state.initialScan = result;
+    for (const watcherKey of state.subscribers) {
+      const targets = workspaceWatchTargets.get(watcherKey);
+      if (
+        targets?.every((entry) => {
+          const current = pathWatchers.get(entry.path);
+          return current && !current.watcher.closed && current.initialScan !== "pending";
+        })
+      ) {
+        publishChange(watcherKey);
+      }
+    }
   };
 
   const schedule = (changedPath?: string) => {
@@ -520,26 +511,23 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
       // Fan the change out to every workspace subscribed to this directory so a
       // shared skill root refreshes the snapshot for all agents that use it.
       for (const watcherKey of state.subscribers) {
-        workspaceWatchTargetCache.delete(watcherKey);
-        bumpSkillsSnapshotVersion({
-          workspaceDir: workspaceWatchOwnerDirs.get(watcherKey) ?? watcherKey,
-          reason: "watch",
-          changedPath: pendingPath,
-        });
+        publishChange(watcherKey, pendingPath);
       }
     }, SKILLS_WATCH_DEBOUNCE_MS);
   };
-  const scheduleRawSkillFile = (changedPath: string) => {
-    void waitForStableSkillFile(changedPath, SKILLS_WATCH_DEBOUNCE_MS, watcher)
-      .catch((err: unknown) => {
-        log.warn(`skills watcher stability check failed (${changedPath}): ${String(err)}`);
-      })
-      .then(() => schedule(changedPath));
-  };
+  const scheduleRawSkillFile = createRawSkillFileScheduler({
+    watcher,
+    stabilityMs: SKILLS_WATCH_DEBOUNCE_MS,
+    schedule,
+    onError: (changedPath, err) => {
+      log.warn(`skills watcher stability check failed (${changedPath}): ${String(err)}`);
+    },
+  });
 
   // ignoreInitial suppresses writes discovered before native watches are ready.
-  // Reconcile snapshots read during that gap once the initial scan completes.
-  watcher.on("ready", () => schedule());
+  // Reconcile the whole workspace once its initial scans finish, rather than
+  // rebuilding metadata for every root that becomes ready.
+  watcher.on("ready", () => settleInitialScan("ready"));
   watcher.on("all", (_event, changedPath) => {
     if (isPathInside(target.path, changedPath) || isPathInside(changedPath, target.path)) {
       schedule(changedPath);
@@ -557,8 +545,8 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
     const changedPath = resolveRawSkillsWatchPath(rawPathText, details);
     if (
       changedPath &&
-      isPathInside(target.path, changedPath) &&
-      isSkillFileWatchPath(changedPath)
+      isSkillFileWatchPath(changedPath) &&
+      isPathInside(target.path, changedPath)
     ) {
       if (usePolling) {
         return;
@@ -584,25 +572,33 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
       return;
     }
     log.warn(`skills watcher error (${target.path}): ${String(err)}`);
+    // A failed scan may never emit ready. Let healthy roots reconcile; if the
+    // failed scan continues, its eventual ready still closes that read gap.
+    settleInitialScan("error");
   });
 
   return state;
 }
 
-async function teardownSkillsPathWatcher(state: SkillsPathWatchState): Promise<void> {
+function teardownSkillsPathWatcher(state: SkillsPathWatchState): Promise<void> {
   clearTimeout(state.timer);
-  try {
-    const wasClosed = state.watcher.closed;
-    const closing = state.watcher.close();
-    if (!wasClosed) {
-      // Chokidar removes listeners before pending scans settle. Their late errors
-      // belong to the retired watcher and must not become unhandled events.
-      state.watcher.on("error", () => {});
+  const closing = (async () => {
+    try {
+      const wasClosed = state.watcher.closed;
+      const closed = state.watcher.close();
+      if (!wasClosed) {
+        // Chokidar removes listeners before pending scans settle. Their late errors
+        // belong to the retired watcher and must not become unhandled events.
+        state.watcher.on("error", () => {});
+      }
+      await closed;
+    } catch {
+      // Closing watchers is best effort, including during replacement and shutdown.
     }
-    await closing;
-  } catch {
-    // Closing watchers is best effort, including during replacement and shutdown.
-  }
+  })();
+  pendingWatcherCloses.add(closing);
+  void closing.then(() => pendingWatcherCloses.delete(closing));
+  return closing;
 }
 
 function subscribeWorkspaceToPath(workspaceDir: string, watchTarget: WatchTarget): void {
@@ -667,12 +663,18 @@ function disposeWorkspaceWatchState(
   clearSkillsSnapshotVersionForWorkspace(workspaceDir);
 }
 
-function evictIdleWorkspaceWatchStates(now: number): void {
+function evictWorkspaceWatchStates(now: number): void {
   const cutoff = now - SKILLS_WORKSPACE_WATCH_IDLE_TTL_MS;
   for (const [workspaceDir, lastEnsuredAt] of workspaceWatchLastEnsuredAt) {
     if (lastEnsuredAt < cutoff) {
       disposeWorkspaceWatchState(workspaceDir);
     }
+  }
+  for (const watcherKey of workspaceWatchLastEnsuredAt.keys()) {
+    if (workspaceWatchLastEnsuredAt.size <= MAX_SKILLS_WORKSPACE_WATCH_STATES) {
+      break;
+    }
+    disposeWorkspaceWatchState(watcherKey);
   }
 }
 
@@ -699,17 +701,19 @@ export function ensureSkillsWatcher(params: {
 
   if (!watchEnabled) {
     disposeWorkspaceWatchState(watcherKey, previousTargets);
-    evictIdleWorkspaceWatchStates(now);
+    evictWorkspaceWatchStates(now);
     return;
   }
 
+  // Map order breaks equal-clock ties and promotes reuse without adding a generation.
+  workspaceWatchLastEnsuredAt.delete(watcherKey);
   workspaceWatchLastEnsuredAt.set(watcherKey, now);
+  evictWorkspaceWatchStates(now);
   if (nativeWatchCapacityFailed) {
     // Both skill caches use this version. Rebuild at the existing preparation
     // boundary while native observation is unavailable, without reopening watches.
     workspaceWatchTargetCache.delete(watcherKey);
     bumpSkillsSnapshotVersion({ workspaceDir, reason: "watch" });
-    evictIdleWorkspaceWatchStates(now);
     return;
   }
   const watchTargets = resolveWatchTargets(
@@ -733,7 +737,6 @@ export function ensureSkillsWatcher(params: {
     (watchTarget) => (pathWatchers.get(watchTarget.path)?.depth ?? -1) >= watchTarget.depth,
   );
   if (targetsUnchanged && watcherDepthsCoverTargets) {
-    evictIdleWorkspaceWatchStates(now);
     return;
   }
   const nextTargetKeys = new Set(watchTargets.map((target) => target.path));
@@ -756,7 +759,6 @@ export function ensureSkillsWatcher(params: {
       changedPath: watchTargets.map((target) => target.path).join("|"),
     });
   }
-  evictIdleWorkspaceWatchStates(now);
 }
 
 export async function closeSkillsWatchers(resetState = false): Promise<void> {
@@ -770,11 +772,8 @@ export async function closeSkillsWatchers(resetState = false): Promise<void> {
   workspaceWatchOwnerDirs.clear();
   workspaceWatchTargetCache.clear();
   workspaceWatchLastEnsuredAt.clear();
-  await Promise.all(active.map(teardownSkillsPathWatcher));
-}
-
-if (process.env.VITEST || process.env.NODE_ENV === "test") {
-  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.skillsRefreshTestApi")] = {
-    resetSkillsRefreshForTest: () => closeSkillsWatchers(true),
-  };
+  for (const state of active) {
+    void teardownSkillsPathWatcher(state);
+  }
+  await Promise.all(pendingWatcherCloses);
 }

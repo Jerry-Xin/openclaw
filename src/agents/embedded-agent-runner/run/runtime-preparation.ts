@@ -223,6 +223,7 @@ export async function prepareEmbeddedRunRuntime(input: {
   const requestedThinkLevel = resolveInitialThinkLevel({
     requested: params.thinkLevel,
     config: params.config,
+    agentId: params.agentId,
     provider,
     modelId,
     model: models.effective,
@@ -564,6 +565,7 @@ export async function prepareEmbeddedRunRuntime(input: {
       agentHarness,
       pluginHarnessOwnsTransport,
       effectiveModel: models.effective,
+      modelContextWindow: models.runtime.contextWindow,
       contextTokenBudget,
       authoredContextTokenCap,
       contextWindowInfo,

@@ -37,7 +37,7 @@ type SkillCollectionReviewResult = {
   dropped: Array<{ name: string; reason: string }>;
 };
 
-export type SkillCollectionReviewStatus = {
+type SkillCollectionReviewStatus = {
   attemptedAtMs: number;
   succeededAtMs?: number;
   error?: string;

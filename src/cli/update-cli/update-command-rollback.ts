@@ -10,6 +10,7 @@ import {
 import { withConfigMutationLock } from "../../config/mutate.js";
 import { resolveStateDir } from "../../config/paths.js";
 import type { ConfigFileSnapshot } from "../../config/types.openclaw.js";
+import { readGatewayServiceState, resolveGatewayService } from "../../daemon/service.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import type { PackageUpdateTransaction } from "../../infra/package-update-steps.js";
 import { replaceFileAtomic } from "../../infra/replace-file.js";
@@ -25,16 +26,19 @@ import { assertUpdateRecoveryAdmission } from "../../infra/update-run-recovery-a
 import type { UpdateRunResult } from "../../infra/update-runner.js";
 import type { OpenClawSchemaVersions } from "../../state/openclaw-schema-versions.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
-import { confirmGatewayReachable } from "../daemon-cli/restart-health-probe.js";
 import type { UpdateCommandOptions } from "./shared.js";
 import {
   readUpdateConfigSnapshot,
   type UpdateConfigSnapshot,
 } from "./update-command-config-snapshot.js";
-import { withOwnedManagedUpdateEnv } from "./update-command-managed-context.js";
 import { readPackageUpdateIdentity } from "./update-command-package.js";
 import { runUpdatedInstallGatewayCommand } from "./update-command-service-command.js";
-import { createWindowsTaskAutoStartGuard } from "./update-command-service-maintenance.js";
+import { withOwnedManagedUpdateEnv } from "./update-command-service-env.js";
+import {
+  createWindowsTaskAutoStartGuard,
+  revalidateManagedGatewayServiceAfterUpdate,
+} from "./update-command-service-maintenance.js";
+import { assertGatewayServiceManagementAllowedForUpdate } from "./update-command-service-plan.js";
 import {
   maybeRestartService,
   maybeResumeWindowsTaskAutoStartAfterPackageUpdate,
@@ -82,14 +86,12 @@ export async function rollbackFailedUpdate(params: {
       assertCurrent();
       // A lost live context (including the same run ID) is not permission to
       // fall back to legacy rollback, even when publication removed the main DB.
-      await assertUpdateRecoveryAdmission({ env });
+      const targetPath = resolveOpenClawStateSqlitePath(env);
+      await assertUpdateRecoveryAdmission({ env, path: targetPath });
       assertCurrent();
       // Service authority and diagnostic history can select distinct state
       // roots. Neither may contain pending recovery before legacy mutation.
-      if (
-        opts.run &&
-        resolveOpenClawStateSqlitePath(opts.run.env) !== resolveOpenClawStateSqlitePath(env)
-      ) {
+      if (opts.run && resolveOpenClawStateSqlitePath(opts.run.env) !== targetPath) {
         await assertUpdateRecoveryAdmission({ env: opts.run.env });
         assertCurrent();
       }
@@ -152,6 +154,7 @@ export async function rollbackFailedUpdate(params: {
       env,
       root: result.root ?? null,
       nodeRunner: params.nodeRunner,
+      timeoutMs: params.timeoutMs,
     });
     assertCurrent();
     const sharedPath = resolveOpenClawStateSqlitePath(env);
@@ -178,7 +181,7 @@ export async function rollbackFailedUpdate(params: {
       const supported = params.previousSchemaVersions?.[kind];
       if (supported === undefined || version > supported) {
         throw new Error(
-          `Automatic rollback refused: newly created ${kind} database ${entry.path} uses schema ${version}; retained previous package support is ${supported ?? "unknown"}. Keep the candidate installed.`,
+          `Automatic rollback refused: newly created ${kind} database ${entry.path} uses schema ${version}; retained previous package support is ${supported ?? "unknown"}. Keep the update installed.`,
         );
       }
     }
@@ -241,6 +244,7 @@ export async function rollbackFailedUpdate(params: {
         shouldRestart: true,
         jsonMode: opts.json === true,
         expectedService: before,
+        allowInstallRootChange: packageTransaction !== undefined,
         timeoutMs: params.timeoutMs,
       }),
     );
@@ -258,32 +262,19 @@ export async function rollbackFailedUpdate(params: {
       stopped.serviceMutationAllowed === false ||
       (stopped.running && !stopped.stopped)
     ) {
-      throw new Error(stopped.blockMessage ?? "Candidate service could not be stopped safely.");
+      throw new Error(stopped.blockMessage ?? "Update service could not be stopped safely.");
     }
     return stopped;
-  };
-  const stopIfUnreachable = async () => {
-    assertCurrent();
-    if (port !== undefined) {
-      const { reachable } = await confirmGatewayReachable({ port, env });
-      assertCurrent();
-      if (!reachable) {
-        await stop();
-      }
-    }
   };
   try {
     assertCurrent();
     if (params.rollbackBlockedReason) {
-      await stopIfUnreachable();
       return failed(params.rollbackBlockedReason);
     }
     if (!params.schemaVersions) {
-      await stopIfUnreachable();
       return failed("rollback-state-unverified");
     }
     if (!(await stateUnchanged())) {
-      await stopIfUnreachable();
       return failed("state-migrated-no-rollback");
     }
     await packageTransaction?.assertRollbackSafe?.();
@@ -395,7 +386,7 @@ export async function rollbackFailedUpdate(params: {
     assertCurrent();
     // A failed candidate does not authorize its restart. The previous package's
     // pre-activation verification authorizes restarting this schema-neutral restoration.
-    const verdict = stopped.serviceUpdateVerdict ?? before?.serviceUpdateVerdict;
+    let verdict = stopped.serviceUpdateVerdict ?? before?.serviceUpdateVerdict;
     const nodeRunner = before?.serviceNodeRunner ?? params.nodeRunner;
     if (verdict?.kind === "owned" && verdict.refreshDefinition) {
       await runUpdatedInstallGatewayCommand(
@@ -411,6 +402,19 @@ export async function rollbackFailedUpdate(params: {
         },
         "install",
       );
+      const state = await readGatewayServiceState(resolveGatewayService(), {
+        env: recoveryEnv,
+        requireEffective: true,
+        requireLoadedCommand: true,
+        validateEnvBeforeStatusRead: assertGatewayServiceManagementAllowedForUpdate,
+        timeoutMs: params.timeoutMs,
+      });
+      assertCurrent();
+      verdict = await revalidateManagedGatewayServiceAfterUpdate({
+        state,
+        root: params.previousRoot,
+        preManagedServiceStop: stopped,
+      });
     }
     assertCurrent();
     result.recovery = {
@@ -465,7 +469,7 @@ export async function rollbackFailedUpdate(params: {
       ...(verifiedAtMs === undefined ? {} : { verifiedAtMs }),
     };
   } catch (error) {
-    let detail = formatErrorMessage(error);
+    const detail = formatErrorMessage(error);
     try {
       assertCurrent();
     } catch (cause) {
@@ -482,19 +486,6 @@ export async function rollbackFailedUpdate(params: {
     }
     if (error instanceof NativePackageRollbackError) {
       failureReason = error.reason;
-    }
-    if (
-      failureReason === "rollback-state-unverified" ||
-      failureReason === "state-migrated-no-rollback" ||
-      error instanceof NativePackageRollbackError
-    ) {
-      const reason = failureReason;
-      try {
-        await stopIfUnreachable();
-        failureReason = reason;
-      } catch (stopError) {
-        detail += `; ${formatErrorMessage(stopError)}`;
-      }
     }
     assertCurrent();
     if (opts.run) {

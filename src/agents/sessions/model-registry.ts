@@ -4,10 +4,11 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { normalizeResolvedPricing } from "@openclaw/llm-core";
+import type { ModelCatalogContextWindowOption } from "@openclaw/model-catalog-core/model-catalog-types";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
-import { type Static, Type } from "typebox";
-import { Compile } from "typebox/compile";
-import type { TLocalizedValidationError } from "typebox/error";
+import { projectConfigOntoRuntimeSourceSnapshot } from "../../config/runtime-source-projection.js";
+import type { ModelProviderConfig } from "../../config/types.models.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type {
   AnthropicMessagesCompat,
@@ -21,16 +22,25 @@ import type {
 } from "../../llm/types.js";
 import type { OAuthProviderInterface } from "../../llm/utils/oauth/types.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { normalizeOptionalSecretInput } from "../../utils/normalize-secret-input.js";
 import { getAgentDir } from "../config.js";
+import { sanitizeModelHeaders } from "../embedded-agent-runner/model.inline-provider.js";
 import { hasUsableCustomProviderApiKey } from "../model-auth-provider-config.js";
 import { parseModelCatalogJson } from "../model-catalog-json.js";
 import { modelTransportRoutesMatch } from "../model-compat-catalog.js";
 import { resolveModelPluginMetadataSnapshot } from "../model-discovery-context.js";
-import { mergeProviderModels } from "../models-config.merge.js";
+import {
+  buildSourceModelFields,
+  mergeProviderModels,
+  normalizeProviderMapKeys,
+  type ProviderModelCatalog,
+} from "../models-config.merge.js";
+import { materializeConfiguredProviderCatalogModels } from "../models-config.providers.catalog.js";
 import {
   filterGeneratedPluginModelCatalogProviders,
   isGeneratedPluginModelCatalog,
-  loadPersistedPluginModelCatalogs,
+  inspectLegacyPluginModelCatalogs,
+  loadPersistedPluginModelCatalogsReadOnly,
   type PersistedPluginModelCatalog,
   type PluginModelCatalogMetadataSnapshot,
 } from "../plugin-model-catalog.js";
@@ -41,6 +51,12 @@ import {
   initializeModelRegistryRuntime,
   resetModelRegistryRuntime,
 } from "./model-registry-runtime.js";
+import {
+  formatValidationPath,
+  validateModelsConfig,
+  type ModelsConfig,
+  type ProviderAuthMode,
+} from "./model-registry-schema.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
 import {
   resolveConfigValueOrThrow,
@@ -50,195 +66,31 @@ import {
 
 const log = createSubsystemLogger("agents/model-registry");
 
-// Schema for OpenRouter routing preferences
-const PercentileCutoffsSchema = Type.Object({
-  p50: Type.Optional(Type.Number()),
-  p75: Type.Optional(Type.Number()),
-  p90: Type.Optional(Type.Number()),
-  p99: Type.Optional(Type.Number()),
-});
-
-const OpenRouterRoutingSchema = Type.Object({
-  allow_fallbacks: Type.Optional(Type.Boolean()),
-  require_parameters: Type.Optional(Type.Boolean()),
-  data_collection: Type.Optional(Type.Union([Type.Literal("deny"), Type.Literal("allow")])),
-  zdr: Type.Optional(Type.Boolean()),
-  enforce_distillable_text: Type.Optional(Type.Boolean()),
-  order: Type.Optional(Type.Array(Type.String())),
-  only: Type.Optional(Type.Array(Type.String())),
-  ignore: Type.Optional(Type.Array(Type.String())),
-  quantizations: Type.Optional(Type.Array(Type.String())),
-  sort: Type.Optional(
-    Type.Union([
-      Type.String(),
-      Type.Object({
-        by: Type.Optional(Type.String()),
-        partition: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-      }),
-    ]),
-  ),
-  max_price: Type.Optional(
-    Type.Object({
-      prompt: Type.Optional(Type.Union([Type.Number(), Type.String()])),
-      completion: Type.Optional(Type.Union([Type.Number(), Type.String()])),
-      image: Type.Optional(Type.Union([Type.Number(), Type.String()])),
-      audio: Type.Optional(Type.Union([Type.Number(), Type.String()])),
-      request: Type.Optional(Type.Union([Type.Number(), Type.String()])),
-    }),
-  ),
-  preferred_min_throughput: Type.Optional(Type.Union([Type.Number(), PercentileCutoffsSchema])),
-  preferred_max_latency: Type.Optional(Type.Union([Type.Number(), PercentileCutoffsSchema])),
-});
-
-// Schema for Vercel AI Gateway routing preferences
-const VercelGatewayRoutingSchema = Type.Object({
-  only: Type.Optional(Type.Array(Type.String())),
-  order: Type.Optional(Type.Array(Type.String())),
-});
-
-// Schema for thinking level support and provider-specific values
-const ThinkingLevelMapValueSchema = Type.Union([Type.String(), Type.Null()]);
-const ThinkingLevelMapSchema = Type.Object({
-  off: Type.Optional(ThinkingLevelMapValueSchema),
-  minimal: Type.Optional(ThinkingLevelMapValueSchema),
-  low: Type.Optional(ThinkingLevelMapValueSchema),
-  medium: Type.Optional(ThinkingLevelMapValueSchema),
-  high: Type.Optional(ThinkingLevelMapValueSchema),
-  xhigh: Type.Optional(ThinkingLevelMapValueSchema),
-  max: Type.Optional(ThinkingLevelMapValueSchema),
-});
-
-const OpenAICompletionsCompatSchema = Type.Object({
-  supportsStore: Type.Optional(Type.Boolean()),
-  supportsDeveloperRole: Type.Optional(Type.Boolean()),
-  supportsReasoningEffort: Type.Optional(Type.Boolean()),
-  supportsUsageInStreaming: Type.Optional(Type.Boolean()),
-  maxTokensField: Type.Optional(
-    Type.Union([Type.Literal("max_completion_tokens"), Type.Literal("max_tokens")]),
-  ),
-  requiresToolResultName: Type.Optional(Type.Boolean()),
-  requiresAssistantAfterToolResult: Type.Optional(Type.Boolean()),
-  requiresThinkingAsText: Type.Optional(Type.Boolean()),
-  requiresReasoningContentOnAssistantMessages: Type.Optional(Type.Boolean()),
-  thinkingFormat: Type.Optional(
-    Type.Union([
-      Type.Literal("openai"),
-      Type.Literal("openrouter"),
-      Type.Literal("together"),
-      Type.Literal("deepseek"),
-      Type.Literal("zai"),
-      Type.Literal("qwen"),
-      Type.Literal("qwen-chat-template"),
-    ]),
-  ),
-  cacheControlFormat: Type.Optional(Type.Literal("anthropic")),
-  openRouterRouting: Type.Optional(OpenRouterRoutingSchema),
-  vercelGatewayRouting: Type.Optional(VercelGatewayRoutingSchema),
-  supportsStrictMode: Type.Optional(Type.Boolean()),
-  supportsJsonSchemaResponseFormat: Type.Optional(Type.Boolean()),
-  supportsLongCacheRetention: Type.Optional(Type.Boolean()),
-});
-
-const OpenAIResponsesCompatSchema = Type.Object({
-  supportsTemperature: Type.Optional(Type.Boolean()),
-  supportsInstructions: Type.Optional(Type.Boolean()),
-  sendSessionIdHeader: Type.Optional(Type.Boolean()),
-  supportsLongCacheRetention: Type.Optional(Type.Boolean()),
-});
-
-const AnthropicMessagesCompatSchema = Type.Object({
-  supportsEagerToolInputStreaming: Type.Optional(Type.Boolean()),
-  supportsLongCacheRetention: Type.Optional(Type.Boolean()),
-});
-
-const ProviderCompatSchema = Type.Union([
-  OpenAICompletionsCompatSchema,
-  OpenAIResponsesCompatSchema,
-  AnthropicMessagesCompatSchema,
-]);
-
-const ProviderAuthModeSchema = Type.Union([
-  Type.Literal("api-key"),
-  Type.Literal("aws-sdk"),
-  Type.Literal("oauth"),
-  Type.Literal("token"),
-]);
-type ProviderAuthMode = Static<typeof ProviderAuthModeSchema>;
-
-// Schema for custom model definition
-// Most fields are optional with sensible defaults for local models (Ollama, LM Studio, etc.)
-const ModelDefinitionSchema = Type.Object({
-  id: Type.String({ minLength: 1 }),
-  name: Type.Optional(Type.String({ minLength: 1 })),
-  api: Type.Optional(Type.String({ minLength: 1 })),
-  baseUrl: Type.Optional(Type.String({ minLength: 1 })),
-  reasoning: Type.Optional(Type.Boolean()),
-  thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
-  input: Type.Optional(
-    Type.Array(
-      Type.Union([
-        Type.Literal("text"),
-        Type.Literal("image"),
-        Type.Literal("audio"),
-        Type.Literal("video"),
-      ]),
-    ),
-  ),
-  cost: Type.Optional(
-    Type.Object({
-      input: Type.Number(),
-      output: Type.Number(),
-      cacheRead: Type.Number(),
-      cacheWrite: Type.Number(),
-    }),
-  ),
-  contextWindow: Type.Optional(Type.Number()),
-  maxTokens: Type.Optional(Type.Number()),
-  params: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-  headers: Type.Optional(Type.Record(Type.String(), Type.String())),
-  compat: Type.Optional(ProviderCompatSchema),
-});
-
-const ProviderConfigSchema = Type.Object({
-  name: Type.Optional(Type.String({ minLength: 1 })),
-  baseUrl: Type.Optional(Type.String({ minLength: 1 })),
-  apiKey: Type.Optional(Type.String({ minLength: 1 })),
-  auth: Type.Optional(ProviderAuthModeSchema),
-  api: Type.Optional(Type.String({ minLength: 1 })),
-  headers: Type.Optional(Type.Record(Type.String(), Type.String())),
-  compat: Type.Optional(ProviderCompatSchema),
-  authHeader: Type.Optional(Type.Boolean()),
-  models: Type.Optional(Type.Array(ModelDefinitionSchema)),
-});
-
-const ModelsConfigSchema = Type.Object({
-  generatedBy: Type.Optional(Type.String()),
-  providers: Type.Record(Type.String(), ProviderConfigSchema),
-});
-
-const validateModelsConfig = Compile(ModelsConfigSchema);
-
-type ModelsConfig = Static<typeof ModelsConfigSchema>;
 type MaxTokensSource = "configured" | "discovered";
 type RegistryProviderSources = Record<
   string,
-  Omit<ModelsConfig["providers"][string], "models"> & {
-    models?: Array<Static<typeof ModelDefinitionSchema> & { maxTokensSource?: MaxTokensSource }>;
-  }
+  ProviderModelCatalog &
+    Pick<ModelsConfig["providers"][string], "apiKey" | "auth" | "authHeader"> & {
+      headers?: Record<string, string>;
+    }
 >;
 
-function formatValidationPath(error: TLocalizedValidationError): string {
-  if (error.keyword === "required") {
-    const requiredProperties = (error.params as { requiredProperties?: string[] })
-      .requiredProperties;
-    const requiredProperty = requiredProperties?.[0];
-    if (requiredProperty) {
-      const basePath = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
-      return basePath ? `${basePath}.${requiredProperty}` : requiredProperty;
-    }
-  }
-  const path = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
-  return path || "root";
+function captureInventoryProvider(
+  provider: ProviderModelCatalog,
+  source: "static" | "composed",
+): RegistryProviderSources[string] {
+  return {
+    api: provider.api,
+    baseUrl: provider.baseUrl,
+    compat: provider.compat,
+    models: provider.models?.map(({ headers: _headers, ...model }) => ({
+      ...model,
+      api: model.api ?? provider.api,
+      baseUrl: model.baseUrl ?? provider.baseUrl,
+      maxTokensSource: source === "static" ? "discovered" : model.maxTokensSource,
+      compat: source === "static" ? mergeCompat(provider.compat, model.compat) : model.compat,
+    })),
+  };
 }
 
 interface ProviderRequestConfig {
@@ -275,6 +127,7 @@ type ModelRegistryOptions = {
   includePluginCatalogs?: boolean;
   modelsJsonContents?: string | null;
   pluginCatalogs?: readonly PersistedPluginModelCatalog[];
+  staticProviderConfigs?: Readonly<Record<string, ModelProviderConfig>>;
   pluginMetadataSnapshot?: PluginModelCatalogMetadataSnapshot;
   sourceSnapshot?: ModelRegistry;
   workspaceDir?: string;
@@ -339,6 +192,7 @@ export class ModelRegistry {
   private modelsJsonPath: string | undefined;
   private modelsJsonContents: string | null | undefined;
   private pluginCatalogs: readonly PersistedPluginModelCatalog[] | undefined;
+  private staticProviderConfigs: Readonly<Record<string, ModelProviderConfig>> | undefined;
   private pluginMetadataSnapshot: PluginModelCatalogMetadataSnapshot | undefined;
   private includePluginCatalogs = true;
   private baseCatalogSnapshot: ModelRegistryCatalogSnapshot | undefined;
@@ -348,6 +202,7 @@ export class ModelRegistry {
     authStorage: AuthStorage,
     modelsJsonPath: string | undefined,
     options: ModelRegistryOptions = {},
+    publishedModels?: ReadonlyMap<string, readonly Model[]>,
   ) {
     this.authStorage = authStorage;
     this.config = options.config ?? options.sourceSnapshot?.config;
@@ -355,7 +210,16 @@ export class ModelRegistry {
     initializeModelRegistryRuntime(this);
     if (options.sourceSnapshot) {
       const source = options.sourceSnapshot;
-      const sourceSnapshot = source.baseCatalogSnapshot ?? source.captureCatalogSnapshot();
+      const captured = source.baseCatalogSnapshot ?? source.captureCatalogSnapshot();
+      const sourceSnapshot = publishedModels
+        ? {
+            ...captured,
+            models: [
+              ...captured.models.filter((model) => !publishedModels.has(model.provider)),
+              ...[...publishedModels.values()].flat(),
+            ],
+          }
+        : captured;
       this.sourceSnapshot = sourceSnapshot;
       this.baseCatalogSnapshot = sourceSnapshot;
       this.restoreSourceCatalog(sourceSnapshot);
@@ -374,7 +238,9 @@ export class ModelRegistry {
     this.modelsJsonPath = modelsJsonPath;
     this.modelsJsonContents = options.modelsJsonContents;
     this.pluginCatalogs = options.pluginCatalogs;
+    this.staticProviderConfigs = options.staticProviderConfigs;
     this.pluginMetadataSnapshot = resolveModelPluginMetadataSnapshot({
+      config: this.config,
       ...(options.pluginMetadataSnapshot
         ? { pluginMetadataSnapshot: options.pluginMetadataSnapshot }
         : {}),
@@ -426,8 +292,11 @@ export class ModelRegistry {
   }
 
   /** Creates a request-isolated registry from this lifecycle-owned catalog snapshot. */
-  fork(authStorage: AuthStorage): ModelRegistry {
-    return new ModelRegistry(authStorage, undefined, { sourceSnapshot: this });
+  fork(
+    authStorage: AuthStorage,
+    publishedModels?: ReadonlyMap<string, readonly Model[]>,
+  ): ModelRegistry {
+    return new ModelRegistry(authStorage, undefined, { sourceSnapshot: this }, publishedModels);
   }
 
   /**
@@ -471,20 +340,45 @@ export class ModelRegistry {
   private loadModels(): void {
     // Keep authored models.json separate from rebuildable provider catalogs
     // owned by the agent SQLite cache.
+    const replace = this.config?.models?.mode === "replace";
     const customResult =
-      this.modelsJsonPath && this.modelsJsonContents !== null
+      !replace && this.modelsJsonPath && this.modelsJsonContents !== null
         ? this.loadCustomModels(this.modelsJsonPath, {
             ...(this.modelsJsonContents !== undefined ? { contents: this.modelsJsonContents } : {}),
             includePluginCatalogs: this.includePluginCatalogs && this.pluginCatalogs === undefined,
           })
         : emptyCustomModelsResult();
     const capturedPluginResult =
-      this.includePluginCatalogs && this.pluginCatalogs !== undefined
+      !replace && this.includePluginCatalogs && this.pluginCatalogs !== undefined
         ? this.loadCapturedPluginCatalogs(this.pluginCatalogs)
         : emptyCustomModelsResult();
     const errors = [customResult.error, capturedPluginResult.error].filter(
       (error): error is string => Boolean(error),
     );
+
+    if (
+      !replace &&
+      this.modelsJsonPath &&
+      this.modelsJsonContents === undefined &&
+      this.pluginCatalogs === undefined &&
+      this.staticProviderConfigs === undefined &&
+      this.includePluginCatalogs
+    ) {
+      // Only explicit disk discovery/refresh inspects legacy sources; hot lookups
+      // and lifecycle-captured registries consume their existing catalog snapshot.
+      const inspected = inspectLegacyPluginModelCatalogs(dirname(this.modelsJsonPath));
+      const diagnostics = [
+        ...inspected.warnings,
+        ...inspected.catalogs.map(
+          ({ pathname }) => `Legacy generated provider catalog: ${pathname}`,
+        ),
+      ];
+      if (diagnostics.length > 0) {
+        errors.push(
+          `${diagnostics.join("\n")}\nRun openclaw doctor --fix to verify and import legacy provider catalogs.`,
+        );
+      }
+    }
 
     if (errors.length > 0) {
       this.loadError = errors.join("\n\n");
@@ -492,9 +386,62 @@ export class ModelRegistry {
       // Plugin catalog failures can return salvaged models; root failures return empty.
     }
 
-    let combined = this.parseModels(
-      this.mergeProviderSources(capturedPluginResult.providers, customResult.providers),
+    const providers = this.mergeProviderSources(
+      replace
+        ? {}
+        : Object.fromEntries(
+            Object.entries(this.staticProviderConfigs ?? {}).map(([provider, config]) => [
+              provider,
+              captureInventoryProvider(config, "static"),
+            ]),
+          ),
+      capturedPluginResult.providers,
+      customResult.providers,
     );
+    const sourceFields = buildSourceModelFields(
+      materializeConfiguredProviderCatalogModels(
+        this.config && projectConfigOntoRuntimeSourceSnapshot(this.config).models?.providers,
+        { manifestPlugins: this.pluginMetadataSnapshot },
+      ),
+    );
+    for (const [providerId, configured] of Object.entries(
+      normalizeProviderMapKeys(
+        materializeConfiguredProviderCatalogModels(this.config?.models?.providers, {
+          manifestPlugins: this.pluginMetadataSnapshot,
+        }),
+      ),
+    )) {
+      const inherited = providers[providerId];
+      const accepted = new Map(inherited?.models?.map((model) => [model.id, model]));
+      const current: RegistryProviderSources[string] = {
+        api: configured.api,
+        baseUrl: configured.baseUrl,
+        models: configured.models?.map((model) => ({
+          ...model,
+          api: model.api ?? accepted.get(model.id)?.api ?? configured.api,
+          baseUrl: model.baseUrl ?? accepted.get(model.id)?.baseUrl ?? configured.baseUrl,
+          maxTokensSource: "configured",
+          headers: sanitizeModelHeaders(model.headers, { stripSecretRefMarkers: true }),
+        })),
+      };
+      providers[providerId] = inherited
+        ? mergeProviderModels(captureInventoryProvider(inherited, "composed"), current, {
+            providerId,
+            modelIdMatching: "exact",
+            sourceModelFields: sourceFields,
+          })
+        : current;
+      this.providerRequestConfigs.delete(providerId);
+      // Current config owns provider request settings, including accepted catalog routes.
+      // File-only callers retain the authored-endpoint scope captured by loadCustomModels.
+      this.storeProviderRequestConfig(providerId, {
+        apiKey: normalizeOptionalSecretInput(configured.apiKey),
+        auth: configured.auth,
+        authHeader: configured.authHeader,
+        headers: sanitizeModelHeaders(configured.headers, { stripSecretRefMarkers: true }),
+      });
+    }
+    let combined = this.parseModels(providers);
 
     // Let OAuth providers modify their models (e.g., update baseUrl)
     for (const oauthProvider of this.authStorage.getOAuthProviders()) {
@@ -637,9 +584,7 @@ export class ModelRegistry {
       if (options.includePluginCatalogs !== false) {
         let pluginCatalogs: readonly PersistedPluginModelCatalog[] = [];
         try {
-          const loaded = loadPersistedPluginModelCatalogs(dirname(modelsJsonPath));
-          pluginCatalogs = loaded.catalogs;
-          pluginCatalogErrors.push(...loaded.warnings);
+          pluginCatalogs = loadPersistedPluginModelCatalogsReadOnly(dirname(modelsJsonPath));
         } catch (error) {
           pluginCatalogErrors.push(
             `Failed to load generated plugin model catalogs: ${
@@ -650,7 +595,9 @@ export class ModelRegistry {
         const pluginResult = this.loadCapturedPluginCatalogs(pluginCatalogs);
         sourceProviders = this.mergeProviderSources(pluginResult.providers, sourceProviders);
         if (pluginResult.error) {
-          pluginCatalogErrors.push(pluginResult.error);
+          pluginCatalogErrors.push(
+            `${pluginResult.error}\nRun openclaw doctor --fix to repair persisted generated provider catalogs.`,
+          );
         }
       }
 
@@ -738,7 +685,6 @@ export class ModelRegistry {
         }
 
         this.storeModelHeaders(providerName, modelDef.id, modelDef.headers);
-        const defaultCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
         models.push({
           id: modelDef.id,
           name: modelDef.name ?? modelDef.id,
@@ -748,8 +694,11 @@ export class ModelRegistry {
           reasoning: modelDef.reasoning ?? false,
           thinkingLevelMap: modelDef.thinkingLevelMap,
           input: runtimeInput,
-          cost: modelDef.cost ?? defaultCost,
+          cost: normalizeResolvedPricing(modelDef.cost ?? {}),
           contextWindow: modelDef.contextWindow ?? 128000,
+          contextTokens: modelDef.contextTokens,
+          contextWindows: modelDef.contextWindows,
+          contextWindowDefault: modelDef.contextWindowDefault,
           maxTokens: modelDef.maxTokens ?? 16384,
           ...(modelDef.maxTokens !== undefined
             ? { maxTokensSource: modelDef.maxTokensSource }
@@ -1095,6 +1044,9 @@ export class ModelRegistry {
           input: modelDef.input,
           cost: modelDef.cost,
           contextWindow: modelDef.contextWindow,
+          contextTokens: modelDef.contextTokens,
+          contextWindows: modelDef.contextWindows,
+          contextWindowDefault: modelDef.contextWindowDefault,
           maxTokens: modelDef.maxTokens,
           params: modelDef.params,
           headers: undefined,
@@ -1141,6 +1093,9 @@ export interface ProviderConfigInput {
     input: ("text" | "image")[];
     cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
     contextWindow: number;
+    contextTokens?: number;
+    contextWindows?: ModelCatalogContextWindowOption[];
+    contextWindowDefault?: string;
     maxTokens: number;
     params?: Record<string, unknown>;
     headers?: Record<string, string>;

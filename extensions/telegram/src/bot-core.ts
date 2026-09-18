@@ -32,7 +32,7 @@ import { getOrCreateAccountThrottler } from "./account-throttler.js";
 import { resolveTelegramAccount } from "./accounts.js";
 import { normalizeTelegramApiRoot } from "./api-root.js";
 import type { TelegramBotDeps } from "./bot-deps.js";
-import { registerTelegramHandlers } from "./bot-handlers.runtime.js";
+import { createTelegramHandlers } from "./bot-handlers.runtime.js";
 import {
   createTelegramMessageProcessor,
   resolveTelegramMessageTurnSettings,
@@ -72,7 +72,7 @@ import {
 } from "./group-history-window.js";
 import { registerTelegramOutboundGroupHistoryRecorder } from "./outbound-message-context.js";
 import {
-  prepareTelegramPollAnswerContext,
+  prepareTelegramPollAnswerContextAsync,
   settleTelegramPollAnswerContext,
 } from "./poll-answer-context.js";
 import { formatTelegramRawUpdateForLog } from "./raw-update-log.js";
@@ -245,9 +245,9 @@ export function createTelegramBotCore(
     }
   });
 
-  // Durable transports start the answer after spool commit; classic polling and
-  // restart replay start it here. Both paths precede same-lane sequentialization
-  // so callback acknowledgements cannot wait for earlier handlers.
+  // Both transports start callback answers after spool commit. Reuse that
+  // answer or start a missing one before same-lane sequentialization so
+  // callback acknowledgements cannot wait for earlier handlers.
   bot.use(async (ctx, next) => {
     const callback = ctx.callbackQuery;
     if (callback) {
@@ -264,7 +264,10 @@ export function createTelegramBotCore(
   // sequentialize so the vote shares the same lane as ordinary session turns.
   bot.use(async (ctx, next) => {
     try {
-      prepareTelegramPollAnswerContext({ update: ctx.update, accountId: account.accountId });
+      await prepareTelegramPollAnswerContextAsync({
+        update: ctx.update,
+        accountId: account.accountId,
+      });
     } catch (error) {
       if (isTelegramSpooledReplayUpdate(ctx.update)) {
         recordTelegramMessageProcessingResult({ kind: "failed-retryable", error });
@@ -393,22 +396,7 @@ export function createTelegramBotCore(
     return resolveTelegramScopedGroupConfig(turnTelegramCfg, chatId, messageThreadId);
   };
 
-  const processMessage = createTelegramMessageProcessor({
-    bot,
-    account,
-    groupHistories,
-    logger,
-    resolveGroupActivation,
-    resolveGroupRequireMention,
-    resolveTelegramGroupConfig,
-    sendChatActionHandler,
-    runtime,
-    buildContext: opts.buildContext,
-    opts: runtimeOpts,
-    telegramDeps,
-  });
-
-  const nativeCommandCallbackDispatcher = registerTelegramNativeCommands({
+  const { nativeCommandNames, nativeCommandCallbackDispatcher } = registerTelegramNativeCommands({
     bot,
     cfg,
     runtime,
@@ -427,7 +415,24 @@ export function createTelegramBotCore(
     },
   });
 
-  registerTelegramHandlers({
+  const processMessage = createTelegramMessageProcessor({
+    nativeCommandNames,
+    bot,
+    account,
+    groupHistories,
+    logger,
+    resolveGroupActivation,
+    resolveGroupRequireMention,
+    resolveTelegramGroupConfig,
+    sendChatActionHandler,
+    runtime,
+    buildContext: opts.buildContext,
+    opts: runtimeOpts,
+    telegramDeps,
+  });
+
+  const handlers = createTelegramHandlers({
+    nativeCommandNames,
     cfg,
     accountId: account.accountId,
     ownerAgentId,
@@ -464,8 +469,9 @@ export function createTelegramBotCore(
       ),
     logger,
     telegramDeps,
-    nativeCommandCallbackDispatcher,
   });
+
+  handlers.register(nativeCommandCallbackDispatcher);
 
   const originalStop = bot.stop.bind(bot);
   bot.stop = ((...args: Parameters<typeof originalStop>) => {

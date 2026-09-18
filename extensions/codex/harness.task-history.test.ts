@@ -90,7 +90,7 @@ async function fixture(supervised = false) {
   });
   const bindingStore = createCodexTestBindingStore();
   const pluginConfig = supervised ? { supervision: { enabled: true } } : undefined;
-  const connection = resolveCodexBindingAppServerConnection({ pluginConfig, agentDir });
+  const connection = await resolveCodexBindingAppServerConnection({ pluginConfig, agentDir });
   let binding: CodexAppServerThreadBinding = {
     threadId: "parent-thread",
     cwd: directory,
@@ -185,7 +185,50 @@ async function fixture(supervised = false) {
   };
 }
 
+function stampHistoryOwner(f: Awaited<ReturnType<typeof fixture>>, lifecycleRevision?: string) {
+  const owner = createCodexNativeSubagentHistoryOwner({
+    parentThreadId: f.binding.threadId,
+    sessionId: f.identity.sessionId,
+    lifecycleRevision,
+    binding: f.binding,
+  })!;
+  f.params.task = { ...f.params.task, detail: { nativeHistory: owner } };
+  return owner;
+}
+
 describe("native subagent history through the harness", () => {
+  it.each([
+    { type: "collabAgentToolCall", tool: "wait", status: "completed", expected: undefined },
+    { type: "collabAgentToolCall", tool: "wait", status: "failed", expected: "failed" },
+    { type: "collabAgentToolCall", tool: "wait", status: "interrupted", expected: "failed" },
+    {
+      type: "dynamicToolCall",
+      tool: "process",
+      arguments: { action: "poll" },
+      status: "completed",
+      expected: "completed",
+    },
+    { type: "commandExecution", status: "declined", expected: "blocked" },
+    { type: "commandExecution", status: "completed", exitCode: 2, expected: "failed" },
+  ])(
+    "preserves native $type $status presentation while paging raw results",
+    async ({ expected, ...nativeItem }) => {
+      const f = await fixture();
+      f.items.push(item("older", { text: "Older answer" }), item("operation", nativeItem));
+      const page = await f.read({ limit: 2 });
+      expect(page.messages).toHaveLength(2);
+      expect(page.activity).toEqual(
+        messageIds(page.messages).map((messageId) => ({
+          messageId,
+          items: expected ? [expect.objectContaining({ status: expected, phase: "end" })] : [],
+        })),
+      );
+      expect(page.messages[1]).toMatchObject({ role: "toolResult", toolCallId: "operation" });
+      const older = await f.read({ cursor: page.nextCursor, limit: 2 });
+      expect(older.activity).toEqual([]);
+      expect(older.messages).toMatchObject([{ content: [{ text: "Older answer" }] }]);
+    },
+  );
   it("renders user, reasoning, tool call/result, and active assistant content in chronological order", async () => {
     const f = await fixture();
     f.items.push(
@@ -219,6 +262,12 @@ describe("native subagent history through the harness", () => {
     const ids = messageIds(page.messages);
     expect(ids.every((id) => typeof id === "string" && id.length > 0)).toBe(true);
     expect(new Set(ids).size).toBe(page.messages.length);
+    expect(page.activity).toMatchObject(
+      ids.slice(2, 4).map((messageId) => ({
+        messageId,
+        items: [{ name: "bash", status: "completed", phase: "end" }],
+      })),
+    );
     expect(native.acquire).toHaveBeenCalledWith(
       expect.objectContaining({ agentDir: expect.any(String) }),
     );
@@ -274,10 +323,17 @@ describe("native subagent history through the harness", () => {
     );
   });
 
-  it.each([false, true])(
-    "reconnects the binding-owned store (supervision=%s)",
-    async (supervised) => {
+  it.each(
+    [false, true].flatMap((supervised) =>
+      [false, true].map((followup) => ({ supervised, followup })),
+    ),
+  )(
+    "reconnects the binding-owned store (supervision=$supervised, followup=$followup)",
+    async ({ supervised, followup }) => {
       const f = await fixture(supervised);
+      if (followup) {
+        f.params.task = { ...f.params.task, runId: `${f.params.task.runId}:turn:followup-turn` };
+      }
       f.items.push(item("answer", { text: "Stored child history" }));
       expect((await f.read()).messages).toMatchObject([
         { content: [{ text: "Stored child history" }] },
@@ -294,16 +350,7 @@ describe("native subagent history through the harness", () => {
   it("keeps completed child history and pagination when the parent starts a replacement thread", async () => {
     const f = await fixture();
     f.threads.set("parent-thread", { id: "parent-thread", projectId: null, parentThreadId: null });
-    f.params.task = {
-      ...f.params.task,
-      detail: {
-        nativeHistory: createCodexNativeSubagentHistoryOwner({
-          parentThreadId: f.binding.threadId,
-          sessionId: f.identity.sessionId,
-          binding: f.binding,
-        })!,
-      },
-    };
+    stampHistoryOwner(f);
     f.items.push(
       ...Array.from({ length: 5 }, (_, index) =>
         item(`item-${index}`, { text: `message ${index}` }),
@@ -325,13 +372,7 @@ describe("native subagent history through the harness", () => {
     "rejects a changed %s before opening the native history store",
     async (change) => {
       const f = await fixture();
-      const owner = createCodexNativeSubagentHistoryOwner({
-        parentThreadId: f.binding.threadId,
-        sessionId: f.identity.sessionId,
-        lifecycleRevision: "parent-lifecycle",
-        binding: f.binding,
-      })!;
-      f.params.task = { ...f.params.task, detail: { nativeHistory: owner } };
+      const owner = stampHistoryOwner(f, "parent-lifecycle");
       if (change === "session" || change === "lifecycle") {
         await upsertSessionEntry({
           agentId: "main",
@@ -369,13 +410,7 @@ describe("native subagent history through the harness", () => {
 
   it("preserves history through repeated compaction transfers in the same session lifecycle", async () => {
     const f = await fixture();
-    const owner = createCodexNativeSubagentHistoryOwner({
-      parentThreadId: f.binding.threadId,
-      sessionId: f.identity.sessionId,
-      lifecycleRevision: "parent-lifecycle",
-      binding: f.binding,
-    })!;
-    f.params.task = { ...f.params.task, detail: { nativeHistory: owner } };
+    stampHistoryOwner(f, "parent-lifecycle");
     f.items.push(item("answer", { text: "Original child result" }));
     const before = await f.read();
     let previousSessionId = f.identity.sessionId;
@@ -458,30 +493,6 @@ describe("native subagent history through the harness", () => {
     },
   );
 
-  it("rechecks the parent binding after awaiting ancestor metadata", async () => {
-    const f = await fixture();
-    f.thread.parentThreadId = "worker-1";
-    f.threads.set("worker-1", { id: "worker-1", projectId: null, parentThreadId: "parent-thread" });
-    const request = native.request.getMockImplementation()!;
-    native.request.mockImplementation(async (method, params) => {
-      const result = await request(method, params);
-      if (method === "thread/read" && params.threadId === "worker-1") {
-        await f.bindingStore.mutate(f.identity, {
-          kind: "patch",
-          threadId: "parent-thread",
-          patch: { appServerRuntimeFingerprint: "changed" },
-        });
-      }
-      return result;
-    });
-    await expect(f.read()).rejects.toThrow("parent changed");
-    expect(native.request.mock.calls.map(([method]) => method)).toEqual([
-      "thread/read",
-      "thread/read",
-    ]);
-    expect(native.release).toHaveBeenCalledOnce();
-  });
-
   it("rejects copied thread ids from a different native store", async () => {
     const f = await fixture();
     native.acquire.mockResolvedValueOnce({
@@ -494,43 +505,59 @@ describe("native subagent history through the harness", () => {
     expect(native.release).toHaveBeenCalledOnce();
   });
 
-  it("rejects an awaited page after the harness is disposed", async () => {
-    const f = await fixture();
-    f.items.push(item("answer", { text: "Pending result" }));
-    const request = native.request.getMockImplementation()!;
-    native.request.mockImplementation(async (method, params) => {
-      const result = await request(method, params);
-      if (method === "thread/items/list") {
-        await f.harness.dispose?.();
-      }
-      return result;
-    });
-    await expect(f.read()).rejects.toThrow("harness is disposed");
-    expect(native.release).toHaveBeenCalledOnce();
-  });
-
-  it.each(["session", "lifecycle"] as const)(
-    "rechecks the parent %s after awaited history reads",
+  it.each(["binding", "disposal", "session", "lifecycle"] as const)(
+    "rejects %s changes after awaited native reads",
     async (change) => {
       const f = await fixture();
+      f.items.push(item("answer", { text: "Pending result" }));
+      if (change === "binding") {
+        f.thread.parentThreadId = "worker-1";
+        f.threads.set("worker-1", {
+          id: "worker-1",
+          projectId: null,
+          parentThreadId: "parent-thread",
+        });
+      }
       const request = native.request.getMockImplementation()!;
       native.request.mockImplementation(async (method, params) => {
         const result = await request(method, params);
-        if (method === "thread/items/list") {
-          await upsertSessionEntry({
-            agentId: "main",
-            sessionKey: f.params.task.requesterSessionKey,
-            storePath: f.storePath,
-            entry: {
-              sessionId: change === "session" ? "replacement-session" : f.identity.sessionId,
-              lifecycleRevision: "replacement-lifecycle",
-              updatedAt: 2,
-            },
-          });
+        const revoke =
+          change === "binding"
+            ? method === "thread/read" && params.threadId === "worker-1"
+            : method === "thread/items/list";
+        if (revoke) {
+          if (change === "binding") {
+            await f.bindingStore.mutate(f.identity, {
+              kind: "patch",
+              threadId: "parent-thread",
+              patch: { appServerRuntimeFingerprint: "changed" },
+            });
+          } else if (change === "disposal") {
+            await f.harness.dispose?.();
+          } else {
+            await upsertSessionEntry({
+              agentId: "main",
+              sessionKey: f.params.task.requesterSessionKey,
+              storePath: f.storePath,
+              entry: {
+                sessionId: change === "session" ? "replacement-session" : f.identity.sessionId,
+                lifecycleRevision: "replacement-lifecycle",
+                updatedAt: 2,
+              },
+            });
+          }
         }
         return result;
       });
-      await expect(f.read()).rejects.toThrow("parent changed");
+      await expect(f.read()).rejects.toThrow(
+        change === "disposal" ? "harness is disposed" : "parent changed",
+      );
+      if (change === "binding") {
+        expect(native.request.mock.calls.map(([method]) => method)).toEqual([
+          "thread/read",
+          "thread/read",
+        ]);
+      }
       expect(native.release).toHaveBeenCalledOnce();
     },
   );

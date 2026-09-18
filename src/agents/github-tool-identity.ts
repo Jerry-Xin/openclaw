@@ -20,14 +20,18 @@ import { resolveAgentConfig, resolveAgentWorkspaceDir } from "./agent-scope.js";
 import { verifyGitHubCredential } from "./github-oauth-client.js";
 import { inspectGitHubOAuthRecord } from "./github-oauth-records.js";
 import {
+  clearNativeGitHubTokenCache,
   createGitHubReadIdentity,
   GITHUB_IDENTITY_OUTPUT_LIMIT_BYTES as PROFILE_OUTPUT_LIMIT_BYTES,
   GitHubIdentityError,
   normalizeGitHubToken as normalizeManagedGitHubToken,
+  readCachedNativeGitHubToken,
   readNativeGitHubToken,
   runGitHubIdentityCommand as runIdentityCommand,
+  startGitHubIdentityOperation,
   type GitHubIdentityPreparation,
   type GitHubReadIdentityPreparation,
+  type GitHubReadIdentityStarter,
   type PreparedGitHubReadIdentity,
   type PreparedGitHubSourceReadIdentity,
 } from "./github-read-identity.js";
@@ -493,8 +497,10 @@ export function matchesPreparedGitHubPublicationIdentity(params: {
 async function prepareSharedGitHubIdentity(
   params: GitHubIdentityPreparation & {
     assertCurrent?: () => void;
+    startCurrent?: GitHubReadIdentityStarter;
     allowAnonymous?: boolean;
   },
+  readNativeToken = readNativeGitHubToken,
 ) {
   const identity = resolveGitHubToolIdentity(params);
   const managed = identity.source !== "system-detected";
@@ -506,30 +512,31 @@ async function prepareSharedGitHubIdentity(
   const readToken = () =>
     managed
       ? readManagedGitHubToken(identity.profileDir)
-      : readNativeGitHubToken(currentEnvironment(), params.allowAnonymous === true);
-  params.assertCurrent?.();
-  const token = await readToken();
-  params.assertCurrent?.();
+      : readNativeToken(currentEnvironment(), params.allowAnonymous === true);
+  const token = await startGitHubIdentityOperation(readToken, params);
   if (!token) {
-    if (!managed && params.allowAnonymous) {
-      return { prepared: undefined, token: undefined, readToken };
+    return startGitHubIdentityOperation(() => {
+      if (!managed && params.allowAnonymous) {
+        return { prepared: undefined, token: undefined, readToken };
+      }
+      throw new GitHubIdentityError("unavailable");
+    }, params);
+  }
+  const probe = await startGitHubIdentityOperation(() => verifyGitHubCredential(token), params);
+  return startGitHubIdentityOperation(() => {
+    if (probe.status !== "available") {
+      throw new GitHubIdentityError(probe.status);
     }
-    throw new GitHubIdentityError("unavailable");
-  }
-  const probe = await verifyGitHubCredential(token);
-  params.assertCurrent?.();
-  if (probe.status !== "available") {
-    throw new GitHubIdentityError(probe.status);
-  }
-  const prepared: PreparedGitHubPublicationIdentity = Object.freeze({
-    source: identity.source,
-    ...(managed ? { profileId: identity.config.profileId } : {}),
-    account: probe.account,
-    // Broker children and worker launches receive this fixed snapshot. Profile
-    // retirement cannot redirect an already-admitted operation.
-    env: Object.freeze({ ...env, GH_TOKEN: token, GITHUB_TOKEN: undefined }),
-  });
-  return { prepared, token, readToken };
+    const prepared: PreparedGitHubPublicationIdentity = Object.freeze({
+      source: identity.source,
+      ...(managed ? { profileId: identity.config.profileId } : {}),
+      account: probe.account,
+      // Broker children and worker launches receive this fixed snapshot. Profile
+      // retirement cannot redirect an already-admitted operation.
+      env: Object.freeze({ ...env, GH_TOKEN: token, GITHUB_TOKEN: undefined }),
+    });
+    return { prepared, token, readToken };
+  }, params);
 }
 
 /** Publication owns a fixed credential snapshot for its already-admitted operation. */
@@ -541,6 +548,17 @@ export async function prepareGitHubPublicationIdentity(
     throw new GitHubIdentityError("unavailable");
   }
   return prepared;
+}
+
+/** Options expose account facts only; publication obtains its own live credential. */
+export async function prepareGitHubPublicationOptionsIdentity(
+  params: GitHubIdentityPreparation,
+): Promise<Pick<PreparedGitHubPublicationIdentity, "source" | "account">> {
+  const { prepared } = await prepareSharedGitHubIdentity(params, readCachedNativeGitHubToken);
+  if (!prepared) {
+    throw new GitHubIdentityError("unavailable");
+  }
+  return { source: prepared.source, account: prepared.account };
 }
 
 export function prepareGitHubReadIdentity(
@@ -567,16 +585,17 @@ export async function prepareGitHubReadIdentity(
       throw new GitHubIdentityError("changed");
     }
   };
+  const caller = { assertCurrent: assertSelected, startCurrent: params.startActive };
+  await startGitHubIdentityOperation(params.refresh, caller);
   assertSelected();
-  await params.refresh();
-  assertSelected();
-  const { token, readToken, prepared } = await prepareSharedGitHubIdentity({
-    ...params,
-    assertCurrent: assertSelected,
-  });
+  const { token, readToken, prepared } = await prepareSharedGitHubIdentity(
+    { ...params, ...caller },
+    readCachedNativeGitHubToken,
+  );
   assertSelected();
   return createGitHubReadIdentity({
     assertSelected,
+    startActive: params.startActive,
     readToken,
     ...(!prepared || token === undefined
       ? { token: undefined, selection: { source: "anonymous" as const } }
@@ -593,6 +612,7 @@ export async function prepareGitHubReadIdentity(
 
 export async function removeManagedGitHubProfile(profileDir: string): Promise<void> {
   await fs.rm(profileDir, { recursive: true, force: true });
+  clearNativeGitHubTokenCache();
 }
 
 async function stageManagedGitHubProfile(parent: string, token: string) {
@@ -686,6 +706,7 @@ export async function refreshManagedGitHubProfile(params: {
     await fs.chmod(replacementHosts, 0o600);
     params.assertCurrent?.();
     await fs.rename(replacementHosts, targetHosts);
+    clearNativeGitHubTokenCache();
     params.assertCurrent?.();
     return staged.account;
   } finally {
@@ -712,6 +733,7 @@ export async function installManagedGitHubProfile(params: {
     published = true;
     params.assertCurrent?.();
     await params.commitConfig(staged.account);
+    clearNativeGitHubTokenCache();
     committed = true;
     return staged.account;
   } finally {

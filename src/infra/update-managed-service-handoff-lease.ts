@@ -6,30 +6,33 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { resolveServiceManagerEnv } from "../daemon/service-process-env.js";
 import { isChildProcessTreeAlive } from "../process/child-process-tree.js";
-import { isPidDefinitelyDead, getFileLockProcessStartTime } from "../shared/pid-alive.js";
 import { hasErrnoCode } from "./errno.js";
 import { executeSqliteQuerySync, executeSqliteQueryTakeFirstSync } from "./kysely-sync.js";
-import {
-  runSqliteImmediateTransactionSync,
-  type SqliteTransactionOptions,
-} from "./sqlite-transaction.js";
+import type { SqliteTransactionOptions } from "./sqlite-transaction.js";
 import { resolvePreferredOpenClawTmpDir } from "./tmp-openclaw-dir.js";
+import { createManagedHandoffBootIdentityReader } from "./update-managed-service-handoff-boot.js";
 import { canCleanupLegacyManagedHandoff } from "./update-managed-service-handoff-cleanup.js";
 import {
   createManagedHandoffLeaseDatabase,
   leaseQueries,
   type LeaseRow,
   type LeaseTable,
+  type ManagedUpdateLeaseDatabaseIdentity,
 } from "./update-managed-service-handoff-database.js";
+import { createManagedHandoffProcessIdentityReader } from "./update-managed-service-handoff-process.js";
 import { assertNoRetainedSourceBorrower } from "./update-managed-service-handoff-retained-custody.js";
 import {
-  managedHandoffBootSchema,
+  isRetiredManagedHandoffLeasePayload,
   parseManagedHandoffLeasePayload,
   type HandoffProcessIdentity,
   type HandoffNativeLifetime,
   type ManagedHandoffLeaseAction,
   type ManagedHandoffLeasePayload,
 } from "./update-managed-service-handoff-schema.js";
+import {
+  hasManagedHandoffSchemaObject,
+  isManagedHandoffSchemaEmpty,
+} from "./update-managed-service-handoff-source-inspection.js";
 
 const text = z.string().min(1).max(4096);
 export const triageFailureSchema = z.strictObject({
@@ -60,13 +63,19 @@ type LeaseAcquisition =
 
 /** One lease implementation, preloaded normally and sealed before package replacement. */
 export function createManagedHandoffLeaseStore(
-  options = {
+  options: {
+    databasePath: string;
+    serviceManagerEnv: NodeJS.ProcessEnv;
+    existingIdentity?: ManagedUpdateLeaseDatabaseIdentity;
+    onProcessIdentityWarning?: (pid: number, message: string) => void;
+  } = {
     databasePath: resolveManagedUpdateLeaseDatabasePath(),
     serviceManagerEnv: resolveServiceManagerEnv(),
   },
   logger?: SqliteTransactionOptions["logger"],
 ) {
   const { databasePath, serviceManagerEnv } = options;
+  const bootIdentity = createManagedHandoffBootIdentityReader(serviceManagerEnv);
   const control = (command: string, args: string[], timeout = 5000) =>
     spawnSync(command, args, {
       env: serviceManagerEnv,
@@ -76,65 +85,19 @@ export function createManagedHandoffLeaseStore(
       windowsHide: true,
       stdio: ["ignore", "pipe", "ignore"],
     });
-  // Lease reclamation needs ESRCH evidence; other probe errors cannot prove absence.
-  const isPidAlive = (pid: number) => !isPidDefinitelyDead(pid);
+  const {
+    isPidAlive,
+    readProcessStartIdentity,
+    processIdentity,
+    processState,
+    isProcessIdentityCurrent,
+    acceptSelfIdentity,
+  } = createManagedHandoffProcessIdentityReader({
+    env: serviceManagerEnv,
+    onWarning:
+      options.onProcessIdentityWarning ?? ((pid, message) => logger?.warn(message, { pid })),
+  });
 
-  function readProcessStartIdentity(pid: number): string | null {
-    const start = getFileLockProcessStartTime(
-      pid,
-      { ...serviceManagerEnv, LC_ALL: "C", TZ: "UTC" },
-      1000,
-    );
-    return start === null ? null : String(start);
-  }
-
-  function processState(value: HandoffProcessIdentity) {
-    if (!isPidAlive(value.pid)) {
-      return "dead";
-    }
-    const start = readProcessStartIdentity(value.pid);
-    return start === null ? "unknown" : start === value.startIdentity ? "live" : "dead";
-  }
-  function processIdentity(pid = process.pid): HandoffProcessIdentity {
-    const startIdentity = readProcessStartIdentity(pid);
-    if (!startIdentity) {
-      throw new Error("managed handoff process start identity is unavailable");
-    }
-    return { pid, startIdentity };
-  }
-  function bootIdentity() {
-    let value: string | undefined;
-    if (process.platform === "linux") {
-      value = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-    } else if (process.platform === "darwin" || process.platform === "win32") {
-      const windows = process.platform === "win32";
-      const result = control(
-        windows ? "powershell.exe" : "/usr/sbin/sysctl",
-        windows
-          ? [
-              "-NoProfile",
-              "-NonInteractive",
-              "-Command",
-              "(Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')",
-            ]
-          : ["-n", "kern.bootsessionuuid"],
-        windows ? 5000 : 1000,
-      );
-      if (!result.error && result.status === 0) {
-        value = result.stdout.trim();
-      }
-    }
-    // Unknown boot identities cannot be replaced with uptime or a wall-clock guess.
-    const boot = {
-      platform: process.platform,
-      identity: process.platform === "win32" ? value : value?.toLowerCase(),
-    };
-    const parsed = managedHandoffBootSchema.safeParse(boot);
-    if (!parsed.success) {
-      throw new Error("OS boot identity unavailable; run openclaw triage manually");
-    }
-    return parsed.data;
-  }
   function properties(stdout: string | Buffer | null | undefined): Record<string, string> {
     return Object.fromEntries(
       String(stdout || "")
@@ -169,7 +132,7 @@ export function createManagedHandoffLeaseStore(
           (life.placement.kind === "pending" || scope.InvocationID === life.placement.invocation))),
     );
   }
-  const withDatabase = createManagedHandoffLeaseDatabase(databasePath);
+  const withDatabase = createManagedHandoffLeaseDatabase(databasePath, options.existingIdentity);
   function row(db: HandoffDatabase, root: string) {
     return executeSqliteQueryTakeFirstSync(
       db,
@@ -239,10 +202,13 @@ export function createManagedHandoffLeaseStore(
   }
   function read(root: string): LeaseRead {
     try {
-      if (!fs.existsSync(databasePath)) {
+      if (!options.existingIdentity && !fs.existsSync(databasePath)) {
         return { kind: "absent" };
       }
       return withDatabase(false, (db) => {
+        if (!options.existingIdentity && isManagedHandoffSchemaEmpty(db)) {
+          return { kind: "absent" };
+        }
         const value = row(db, root);
         return value ? { kind: "current", lease: handle(root, value) } : { kind: "absent" };
       });
@@ -253,14 +219,14 @@ export function createManagedHandoffLeaseStore(
   const sameRow = (a: LeaseRow | undefined, b: LeaseRow | undefined) =>
     a?.owner === b?.owner && a?.payload_json === b?.payload_json && a?.updated_at === b?.updated_at;
   function transact<T>(db: HandoffDatabase, operation: () => T): T {
-    return runSqliteImmediateTransactionSync(db, operation, { logger });
+    return withDatabase.transact(db, operation, { logger });
   }
-  function hasUnsettledChildren(lease: ManagedHandoffLease): boolean {
+  function hasUnsettledChildren(lease: ManagedHandoffLease, connection?: HandoffDatabase): boolean {
     if (lease.version === 3) {
       return true;
     }
     const prefix = `${lease.key}/.openclaw-update-child-`;
-    return withDatabase(false, (db) => {
+    const inspect = (db: HandoffDatabase) => {
       const children = executeSqliteQuerySync(
         db,
         leaseQueries(db)
@@ -278,9 +244,10 @@ export function createManagedHandoffLeaseStore(
           (process.platform !== "win32" && isChildProcessTreeAlive(child.executor))
         );
       });
-    });
+    };
+    return connection ? inspect(connection) : withDatabase(false, inspect);
   }
-  function reclaimable(lease: ManagedHandoffLease) {
+  function reclaimable(lease: ManagedHandoffLease, db?: HandoffDatabase) {
     // No process/boot liveness observation is a join receipt.
     if (lease.version === 3) {
       return false;
@@ -302,7 +269,7 @@ export function createManagedHandoffLeaseStore(
       return false;
     }
     return (
-      !hasUnsettledChildren(lease) &&
+      !hasUnsettledChildren(lease, db) &&
       (action.kind !== "triage" ||
         action.lifetime.kind !== "native" ||
         nativeClosed(action.lifetime))
@@ -318,7 +285,8 @@ export function createManagedHandoffLeaseStore(
       // Probe liveness before taking the write lock; commit only if both observations still match.
       const observed = row(db, root);
       const destination = admissionLease(root, observed);
-      const canReplace = !destination || (destination.owner !== owner && reclaimable(destination));
+      const canReplace =
+        !destination || (destination.owner !== owner && reclaimable(destination, db));
       return transact(db, () => {
         if (
           source &&
@@ -329,7 +297,7 @@ export function createManagedHandoffLeaseStore(
         ) {
           throw new Error("managed triage source changed during admission");
         }
-        if (source && hasUnsettledChildren(source)) {
+        if (source && hasUnsettledChildren(source, db)) {
           return { kind: "busy", owner: source.owner };
         }
         const childMarker = root.indexOf("/.openclaw-update-child-");
@@ -346,7 +314,7 @@ export function createManagedHandoffLeaseStore(
           }
           throw new Error("managed handoff lease changed during admission");
         }
-        if (!canReplace || (destination && hasUnsettledChildren(destination))) {
+        if (!canReplace || (destination && hasUnsettledChildren(destination, db))) {
           return { kind: "busy", owner: destination.owner };
         }
         if (observed) {
@@ -425,8 +393,19 @@ export function createManagedHandoffLeaseStore(
         ["closing", "closed", "uncertain"].includes(lease.action.phase)
       ) &&
       lease[role].pid === process.pid &&
-      processState(lease.helper) === "live" &&
-      (role === "helper" || processState(lease.executor) === "live")
+      isProcessIdentityCurrent(lease.helper) &&
+      acceptSelfIdentity(lease[role])
+    );
+  }
+  function acceptParentBoundExecutor(lease: ManagedHandoffLease) {
+    return (
+      current(lease) &&
+      lease.version === 2 &&
+      lease.action.kind === "update" &&
+      lease.helper.pid === process.ppid &&
+      lease.executor.pid === process.pid &&
+      isProcessIdentityCurrent(lease.helper) &&
+      acceptSelfIdentity(lease.executor, true)
     );
   }
   function cas(
@@ -448,7 +427,7 @@ export function createManagedHandoffLeaseStore(
     }
     return withDatabase(true, (db) =>
       transact(db, () => {
-        if (hasUnsettledChildren(lease)) {
+        if (hasUnsettledChildren(lease, db)) {
           return null;
         }
         const updatedAt = Math.max(Date.now(), lease.updatedAt + 1);
@@ -458,7 +437,12 @@ export function createManagedHandoffLeaseStore(
       }),
     );
   }
-  function bind(lease: ManagedHandoffLease, pid: number, action = lease.action) {
+  function bind(
+    lease: ManagedHandoffLease,
+    pid: number,
+    action = lease.action,
+    argv?: readonly string[],
+  ) {
     if (!owns(lease)) {
       return null;
     }
@@ -484,7 +468,7 @@ export function createManagedHandoffLeaseStore(
     } else if (action.kind !== "update") {
       return null;
     }
-    return cas(lease, action, processIdentity(pid));
+    return cas(lease, action, processIdentity(pid, argv));
   }
   function retarget(
     lease: ManagedHandoffLease,
@@ -603,7 +587,7 @@ export function createManagedHandoffLeaseStore(
       transact(
         db,
         () =>
-          !hasUnsettledChildren(lease) &&
+          !hasUnsettledChildren(lease, db) &&
           deleteRow(db, lease.key, {
             owner: lease.owner,
             payload_json: lease.payload,
@@ -622,15 +606,29 @@ export function createManagedHandoffLeaseStore(
       }
       throw error;
     }
-    return withDatabase(false, (db) =>
-      executeSqliteQuerySync(
+    return withDatabase(false, (db) => {
+      // Only ordinary inspection may accept an uninitialized store.
+      if (!options.existingIdentity && !hasManagedHandoffSchemaObject(db)) {
+        return [];
+      }
+      return executeSqliteQuerySync(
         db,
         leaseQueries(db)
           .selectFrom("managed_update_handoffs")
           .select(["install_root", "owner", "payload_json", "updated_at"]),
-      ).rows.map((entry) => handle(entry.install_root, entry)),
-    );
+      ).rows.flatMap((entry) =>
+        // A retired record decodes exactly, so unlike unreadable data it proves
+        // the row predates native custody and cannot borrow any source. A record
+        // this build cannot decode may still name a source it holds, so it is
+        // never discarded here: releasing that source is the hazard this refusal
+        // exists for. Store-level damage recovers in the database owner instead.
+        isRetiredManagedHandoffLeasePayload(entry.payload_json)
+          ? []
+          : [handle(entry.install_root, entry)],
+      );
+    });
   }
+
   function assertSourceUnborrowed(resource: string) {
     assertNoRetainedSourceBorrower(resource, readRetainedSources());
   }
@@ -682,6 +680,8 @@ export function createManagedHandoffLeaseStore(
     retarget,
     activate,
     owns,
+    hasUnsettledChildren,
+    acceptParentBoundExecutor,
     current,
     readGeneration,
     settle,
@@ -689,6 +689,7 @@ export function createManagedHandoffLeaseStore(
     assertSourceUnborrowed,
     stopNative,
     processIdentity,
+    isProcessIdentityCurrent,
     readProcessStartIdentity,
     isPidAlive,
     bootIdentity,

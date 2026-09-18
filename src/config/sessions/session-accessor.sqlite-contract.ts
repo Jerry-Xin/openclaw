@@ -16,10 +16,30 @@ import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 export type SessionEntryStatus = NonNullable<SessionEntry["status"]>;
 
-/** One writer callback owns this record; no Worker object or plan payload is retained. */
+export type CanonicalSessionValidationResult = {
+  validatedRows: number;
+  certifiedRows: number;
+  hasMore: boolean;
+  oversizedRows: number;
+};
+
+/** Worker operation facts; no Worker object or plan payload is retained. */
 export type SqliteSessionReclamationDiagnostics = {
-  kind?: "entry" | "lifecycle-artifacts" | "history-eviction" | "historical-generation";
+  kind?:
+    | "entry"
+    | "lifecycle-artifacts"
+    | "history-eviction"
+    | "historical-generation"
+    | "cold-batch"
+    | "cold-maintain"
+    | "cold-restore";
   workerThreadId?: number;
+};
+
+/** One validated request owns this record until its observed release event. */
+export type SqliteSessionReclamationAdmissionDiagnostics = {
+  admissionId: number;
+  releaseCause?: "worker-release" | "worker-exit";
 };
 
 export type SqliteSessionDatabaseAdmissionDiagnostics = {
@@ -44,8 +64,35 @@ export type SqliteSessionArtifactPreparationDiagnostics =
     completed?: boolean;
   };
 
+/** One pruning attempt retains only aggregate stage observations. */
+export type SqliteSessionArchivePruningDiagnostics = {
+  trigger: "initial" | "after-eviction" | "final";
+  admissionMs?: number;
+  cachedAdmissions?: number;
+  asyncAdmissions?: number;
+  checkpointCalls?: number;
+  checkpointIncomplete?: number;
+  checkpointMs?: number;
+  checkpointMaxMs?: number;
+  vacuumMs?: number;
+  vacuumPasses?: number;
+  vacuumPagesRequested?: number;
+  queryMs?: number;
+  rowDeletionMs?: number;
+  fileRemovalMs?: number;
+  removedFiles?: number;
+  missingFiles?: number;
+  failedRemovals?: number;
+  measurementMs?: number;
+  measurements?: number;
+  legacyInventoryMs?: number;
+  completed?: boolean;
+};
+
 export type SqliteSessionWriteDiagnostics = SqliteSessionReclamationDiagnostics & {
   artifactPreparation?: SqliteSessionArtifactPreparationDiagnostics;
+  archivePruning?: SqliteSessionArchivePruningDiagnostics;
+  reclamationAdmission?: SqliteSessionReclamationAdmissionDiagnostics;
 };
 
 export type SessionTranscriptInstance = SessionEntrySummary & {
@@ -80,8 +127,6 @@ export type TranscriptEventAppendOptions = {
   beforeCommitInTransaction?: () => void;
   /** Reject the append when the transcript changed since the caller loaded it. */
   expectedMutationAt?: number | null;
-  /** Captures the parent selected by an active-branch event append. */
-  captureEffectiveParentIdInTransaction?: (parentId: string | null) => void;
 };
 
 export type TranscriptAppendRefusal =

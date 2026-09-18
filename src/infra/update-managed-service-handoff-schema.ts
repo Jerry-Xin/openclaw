@@ -2,10 +2,21 @@ import path from "node:path";
 import { z } from "zod";
 
 const text = z.string().min(1).max(4096);
-const processIdentitySchema = z.strictObject({
+const nativeProcessIdentityShape = {
   pid: z.number().int().positive(),
   startIdentity: text.max(128),
-});
+};
+const processIdentitySchema = z
+  .strictObject({
+    ...nativeProcessIdentityShape,
+    // Older strict readers must not mistake an argv digest for a dead process.
+    startIdentitySource: z.literal("argv-sha256").nullable().optional(),
+  })
+  .refine(({ startIdentity, startIdentitySource }) =>
+    startIdentitySource === "argv-sha256"
+      ? /^win32-argv-sha256:[a-f0-9]{64}$/.test(startIdentity)
+      : !startIdentity.startsWith("win32-argv-sha256:"),
+  );
 export const managedHandoffBootSchema = z.union([
   z.strictObject({
     platform: z.enum(["linux", "darwin"]),
@@ -14,6 +25,10 @@ export const managedHandoffBootSchema = z.union([
   z.strictObject({
     platform: z.literal("win32"),
     identity: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/),
+  }),
+  z.strictObject({
+    platform: z.literal("freebsd"),
+    identity: z.string().regex(/^[a-f0-9]{32}$/),
   }),
 ]);
 const nativeLifetimeSchema = z.strictObject({
@@ -85,10 +100,26 @@ export type HandoffNativeLifetime = z.infer<typeof nativeLifetimeSchema>;
 export type ManagedHandoffLeaseAction = z.infer<typeof actionSchema>;
 export type ManagedHandoffLeasePayload = z.infer<typeof payloadSchema>;
 
+// A retired v1 record names one process. It predates both the executor/helper
+// split and native custody, so it can never carry a v3 borrower.
+const retiredPayloadSchema = z.strictObject({
+  version: z.literal(1),
+  ...nativeProcessIdentityShape,
+});
+
 export function parseManagedHandoffLeasePayload(value: string) {
   try {
     return payloadSchema.parse(JSON.parse(value));
   } catch {
     return null;
+  }
+}
+
+/** Distinguish an exactly decoded retired record from unreadable prospective data. */
+export function isRetiredManagedHandoffLeasePayload(value: string): boolean {
+  try {
+    return retiredPayloadSchema.safeParse(JSON.parse(value)).success;
+  } catch {
+    return false;
   }
 }

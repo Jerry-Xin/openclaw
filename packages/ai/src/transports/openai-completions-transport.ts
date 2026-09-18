@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Context, Model, StreamFn } from "@openclaw/llm-core";
+import type { Model, StreamFn } from "@openclaw/llm-core";
 import OpenAI from "openai";
 import { getEnvApiKey } from "../env-api-keys.js";
 import {
@@ -7,6 +7,7 @@ import {
   reasoningTagTextPolicy,
   type OpenAICompletionsOptions,
 } from "../provider-options.js";
+import { resolveCacheRetention } from "../providers/cache-retention.js";
 import { finalizeOpenAICompletionsToolCalls } from "../providers/openai-completions-tool-calls.js";
 import { tagUnresolvedTextAsCommentary } from "../utils/assistant-text-phase.js";
 import {
@@ -34,11 +35,15 @@ import {
 import {
   createOpenAIProviderAcceptanceHook,
   resolveOpenAIClientBaseUrl,
+  resolvePromptCacheKey,
   type MutableAssistantOutput,
   type OpenAIModeModel,
 } from "./openai-transport-shared.js";
-import { resolveProviderTransportTurnState } from "./provider-transport-turn-state.js";
-import { hasOpencodeSessionHeader, resolveOpencodeSessionHeaders } from "./session-affinity.js";
+import {
+  filterProviderTurnHeadersForExplicitOpencodeSession,
+  resolveProviderTransportTurnState,
+} from "./provider-transport-turn-state.js";
+import { resolveOpencodeSessionHeaders } from "./session-affinity.js";
 import {
   createWritableTransportEventStream,
   failTransportStream,
@@ -114,12 +119,11 @@ function createSseDoneDetector() {
 
 function createOpenAICompletionsClient(
   model: Model,
-  context: Context,
   apiKey: string,
-  optionHeaders?: Record<string, string>,
+  headers: Record<string, string>,
   opts?: { fetch?: typeof globalThis.fetch },
 ) {
-  const clientConfig = buildOpenAICompletionsClientConfig(model, context, optionHeaders);
+  const clientConfig = buildOpenAICompletionsClientConfig(model, headers);
   return new OpenAI({
     apiKey,
     baseURL: clientConfig.baseURL,
@@ -133,14 +137,12 @@ function createOpenAICompletionsClient(
 
 function buildOpenAICompletionsClientConfig(
   model: Model,
-  context: Context,
-  optionHeaders?: Record<string, string>,
+  headers: Record<string, string>,
 ): {
   baseURL: string | undefined;
   defaultHeaders: Record<string, string>;
   defaultQuery?: Record<string, string>;
 } {
-  const headers = buildOpenAIClientHeaders(model, context, optionHeaders);
   const defaultQuery: Record<string, string> = {};
   let baseURL = model.baseUrl;
   let isAzureHost = false;
@@ -210,9 +212,11 @@ export function createOpenAICompletionsTransportStreamFn(): StreamFn {
           transport: "stream",
         });
         const optionHeaders = resolveOpencodeSessionHeaders(model, options);
-        const turnHeaders = hasOpencodeSessionHeader(model, options)
-          ? undefined
-          : turnState?.headers;
+        const turnHeaders = filterProviderTurnHeadersForExplicitOpencodeSession(
+          model,
+          options,
+          turnState?.headers,
+        );
         // The OpenAI SDK consumes the SSE terminal without yielding it. Observe
         // the raw body so native tool calls can distinguish clean DONE from EOF.
         const doneDetector = createSseDoneDetector();
@@ -242,11 +246,18 @@ export function createOpenAICompletionsTransportStreamFn(): StreamFn {
             statusText: response.statusText,
           });
         };
+        const cacheRetention = resolveCacheRetention(options?.cacheRetention);
         const client = createOpenAICompletionsClient(
           model,
-          context,
           apiKey,
-          { ...turnHeaders, ...optionHeaders },
+          buildOpenAIClientHeaders(
+            model,
+            context,
+            { ...turnHeaders, ...optionHeaders },
+            undefined,
+            resolvePromptCacheKey(options, cacheRetention),
+            cacheRetention,
+          ),
           {
             fetch: doneDetectingFetch,
           },

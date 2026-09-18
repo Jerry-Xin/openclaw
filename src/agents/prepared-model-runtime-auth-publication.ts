@@ -1,6 +1,13 @@
 import { createDeferredCore, type Deferred } from "../shared/deferred.js";
+import { resolveLegacyInheritedAuthDir } from "./legacy-inherited-auth-dir.js";
 import { PreparedModelRuntimePublicationSupersededError } from "./prepared-model-runtime.errors.js";
-import { ownerKey, resolveConfiguredOwner } from "./prepared-model-runtime.owner.js";
+import {
+  normalizeOptionalDir,
+  normalizePreparedModelRuntimeInput,
+  ownerKey,
+  prepareModelRuntimeOwner,
+  resolveConfiguredOwner,
+} from "./prepared-model-runtime.owner.js";
 import type {
   PreparedModelRuntimeOwner,
   PreparedModelRuntimeReplacementGateId,
@@ -47,6 +54,7 @@ function partitionAuthMutationOwners(
 export class PreparedModelRuntimeAuthPublicationOwner {
   readonly #events: (readonly PreparedModelRuntimeOwner[])[] = [];
   #transaction: PreparedModelRuntimeAuthTransaction | undefined;
+  #drainTail: Promise<void> = Promise.resolve();
 
   enqueue(
     invalidatedOwners: readonly PreparedModelRuntimeOwner[],
@@ -109,6 +117,12 @@ export class PreparedModelRuntimeAuthPublicationOwner {
     }
     this.clearOwnerGates(transaction);
     return transaction;
+  }
+
+  releaseAdopted(gateId: PreparedModelRuntimeReplacementGateId): void {
+    if (this.#transaction?.adoptedBy === gateId) {
+      this.#transaction.adoptedBy = undefined;
+    }
   }
 
   resolve(
@@ -223,6 +237,17 @@ export class PreparedModelRuntimeAuthPublicationOwner {
     commit?: () => void;
     onOwnerFailure?: (error: unknown) => void;
   }): Promise<void> {
+    const pending = this.#drainTail.then(() => this.drainNow(params));
+    this.#drainTail = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    await pending;
+  }
+
+  private async drainNow(
+    params: Parameters<PreparedModelRuntimeAuthPublicationOwner["drain"]>[0],
+  ): Promise<void> {
     while (this.#events.length > 0) {
       const components = partitionAuthMutationOwners(this.#events.splice(0));
       for (const componentOwners of components) {
@@ -306,9 +331,18 @@ export function invalidatePreparedModelRuntimeOwnersForAuthMutation(
   const invalidatedConfiguredAgentIds = new Set<string>();
   for (const owner of owners.values()) {
     if (
-      !normalizedEvent.affectsInheritedStores &&
-      owner.input.agentDir !== normalizedEvent.agentDir &&
-      owner.input.inheritedAuthDir !== normalizedEvent.agentDir
+      // An initial active build will read current credentials; failed owners still need recovery.
+      (!owner.snapshot &&
+        owner.buildCompletion &&
+        !owner.authCaptureStarted &&
+        !owner.refreshError &&
+        owner.input.inheritedAuthDir ===
+          normalizeOptionalDir(
+            resolveLegacyInheritedAuthDir(owner.input.config, owner.input.env),
+          )) ||
+      (!normalizedEvent.affectsInheritedStores &&
+        owner.input.agentDir !== normalizedEvent.agentDir &&
+        owner.input.inheritedAuthDir !== normalizedEvent.agentDir)
     ) {
       continue;
     }
@@ -322,6 +356,23 @@ export function invalidatePreparedModelRuntimeOwnersForAuthMutation(
     if (owner.provenance === "configured" && owner.input.agentId) {
       invalidatedConfiguredAgentIds.add(owner.input.agentId);
     }
+  }
+  // Rebind before queueing: readers must find the pending owner while an older build settles.
+  for (const owner of invalidatedOwners) {
+    if (owner.provenance !== "configured") {
+      continue;
+    }
+    const inheritedAuthDir = normalizeOptionalDir(
+      resolveLegacyInheritedAuthDir(owner.input.config, owner.input.env),
+    );
+    if (owner.input.inheritedAuthDir === inheritedAuthDir) {
+      continue;
+    }
+    const previousKey = ownerKey(owner.input);
+    const input = normalizePreparedModelRuntimeInput({ ...owner.input, inheritedAuthDir });
+    prepareModelRuntimeOwner(input, "configured", owner.catalogMode, owner);
+    owners.delete(previousKey);
+    owners.set(ownerKey(input), owner);
   }
   return { invalidatedOwners, invalidatedConfiguredAgentIds };
 }

@@ -46,7 +46,7 @@ describe("Crabbox idle image maintenance", () => {
       if (params?.binary === "/opt/b/crabbox") {
         throw new Error("fixture binary acquisition unavailable");
       }
-      return params?.binary ?? "crabbox";
+      return { binary: params?.binary ?? "crabbox", version: "0.55.0" };
     });
     const store = openWarmImageStore();
     store.register("expired", expiredImage("chk_expired"));
@@ -219,8 +219,8 @@ describe("Crabbox idle image maintenance", () => {
       if (boundary !== "authority") {
         expect(stopped).toBe(true);
         expect(() => provider.maintain!(context())).toThrow();
-        expect(() => provider.images.pin("chk_expired", true)).toThrow();
-        expect(() => provider.images.rollback("chk_expired")).toThrow();
+        await expect(provider.images.pin("chk_expired", true)).rejects.toThrow();
+        await expect(provider.images.rollback("chk_expired")).rejects.toThrow();
         await expect(provider.images.delete("chk_expired", context().profiles)).rejects.toThrow();
       }
     },

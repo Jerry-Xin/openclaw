@@ -3,51 +3,43 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import {
-  GATEWAY_CLIENT_IDS,
-  GATEWAY_CLIENT_MODES,
-} from "../../../packages/gateway-protocol/src/client-info.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
-import type { PreparedMessageToolCatalog } from "../../channels/plugins/message-action-discovery.js";
+import { isScheduledMessageWriteAction } from "../../channels/plugins/message-action-dispatch.js";
 import type { ChannelMessageActionName } from "../../channels/plugins/types.public.js";
 import { resolveCommandSecretRefsViaGateway } from "../../cli/command-secret-gateway.js";
 import { getScopedChannelsCommandSecretTargets } from "../../cli/command-secret-targets.js";
 import { resolveMessageSecretScope } from "../../cli/message-secret-scope.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import * as messageActionTurnCapability from "../../gateway/message-action-turn-capability.js";
-import { createAbortError } from "../../infra/abort-signal.js";
+import type { MessageActionAuthorization } from "../../gateway/message-action-turn-capability.js";
 import { resolveMessageChannelSelection } from "../../infra/outbound/channel-selection.js";
 import {
   resolveMessageBroadcastAccountPlan,
   validateExplicitMessageAccountSelection,
 } from "../../infra/outbound/message-account-selection.js";
-import type {
-  MessageActionGateway,
-  MessageActionResult,
-} from "../../infra/outbound/message-action-contracts.js";
+import type { MessageActionResult } from "../../infra/outbound/message-action-contracts.js";
 import { projectGatewayQueuedDeliveryResult } from "../../infra/outbound/message-action-execution.js";
+import { hasAcceptedMessageActionResult } from "../../infra/outbound/message-action-result-acceptance.js";
 import { getToolResult, runMessageAction } from "../../infra/outbound/message-action-runner.js";
 import {
   resolveEffectiveMessageToolsConfig,
   shouldApplyCrossContextMarker,
 } from "../../infra/outbound/outbound-policy.js";
-import { isDeliveredCurrentSourceReply } from "../../infra/outbound/source-reply-mirror.js";
+import { isDeliveredCurrentSourceReplyAsync } from "../../infra/outbound/source-reply-mirror.js";
+import { readBooleanParam } from "../../plugin-sdk/boolean-param.js";
 import { stringifyRouteThreadId } from "../../plugin-sdk/channel-route.js";
 import { getPreparedMessageToolCatalog } from "../../plugins/prepared-message-tool-catalog.js";
+import { withChannelReadAuthority } from "../../shared/channel-read-authority.js";
 import { INTERNAL_MESSAGE_CHANNEL, normalizeMessageChannel } from "../../utils/message-channel.js";
 import { resolveSessionAgentId } from "../agent-scope.js";
-import {
-  attachEmbeddedMessageDeliveryFact,
-  projectEmbeddedMessageDeliveryFact,
-} from "../embedded-agent-message-delivery.js";
+import * as embeddedMessageDelivery from "../embedded-agent-message-delivery.js";
 import { createSandboxBridgeReadFile } from "../sandbox-media-paths.js";
 import { type AnyAgentTool, jsonResult, readToolStringParam } from "./common.js";
+import { captureGatewayToolCallerAssertion } from "./gateway-caller-context.js";
 import {
-  readGatewayCallOptions,
-  resolveGatewayOptions,
-  resolveMessageActionAgentRuntimeIdentityToken,
-} from "./gateway.js";
-import { createMessageToolDecisionRecorder } from "./message-tool-decision.js";
+  createMessageToolDecisionRecorder,
+  resolveTrustedDecisionChannel,
+} from "./message-tool-decision.js";
 import {
   buildMessageToolDescription,
   buildMessageToolSchema,
@@ -58,8 +50,14 @@ import {
 } from "./message-tool-discovery.js";
 import type { MessageToolOptions } from "./message-tool-execution-options.js";
 import { createMessageToolExplicitTargetGuard } from "./message-tool-explicit-target.js";
+import { createMessageToolGateway } from "./message-tool-gateway.js";
+import { prepareMessageToolGroupThread } from "./message-tool-group-thread.js";
 import { deriveMessageToolIdempotency } from "./message-tool-idempotency.js";
 import { resolveOutboundActionRoute } from "./message-tool-outbound-route.js";
+import {
+  projectScheduledMessageActionPartialResult,
+  shouldRevalidateCompletedMessageAction,
+} from "./message-tool-scheduled-execution.js";
 import { MessageToolSchema } from "./message-tool-schema.js";
 import {
   addSourceReplyFinalControl,
@@ -68,29 +66,19 @@ import {
   enforceTrustedTurnExplicitAccount,
   SOURCE_REPLY_ONLY_MESSAGE_SCHEMA,
 } from "./message-tool-source-policy.js";
+import { createMessageToolTurnAuthority } from "./message-tool-turn-authority.js";
 import {
   hasSanitizedSendPayloadContent,
   sanitizeMessageToolVisiblePayload,
   type VisibleTextSuppressionReason,
 } from "./message-tool-visible-content.js";
-import { isPollVoteEchoText } from "./poll-vote-echo.js";
+import { isPollVoteEchoText, resolvePollVoteEchoRoute } from "./poll-vote-echo.js";
 import {
   buildTurnSendLedgerSessionKey,
   commitTurnSend,
   releaseTurnSend,
   reserveTurnSend,
 } from "./turn-send-ledger.js";
-
-function resolveTrustedDecisionChannel(
-  raw: string | null | undefined,
-  catalog: PreparedMessageToolCatalog | undefined,
-): string | undefined {
-  const channel = normalizeMessageChannel(raw);
-  if (!channel) {
-    return undefined;
-  }
-  return channel === INTERNAL_MESSAGE_CHANNEL || catalog?.getChannel(channel) ? channel : undefined;
-}
 
 const POLL_VOTE_ECHO_TTL_MS = 30_000;
 
@@ -105,8 +93,6 @@ const recentPollVoteBySession = new Map<
   string,
   { option: string; route: string; recordedAt: number }
 >();
-
-export type { MessageToolOptions } from "./message-tool-execution-options.js";
 
 export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
   const loadConfigForTool = options?.getRuntimeConfig ?? getRuntimeConfig;
@@ -148,10 +134,16 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           config: options?.config,
         })
       : undefined);
-  // Agent-prefixed session slot shared with conversations_send so alternating the two
-  // tools at one recipient shares one per-turn budget (buildTurnSendLedgerSessionKey).
-  // Also scopes the poll-vote-echo map; a null session key disables both.
   const pollEchoSessionKey = buildTurnSendLedgerSessionKey(resolvedAgentId, rawPollEchoSessionKey);
+  const turnAuthority = createMessageToolTurnAuthority({
+    token: options?.messageActionTurnCapability,
+    agentId: resolvedAgentId,
+    runId: options?.runId,
+    sessionKey: options?.agentSessionKey,
+    sessionId: options?.sessionId,
+    getConfig: () => options?.config ?? loadConfigForTool(),
+    admitScheduledInvocation: options?.admitScheduledInvocation,
+  });
   const messageToolDiscoveryParams: MessageToolDiscoveryParams | undefined =
     options?.config && !options.sourceReplyOnly
       ? {
@@ -162,6 +154,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           currentThreadTs,
           currentMessageId: options.currentMessageId,
           currentAccountId: agentAccountId,
+          scheduledAccountScope: turnAuthority.scheduledAccountScope,
           sessionKey: options.agentSessionKey,
           sessionId: options.sessionId,
           agentId: resolvedAgentId,
@@ -204,6 +197,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           localRoots: [
             sandboxRoot,
             ...(options?.sandboxContainerWorkdir ? [options.sandboxContainerWorkdir] : []),
+            ...(options?.sandboxReadOnlyResourceMounts?.map((mount) => mount.containerPath) ?? []),
           ],
           readFile: createSandboxBridgeReadFile({
             sandbox: { root: sandboxRoot, bridge: options.sandboxFsBridge },
@@ -221,15 +215,21 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
     prepareBeforeToolCallParams: explicitTargetGuard?.prepareBeforeToolCallParams,
     finalizeBeforeToolCallParams: explicitTargetGuard?.finalizeBeforeToolCallParams,
     execute: async (toolCallId, args, signal) => {
-      if (signal?.aborted) {
-        throw createAbortError("Message send aborted");
-      }
+      const assertCaller = turnAuthority.captureCaller(signal, captureGatewayToolCallerAssertion);
       // Shallow-copy so we don't mutate the original event args (used for logging/dedup).
       const params = { ...(args as Record<string, unknown>) };
       const action = readToolStringParam(params, "action", {
         required: true,
       }) as ChannelMessageActionName;
-      const rawConfig = options?.config ?? loadConfigForTool();
+      const {
+        authorization: trustedTurnContext,
+        config: rawConfig,
+        scheduledRead,
+        assertDashboardReadCurrent,
+        hasChannelTurnContext,
+        gatewayTurnCapability,
+      } = turnAuthority.beginInvocation(action);
+      const messageActionAuthorization: MessageActionAuthorization = trustedTurnContext ?? {};
       const requestedAccountId = readToolStringParam(params, "accountId");
       const effectiveCurrentChannel = resolveEffectiveCurrentChannelContext(options, {
         config: rawConfig,
@@ -247,20 +247,26 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           ? decisions.executionIdentityToken
           : undefined;
       const deliveryRunId = options?.runId ?? executionIdentityToken?.runId;
-      const trustedTurnContext =
-        resolvedAgentId && options?.agentSessionKey
-          ? messageActionTurnCapability.resolveMessageActionTurnCapability({
-              token: options.messageActionTurnCapability,
-              agentId: resolvedAgentId,
-              runId: options.runId,
-              sessionKey: options.agentSessionKey,
-              sessionId: options.sessionId,
-            })
-          : undefined;
+      const scheduledWrite = isScheduledMessageWriteAction(action)
+        ? messageActionAuthorization.scheduled
+        : undefined;
+      const scheduledPolicy = (scheduledRead ?? scheduledWrite)?.policy;
+      const scheduledAccountId =
+        scheduledPolicy?.mode === "account" ? scheduledPolicy.ownerAccountId : undefined;
       if (normalizeOptionalString(options?.messageActionTurnCapability) && !trustedTurnContext) {
         decisions.recordTurnCapabilityInactive();
         throw new Error("message action turn capability is no longer active");
       }
+      const assertActionCurrent = () => {
+        assertCaller();
+        turnAuthority.assertCurrent();
+        const scheduled = messageActionAuthorization.scheduled;
+        ((scheduledRead ?? scheduledWrite)
+          ? (scheduled?.assertSourceCurrent ?? scheduled?.assertCurrent)
+          : scheduled?.assertCurrent)?.();
+        assertDashboardReadCurrent?.();
+      };
+      assertActionCurrent();
       if (options?.sourceReplyOnly) {
         decisions.runBoundary(() =>
           enforceSourceReplyOnlyMessageAction({
@@ -309,7 +315,16 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         decisions.runBoundary(() => explicitTargetGuard.require(params, action));
       }
 
-      const gatewayOpts = readGatewayCallOptions(params);
+      const gatewayContext = { ...options, messageActionTurnCapability: gatewayTurnCapability };
+      const gateway = createMessageToolGateway(params, gatewayContext, signal, {
+        resolveConfig: () => cfg,
+        preserveWriteOutcome: Boolean(
+          messageActionAuthorization.scheduled &&
+          !scheduledRead &&
+          readBooleanParam(params, "dryRun") !== true,
+        ),
+        hasScheduledAuthority: Boolean(messageActionAuthorization.scheduled),
+      });
       decisions.runBoundary(() =>
         validateExplicitMessageAccountSelection({
           cfg: rawConfig,
@@ -338,7 +353,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         targets: params.targets,
         fallbackChannel: effectiveCurrentChannel.currentChannelProvider,
         accountId: requestedAccountId,
-        fallbackAccountId: agentAccountId,
+        fallbackAccountId: scheduledAccountId ?? agentAccountId,
       });
       // Broadcast execution only narrows on an explicit non-all channel. Target
       // prefixes cannot authorize fewer providers than the runner will execute.
@@ -350,7 +365,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         validateExplicitMessageAccountSelection({
           cfg: rawConfig,
           channel: unscopedExplicitBroadcast ? undefined : scope.channel,
-          accountId: requestedAccountId,
+          accountId: requestedAccountId ?? scheduledAccountId,
           checkResolvedAccount: false,
         }),
       );
@@ -369,7 +384,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             : [scope.channel],
           trustedCurrentChannel: trustedTurnContext?.toolContext?.currentChannelProvider,
           trustedRequesterAccountId: trustedTurnContext?.requesterAccountId,
-          hasTrustedTurnContext: trustedTurnContext !== undefined,
+          hasTrustedTurnContext: hasChannelTurnContext,
         }),
       );
       if (explicitAccountId) {
@@ -391,8 +406,18 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           mode: "enforce_resolved",
         })
       ).resolvedConfig;
+      assertActionCurrent();
 
-      const accountId = explicitAccountId ?? agentAccountId;
+      const accountId = explicitAccountId ?? scheduledAccountId ?? agentAccountId;
+      const pollVoteEchoRoute = resolvePollVoteEchoRoute({
+        action,
+        args: params,
+        channel: scope.channel ?? effectiveCurrentChannel.currentChannelProvider,
+        accountId,
+        currentChannelId: effectiveCurrentChannel.currentChannelId,
+        currentMessagingTarget: effectiveCurrentChannel.currentMessagingTarget,
+        preparedMessageToolCatalog,
+      });
       const outboundActionRoute = resolveOutboundActionRoute({
         action,
         args: params,
@@ -430,7 +455,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       ) {
         if (Date.now() - recentPollVote.recordedAt >= POLL_VOTE_ECHO_TTL_MS) {
           recentPollVoteBySession.delete(pollEchoSessionKey);
-        } else if (outboundActionRoute === recentPollVote.route) {
+        } else if (pollVoteEchoRoute === recentPollVote.route) {
           const vote = recentPollVote;
           recentPollVoteBySession.delete(pollEchoSessionKey);
           const outboundText =
@@ -448,120 +473,6 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         }
       }
 
-      // Derive the delivery idempotency key before the hard cap. A true replay (same
-      // toolCallId + identical params) reproduces the same autogenerated key, which the
-      // Gateway-backed delivery path dedups to the already-completed "sent" receipt
-      // without re-delivering; the cap below uses this key to recognize and admit that
-      // replay instead of blocking it. Derivation reads only values fixed above (params,
-      // action, toolCallId, runId, and the closure-scoped failed-key map/counter), so
-      // its position does not change the derived key.
-      const { actionIdempotencyKey, autogeneratedDeliveryFingerprint } =
-        deriveMessageToolIdempotency({
-          action,
-          params,
-          explicitIdempotencyKey: params.idempotencyKey,
-          runId: options?.runId,
-          toolCallId,
-          failedAutogeneratedKeys: failedAutogeneratedIdempotencyKeys,
-          nextOperationId: () => String(++generatedIdempotencyCounter),
-        });
-
-      // Resolve the delivery route BEFORE reserving, because whether a repeated send is
-      // re-delivery-safe depends on which delivery branch runMessageAction will take.
-      // Direct tool invocations already execute inside the authenticated Gateway request,
-      // so keep their authority operation-local by dispatching channel actions in-process
-      // (gateway === undefined) instead of laundering it through a new backend connection.
-      const gatewayResolved = resolveGatewayOptions(gatewayOpts);
-      const { token: gatewayToken } = gatewayResolved;
-      const callerOwnsTerminalReceipt =
-        gatewayResolved.target === "remote" ||
-        normalizeOptionalString(gatewayOpts.gatewayUrl) !== undefined ||
-        normalizeOptionalString(gatewayOpts.gatewayToken) !== undefined;
-      const gateway: MessageActionGateway | undefined =
-        options?.conversationReadOrigin === "direct-operator"
-          ? undefined
-          : {
-              url: gatewayResolved.url,
-              token: gatewayToken,
-              timeoutMs: gatewayResolved.timeoutMs,
-              clientName: GATEWAY_CLIENT_IDS.GATEWAY_CLIENT,
-              clientDisplayName: "agent",
-              mode: GATEWAY_CLIENT_MODES.BACKEND,
-              ...(callerOwnsTerminalReceipt
-                ? { terminalSourceReplyReceiptOwner: "caller" as const }
-                : {}),
-              resolveAgentRuntimeIdentityToken: (context) =>
-                resolveMessageActionAgentRuntimeIdentityToken({
-                  opts: gatewayOpts,
-                  target: gatewayResolved.target,
-                  turnCapability: options?.messageActionTurnCapability,
-                  turnCapabilitySessionKey: options?.agentSessionKey,
-                  runId: options?.runId,
-                  sessionId: options?.sessionId,
-                  sourceReplyFinal: context?.sourceReplyFinal,
-                  sourceReplyToolCallId: context?.sourceReplyToolCallId,
-                  callerOwnsTerminalReceipt,
-                }),
-            };
-
-      // Optional hard cap (opt-in, default off): reserve a slot before dispatch so a
-      // concurrent same-target send cannot slip past the cap while this one is in
-      // flight, then settle the reservation once delivery lands (commit) or does not
-      // (release). Media (sendAttachment/upload-file) passes maxPerTurn=undefined so it
-      // is never blocked — legitimately split attachments must not be truncated — while
-      // still counting toward the nudge; broadcast fan-out never builds a budgetContext.
-      // Cross-tool budget unification (message <-> conversations_send at one recipient)
-      // is via the shared ledger slot key.
-      //
-      // Replay admission is route-aware. A committed operationId is handed to the ledger
-      // ONLY when delivery actually relays through the Gateway backend, which resolves a
-      // repeated idempotency key to the already-completed operation and returns it without
-      // sending again. There the replay is admitted past the cap (`replay`) and left
-      // unsettled, so a receipt the model already earned is neither suppressed nor
-      // double-counted. A direct in-process send (message.ts sendDurableMessageBatchCore)
-      // does NOT dedup on the idempotency key, so a repeat there is a genuine second
-      // delivery; the operationId is withheld and the repeat is treated as an ordinary new
-      // send — cap-blocked when a cap is set, honestly counted when it is not. The route is
-      // read from the same gateway-vs-direct branch delivery itself selects (a live gateway
-      // connection plus the channel's gateway execution/delivery mode), never from the
-      // caller-supplied receipt owner or gateway target alone, which do not prove which
-      // delivery branch runs.
-      const isMediaSendAction = action === "sendAttachment" || action === "upload-file";
-      const effectiveMessageTools = budgetContext
-        ? resolveEffectiveMessageToolsConfig({ cfg: rawConfig, agentId: resolvedAgentId })
-        : undefined;
-      const maxPerTurn = isMediaSendAction
-        ? undefined
-        : effectiveMessageTools?.maxMessagesPerTurnPerTarget;
-      const budgetDeliveryChannel = normalizeMessageChannel(
-        scope.channel ?? effectiveCurrentChannel.currentChannelProvider,
-      );
-      const budgetChannelPlugin =
-        budgetContext && budgetDeliveryChannel
-          ? getChannelPlugin(budgetDeliveryChannel)
-          : undefined;
-      const routeDedupsCompletedOperation =
-        gateway !== undefined &&
-        (budgetChannelPlugin?.actions?.resolveExecutionMode?.({ action }) === "gateway" ||
-          budgetChannelPlugin?.outbound?.deliveryMode === "gateway");
-      const reservation = budgetContext
-        ? reserveTurnSend(budgetContext, {
-            maxPerTurn,
-            ...(actionIdempotencyKey && routeDedupsCompletedOperation
-              ? { operationId: actionIdempotencyKey }
-              : {}),
-          })
-        : undefined;
-      if (reservation?.status === "exhausted") {
-        return jsonResult({
-          status: "suppressed",
-          reason: "turn_send_budget_exhausted",
-          // Report the configured per-turn limit, not a delivered count: admission is
-          // blocked on committed + in-flight pending reaching the cap, so the number
-          // actually delivered this turn may be fewer than `maxPerTurn`.
-          message: `Blocked: reached this turn's configured limit of ${maxPerTurn} message(s) to this target (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
-        });
-      }
       const hasCurrentMessageId =
         typeof options?.currentMessageId === "number" ||
         (typeof options?.currentMessageId === "string" &&
@@ -592,210 +503,282 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
               skipCrossContextDecoration: true,
             }
           : undefined;
+      const groupThread = prepareMessageToolGroupThread(params, {
+        action,
+        channel: scope.channel,
+        accountId,
+        currentAccountId: agentAccountId,
+        toolContext,
+        catalog: preparedMessageToolCatalog,
+      });
+      if (groupThread.silent) {
+        return jsonResult({ status: "suppressed", reason: "silent_reply" });
+      }
+      const { actionIdempotencyKey, autogeneratedDeliveryFingerprint } =
+        deriveMessageToolIdempotency({
+          action,
+          params,
+          explicitIdempotencyKey: params.idempotencyKey,
+          runId: options?.runId,
+          toolCallId,
+          failedAutogeneratedKeys: failedAutogeneratedIdempotencyKeys,
+          nextOperationId: () => String(++generatedIdempotencyCounter),
+        });
       const actionParams = actionIdempotencyKey
         ? { ...params, idempotencyKey: actionIdempotencyKey }
         : params;
+      const effectiveMessageTools = resolveEffectiveMessageToolsConfig({
+        cfg: rawConfig,
+        agentId: resolvedAgentId,
+      });
+      const isMediaSendAction = action === "sendAttachment" || action === "upload-file";
+      const budgetDeliveryChannel = normalizeMessageChannel(
+        scope.channel ?? effectiveCurrentChannel.currentChannelProvider,
+      );
+      const budgetChannelPlugin =
+        budgetContext && budgetDeliveryChannel
+          ? getChannelPlugin(budgetDeliveryChannel)
+          : undefined;
+      const routeDedupsCompletedOperation =
+        gateway !== undefined &&
+        (budgetChannelPlugin?.actions?.resolveExecutionMode?.({ action }) === "gateway" ||
+          budgetChannelPlugin?.outbound?.deliveryMode === "gateway");
+      const reservation = budgetContext
+        ? reserveTurnSend(budgetContext, {
+            maxPerTurn: isMediaSendAction
+              ? undefined
+              : effectiveMessageTools?.maxMessagesPerTurnPerTarget,
+            operationId: routeDedupsCompletedOperation ? actionIdempotencyKey : undefined,
+            chargeCap: !isMediaSendAction,
+          })
+        : undefined;
+      if (reservation?.status === "exhausted") {
+        const max = effectiveMessageTools?.maxMessagesPerTurnPerTarget;
+        return jsonResult({
+          status: "suppressed",
+          reason: "turn_send_budget_exhausted",
+          message: `Blocked: reached this turn's configured limit of ${max} message(s) to this target (maxMessagesPerTurnPerTarget). Finalize your reply instead of sending another message.`,
+        });
+      }
       const hasExactSourceTurn =
         action === "send" &&
         sourceReplySinkDeliveryMode === "message_tool_only" &&
         normalizeOptionalString(trustedTurnContext?.toolContext?.currentSourceTurnId) !== undefined;
-      let result: MessageActionResult;
-      try {
-        result = await runMessageActionForTool({
-          cfg,
-          action,
-          params: actionParams,
-          actionOrigin: "message-tool",
-          defaultAccountId: accountId ?? undefined,
-          ...messageActionTurnCapability.selectMessageActionRequesterIdentity(trustedTurnContext),
-          messageActionAuthorization: {
-            requesterAccountId: trustedTurnContext?.requesterAccountId,
-            requesterSenderId: trustedTurnContext?.requesterSenderId,
-            toolContext: trustedTurnContext?.toolContext,
-          },
-          senderIsOwner: options?.senderIsOwner,
-          conversationReadOrigin: options?.conversationReadOrigin,
-          workspaceDir: options?.workspaceDir,
-          broadcastAccountPlan,
-          gateway,
-          toolContext,
-          sessionKey: options?.agentSessionKey,
-          sourceReplySessionKey: options?.runSessionKey,
-          sessionId: options?.sessionId,
-          runId: deliveryRunId,
-          executionIdentityToken,
-          agentId: resolvedAgentId,
-          workspaceMediaAccess: sandboxWorkspaceMediaAccess,
-          sandboxRoot: options?.sandboxRoot,
-          sandboxContainerWorkdir: options?.sandboxContainerWorkdir,
-          sourceReplyDeliveryMode: sourceReplySinkDeliveryMode,
-          // Only an admitted channel source can arm terminal restart reconciliation.
-          // Source-less scheduled and ambient sends remain ordinary message actions.
-          sourceReplyFinal: hasExactSourceTurn ? (requestedSourceReplyFinal ?? true) : undefined,
-          sourceReplyToolCallId: hasExactSourceTurn ? toolCallId : undefined,
-          onActionDenied: (error, channel, receiptDiscriminator) =>
-            decisions.recordTypedDenial(
+      return await withChannelReadAuthority(
+        action === "download-file" || scheduledRead || assertDashboardReadCurrent
+          ? assertActionCurrent
+          : undefined,
+        async () => {
+          let result: MessageActionResult;
+          try {
+            result = await groupThread.run(() =>
+              runMessageActionForTool({
+                cfg,
+                action,
+                params: actionParams,
+                actionOrigin: "message-tool",
+                defaultAccountId: accountId ?? undefined,
+                ...messageActionTurnCapability.selectMessageActionRequesterIdentity(
+                  trustedTurnContext,
+                ),
+                messageActionAuthorization,
+                assertDirectAdapterHandoff: assertActionCurrent,
+                onPlatformSendDispatch: messageActionAuthorization.scheduled
+                  ? async () => assertActionCurrent()
+                  : undefined,
+                skipQueue: Boolean(messageActionAuthorization.scheduled),
+                senderIsOwner: options?.senderIsOwner,
+                conversationReadOrigin: options?.conversationReadOrigin,
+                workspaceDir: options?.workspaceDir,
+                broadcastAccountPlan,
+                gateway,
+                toolContext,
+                sessionKey: options?.agentSessionKey,
+                sourceReplySessionKey: options?.runSessionKey,
+                sessionId: options?.sessionId,
+                runId: deliveryRunId,
+                executionIdentityToken,
+                agentId: resolvedAgentId,
+                workspaceMediaAccess: sandboxWorkspaceMediaAccess,
+                sandboxRoot: options?.sandboxRoot,
+                sandboxContainerWorkdir: options?.sandboxContainerWorkdir,
+                sourceReplyDeliveryMode: sourceReplySinkDeliveryMode,
+                // Only an admitted channel source can arm terminal restart reconciliation.
+                // Source-less scheduled and ambient sends remain ordinary message actions.
+                sourceReplyFinal: hasExactSourceTurn
+                  ? (requestedSourceReplyFinal ?? true)
+                  : undefined,
+                sourceReplyToolCallId: hasExactSourceTurn ? toolCallId : undefined,
+                onActionDenied: (error, channel, receiptDiscriminator) =>
+                  decisions.recordTypedDenial(
+                    error,
+                    resolveTrustedDecisionChannel(channel, preparedMessageToolCatalog),
+                    receiptDiscriminator,
+                  ),
+                inboundEventKind: options?.inboundEventKind,
+                inboundAudio: options?.hasCurrentInboundAudio?.() ?? options?.currentInboundAudio,
+                abortSignal: signal,
+              }),
+            );
+          } catch (error) {
+            const partialResult = projectScheduledMessageActionPartialResult({
               error,
-              resolveTrustedDecisionChannel(channel, preparedMessageToolCatalog),
-              receiptDiscriminator,
-            ),
-          inboundEventKind: options?.inboundEventKind,
-          inboundAudio: options?.hasCurrentInboundAudio?.() ?? options?.currentInboundAudio,
-          abortSignal: signal,
-        });
-      } catch (error) {
-        // Nothing reached the peer: roll back the reservation so a throwing send does
-        // not consume the cap. A `replay` reservation took no pending slot (no-op).
-        if (reservation?.status === "reserved") {
-          releaseTurnSend(reservation.reservation);
-        }
-        if (autogeneratedDeliveryFingerprint && actionIdempotencyKey) {
-          failedAutogeneratedIdempotencyKeys.set(
-            autogeneratedDeliveryFingerprint,
-            actionIdempotencyKey,
-          );
-        }
-        // Queue-owned retry: the gateway already holds the durable row and
-        // caches this outcome under the same idempotency key, so a model resend
-        // of the same content collapses instead of minting a second send.
-        const queuedDelivery = projectGatewayQueuedDeliveryResult(error);
-        if (queuedDelivery) {
-          return jsonResult(queuedDelivery);
-        }
-        decisions.recordTypedDenial(error);
-        throw error;
-      }
-      if (
-        autogeneratedDeliveryFingerprint &&
-        failedAutogeneratedIdempotencyKeys.get(autogeneratedDeliveryFingerprint) ===
-          actionIdempotencyKey
-      ) {
-        failedAutogeneratedIdempotencyKeys.delete(autogeneratedDeliveryFingerprint);
-      }
-      decisions.recordActionResult(
-        result,
-        resolveTrustedDecisionChannel(result.channel, preparedMessageToolCatalog),
-      );
-      const toolResult = getToolResult(result);
-      // A2A enters through webchat but resolves an external source route here.
-      // Compare the completed send with that route, independently of display mirrors.
-      const currentSourceReply =
-        result.handledBy !== "internal-source" &&
-        isDeliveredCurrentSourceReply({
-          action,
-          cfg,
-          channel: result.channel,
-          actionParams: "to" in result ? { ...actionParams, target: result.to } : actionParams,
-          accountId,
-          currentAccountId: agentAccountId,
-          sessionKey: options?.agentSessionKey,
-          toolContext,
-          deliveredPayload: result.payload,
-          replyToIsExplicit: Boolean(readToolStringParam(actionParams, "replyTo")),
-        });
-      const messageDelivery = projectEmbeddedMessageDeliveryFact(result, currentSourceReply);
-      if (
-        messageDelivery?.status === "settled" &&
-        !messageDelivery.partialDelivery &&
-        requestedSourceReplyFinal !== false &&
-        !result.dryRun &&
-        currentSourceReply
-      ) {
-        messageDelivery.sourceReplyDelivered = true;
-      }
-      const normalizationNotice = result.kind === "send" ? result.normalization?.notice : undefined;
-      if (
-        action === "poll-vote" &&
-        outboundActionRoute &&
-        pollEchoSessionKey &&
-        sourceReplySinkDeliveryMode === "message_tool_only"
-      ) {
-        const details = toolResult?.details as { pollVotedOption?: unknown } | undefined;
-        const option =
-          typeof details?.pollVotedOption === "string" ? details.pollVotedOption.trim() : "";
-        if (option) {
-          const recordedAt = Date.now();
-          // Prune expired entries on write so a session that votes but never
-          // sends a follow-up text can't leak a record forever in a long-lived
-          // gateway; the map stays bounded to sessions that voted within the TTL.
-          for (const [key, entry] of recentPollVoteBySession) {
-            if (recordedAt - entry.recordedAt >= POLL_VOTE_ECHO_TTL_MS) {
-              recentPollVoteBySession.delete(key);
+              action,
+              actionParams: params,
+              scopeChannel: scope.channel,
+              hasScheduledAuthority: Boolean(messageActionAuthorization.scheduled),
+            });
+            if (partialResult) {
+              result = partialResult;
+            } else {
+              if (reservation?.status === "reserved") {
+                releaseTurnSend(reservation.reservation);
+              }
+              if (autogeneratedDeliveryFingerprint && actionIdempotencyKey) {
+                failedAutogeneratedIdempotencyKeys.set(
+                  autogeneratedDeliveryFingerprint,
+                  actionIdempotencyKey,
+                );
+              }
+              // Queue-owned retry: the gateway already holds the durable row and
+              // caches this outcome under the same idempotency key, so a model resend
+              // of the same content collapses instead of minting a second send.
+              const queuedDelivery = projectGatewayQueuedDeliveryResult(error);
+              if (queuedDelivery) {
+                return jsonResult(queuedDelivery);
+              }
+              decisions.recordTypedDenial(error);
+              throw error;
             }
           }
-          recentPollVoteBySession.set(pollEchoSessionKey, {
-            option,
-            route: outboundActionRoute,
-            recordedAt,
-          });
-        }
-      }
-      // Reaching here without throwing means the action was dispatched. Settle the
-      // reservation against the outcome: a delivery that landed commits (counting it in
-      // the per-turn ledger regardless of the nudge toggle) and, from the second send to
-      // this target onward, appends a one-line soft reminder unless turnSendNudge is
-      // explicitly disabled. A `dry-run` result (e.g. no gateway) never counts.
-      //
-      // A core send can return deliveryStatus "suppressed" (e.g. no_visible_payload) or a
-      // best-effort "failed" (a delivery that did not reach the peer but was not raised as a
-      // throw) without reaching the peer; neither must consume the cap or fire a false
-      // nudge, so both release the reservation instead of committing. "partial_failed" and
-      // the throwing "failed" path already reject upstream (message.ts) and never reach here;
-      // plugin/gateway sends carry kind:"send" with no sendResult (deliveryStatus undefined)
-      // — those still count because delivery happened remotely. A `replay` reservation is
-      // left unsettled (the Gateway deduped it to the completed receipt), so it neither
-      // re-commits nor nudges.
-      const deliveryStatus = result.kind === "send" ? result.sendResult?.deliveryStatus : undefined;
-      const deliveredNothing = deliveryStatus === "suppressed" || deliveryStatus === "failed";
-      let turnSendNotice: string | undefined;
-      if (reservation?.status === "reserved") {
-        const landed = result.kind !== "broadcast" && !result.dryRun && !deliveredNothing;
-        if (!landed) {
-          releaseTurnSend(reservation.reservation);
-        } else {
-          const sendCount = commitTurnSend(reservation.reservation);
-          const nudgeEnabled = effectiveMessageTools?.turnSendNudge !== false;
-          if (sendCount >= 2 && nudgeEnabled) {
-            turnSendNotice = `You have already sent ${sendCount} messages to this target this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`;
+          if (
+            autogeneratedDeliveryFingerprint &&
+            failedAutogeneratedIdempotencyKeys.get(autogeneratedDeliveryFingerprint) ===
+              actionIdempotencyKey
+          ) {
+            failedAutogeneratedIdempotencyKeys.delete(autogeneratedDeliveryFingerprint);
           }
-        }
-      }
-      // Single append point for all three return exits so a notice is never dropped
-      // or duplicated across the normalization/toolResult/payload paths.
-      const baseResult = toolResult ?? jsonResult(result.payload);
-      const appendedNotices = [normalizationNotice, turnSendNotice].filter(
-        (notice): notice is string => Boolean(notice),
-      );
-      if (appendedNotices.length === 0) {
-        return attachEmbeddedMessageDeliveryFact(baseResult, messageDelivery);
-      }
-      // The message tool declares no outputSchema, but Code Mode still projects a
-      // tool's details (not its content) to the guest. Carry the send-budget reminder
-      // in details.turnSendNotice for this successful send so a Code Mode guest sees
-      // it too; the content append is unchanged. Only turnSendNotice rides in details
-      // (the normalization notice stays presentation-only), and only when the result
-      // already carries a plain-object details to extend.
-      //
-      // Replace details only when there is a real record to augment. `...baseResult`
-      // already carries the producer's original details key exactly (present or
-      // absent); adding an explicit `details: undefined` here would materialize a key
-      // that Code Mode's presence-based projection ("details" in result) then returns
-      // as undefined, so a details-less plugin result would reach the guest as
-      // undefined instead of its real envelope.
-      const detailsWithNotice =
-        turnSendNotice && isRecord(baseResult.details)
-          ? { ...baseResult.details, turnSendNotice }
-          : undefined;
-      return attachEmbeddedMessageDeliveryFact(
-        {
-          ...baseResult,
-          content: [
-            ...baseResult.content,
-            ...appendedNotices.map((text) => ({ type: "text" as const, text })),
-          ],
-          ...(detailsWithNotice ? { details: detailsWithNotice } : {}),
+          decisions.recordActionResult(
+            result,
+            resolveTrustedDecisionChannel(result.channel, preparedMessageToolCatalog),
+          );
+          const toolResult = getToolResult(result);
+          // A2A enters through webchat but resolves an external source route here.
+          // Compare the completed send with that route, independently of display mirrors.
+          const sourceReply = {
+            action,
+            cfg,
+            channel: result.channel,
+            actionParams: "to" in result ? { ...actionParams, target: result.to } : actionParams,
+            accountId,
+            currentAccountId: agentAccountId,
+            sessionKey: options?.agentSessionKey,
+            toolContext,
+            deliveredPayload: result.payload,
+            replyToIsExplicit: Boolean(readToolStringParam(actionParams, "replyTo")),
+          };
+          const currentSourceReply =
+            result.handledBy !== "internal-source" &&
+            (await isDeliveredCurrentSourceReplyAsync(sourceReply));
+          // A completed provider write must settle even if its caller was revoked
+          // while awaiting the accepted response. Its next request stays fenced.
+          if (
+            !embeddedMessageDelivery.hasAcceptedBroadcastDelivery(result) &&
+            shouldRevalidateCompletedMessageAction({
+              hasScheduledAuthority: Boolean(messageActionAuthorization.scheduled),
+              scheduledRead: Boolean(scheduledRead),
+              dryRun: result.dryRun,
+              acceptedResult: hasAcceptedMessageActionResult(
+                result,
+                messageActionAuthorization.scheduled !== undefined,
+              ),
+            })
+          ) {
+            assertActionCurrent();
+          }
+          const messageDelivery = embeddedMessageDelivery.projectEmbeddedMessageDeliveryFact(
+            result,
+            currentSourceReply,
+          );
+          groupThread.record(result, sourceReply, currentSourceReply, requestedSourceReplyFinal);
+          if (
+            messageDelivery?.status === "settled" &&
+            !messageDelivery.partialDelivery &&
+            requestedSourceReplyFinal !== false &&
+            !result.dryRun &&
+            currentSourceReply
+          ) {
+            messageDelivery.sourceReplyDelivered = true;
+          }
+          if (
+            action === "poll-vote" &&
+            pollVoteEchoRoute &&
+            pollEchoSessionKey &&
+            sourceReplySinkDeliveryMode === "message_tool_only"
+          ) {
+            const details = toolResult?.details as { pollVotedOption?: unknown } | undefined;
+            const option =
+              typeof details?.pollVotedOption === "string" ? details.pollVotedOption.trim() : "";
+            if (option) {
+              const recordedAt = Date.now();
+              // Prune expired entries on write so a session that votes but never
+              // sends a follow-up text can't leak a record forever in a long-lived
+              // gateway; the map stays bounded to sessions that voted within the TTL.
+              for (const [key, entry] of recentPollVoteBySession) {
+                if (recordedAt - entry.recordedAt >= POLL_VOTE_ECHO_TTL_MS) {
+                  recentPollVoteBySession.delete(key);
+                }
+              }
+              recentPollVoteBySession.set(pollEchoSessionKey, {
+                option,
+                route: pollVoteEchoRoute,
+                recordedAt,
+              });
+            }
+          }
+          const response = toolResult ?? jsonResult(result.payload);
+          const normalizationNotice =
+            result.kind === "send" ? result.normalization?.notice : undefined;
+          const deliveryStatus =
+            result.kind === "send" ? result.sendResult?.deliveryStatus : undefined;
+          const landed =
+            result.kind !== "broadcast" &&
+            !result.dryRun &&
+            deliveryStatus !== "suppressed" &&
+            deliveryStatus !== "failed";
+          let turnSendNotice: string | undefined;
+          if (reservation?.status === "reserved") {
+            if (landed) {
+              const sendCount = commitTurnSend(reservation.reservation);
+              if (sendCount >= 2 && effectiveMessageTools?.turnSendNudge !== false) {
+                turnSendNotice = `You have already sent ${sendCount} messages to this target this turn; if this is a rewrite of the same reply, finalize now instead of sending another variant.`;
+              }
+            } else {
+              releaseTurnSend(reservation.reservation);
+            }
+          }
+          const appendedNotices = [normalizationNotice, turnSendNotice].filter(
+            (value): value is string => Boolean(value),
+          );
+          const detailsWithNotice =
+            turnSendNotice && isRecord(response.details)
+              ? { ...response.details, turnSendNotice }
+              : undefined;
+          return embeddedMessageDelivery.attachEmbeddedMessageDeliveryFact(
+            appendedNotices.length > 0
+              ? {
+                  ...response,
+                  content: [
+                    ...response.content,
+                    ...appendedNotices.map((text) => ({ type: "text" as const, text })),
+                  ],
+                  ...(detailsWithNotice ? { details: detailsWithNotice } : {}),
+                }
+              : response,
+            messageDelivery,
+          );
         },
-        messageDelivery,
+        signal,
       );
     },
   };

@@ -38,11 +38,13 @@ openclaw onboard --import-from hermes --import-source ~/.hermes
 
 Running `openclaw migrate <provider>` with no other flags plans, previews, and (in a TTY) prompts before applying. `openclaw migrate plan <provider>` and `openclaw migrate apply <provider>` split preview and apply into separate subcommands with the same flags.
 
+Shared flags work in either position, so `openclaw migrate --no-auth-credentials apply hermes --yes` and `openclaw migrate apply hermes --no-auth-credentials --yes` behave the same. A flag placed on the subcommand overrides the same flag placed before it. `--dry-run` is the exception: `openclaw migrate apply` rejects it instead of applying, because apply always changes state.
+
 <ParamField path="<provider>" type="string">
   Name of a registered migration provider, for example `hermes`. Run `openclaw migrate list` to see installed providers.
 </ParamField>
 <ParamField path="--dry-run" type="boolean">
-  Build the plan and exit without changing state.
+  Build the plan and exit without changing state. Not accepted by `openclaw migrate apply`; use `openclaw migrate plan <provider>` instead.
 </ParamField>
 <ParamField path="--from <path>" type="string">
   Override the source state directory. Hermes follows `$HERMES_HOME` and the active profile, then uses the platform default (`~/.hermes` or `%LOCALAPPDATA%\hermes`). Codex defaults to `~/.codex` (or `$CODEX_HOME`), Claude defaults to `~/.claude`.
@@ -218,7 +220,7 @@ The bundled Hermes provider follows `$HERMES_HOME` and the active profile, then 
 
 ### Supported `.env` keys
 
-`AI_GATEWAY_API_KEY`, `ALIBABA_API_KEY`, `ANTHROPIC_API_KEY`, `ARCEEAI_API_KEY`, `CEREBRAS_API_KEY`, `CHUTES_API_KEY`, `CLOUDFLARE_AI_GATEWAY_API_KEY`, `COPILOT_GITHUB_TOKEN`, `DASHSCOPE_API_KEY`, `DEEPINFRA_API_KEY`, `DEEPSEEK_API_KEY`, `FIREWORKS_API_KEY`, `GEMINI_API_KEY`, `GH_TOKEN`, `GITHUB_TOKEN`, `GLM_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `KILOCODE_API_KEY`, `KIMICODE_API_KEY`, `KIMI_API_KEY`, `KIMI_CODING_API_KEY`, `MINIMAX_API_KEY`, `MINIMAX_CODING_API_KEY`, `MISTRAL_API_KEY`, `MODELSTUDIO_API_KEY`, `MOONSHOT_API_KEY`, `NVIDIA_API_KEY`, `OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENCODE_GO_API_KEY`, `OPENCODE_ZEN_API_KEY`, `OPENROUTER_API_KEY`, `QIANFAN_API_KEY`, `QWEN_API_KEY`, `TOGETHER_API_KEY`, `VENICE_API_KEY`, `XAI_API_KEY`, `XIAOMI_API_KEY`, `ZAI_API_KEY`, `Z_AI_API_KEY`.
+`AI_GATEWAY_API_KEY`, `ALIBABA_API_KEY`, `ALIBABA_CODING_PLAN_API_KEY`, `ANTHROPIC_API_KEY`, `ARCEEAI_API_KEY`, `CEREBRAS_API_KEY`, `CHUTES_API_KEY`, `CLOUDFLARE_AI_GATEWAY_API_KEY`, `COPILOT_GITHUB_TOKEN`, `DASHSCOPE_API_KEY`, `DEEPINFRA_API_KEY`, `DEEPSEEK_API_KEY`, `FIREWORKS_API_KEY`, `GEMINI_API_KEY`, `GLM_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `KILOCODE_API_KEY`, `KIMICODE_API_KEY`, `KIMI_API_KEY`, `KIMI_CN_API_KEY`, `KIMI_CODING_API_KEY`, `MINIMAX_API_KEY`, `MINIMAX_CN_API_KEY`, `MINIMAX_CODING_API_KEY`, `MISTRAL_API_KEY`, `MODELSTUDIO_API_KEY`, `MOONSHOT_API_KEY`, `NVIDIA_API_KEY`, `OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENCODE_GO_API_KEY`, `OPENCODE_ZEN_API_KEY`, `OPENROUTER_API_KEY`, `QIANFAN_API_KEY`, `QWEN_API_KEY`, `TOGETHER_API_KEY`, `VENICE_API_KEY`, `XAI_API_KEY`, `XIAOMI_API_KEY`, `ZAI_API_KEY`, `Z_AI_API_KEY`.
 
 ### Archive-only state
 

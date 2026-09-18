@@ -4,12 +4,16 @@ import {
   freezeDiagnosticTraceContext,
   type DiagnosticTraceContext,
 } from "../../../infra/diagnostic-trace-context.js";
+import type { AdmittedRunContext } from "../../admitted-run-context.js";
+import { createAdmittedGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
 import { mergeForcedEmbeddedAttemptToolsAllow } from "./attempt-tool-construction-plan.js";
 import type { EmbeddedRunTrigger, RunEmbeddedAgentParams } from "./params.js";
+import type { EmbeddedRunAttemptParams } from "./types.js";
 
 type AttemptToolRunFacts = Pick<
   RunEmbeddedAgentParams,
   | "clientCaps"
+  | "gatewayUiCommandTarget"
   | "pinnedWidgetAuthoring"
   | "toolBindings"
   | "chatType"
@@ -45,6 +49,7 @@ type AttemptToolRunFacts = Pick<
  */
 export function buildEmbeddedAttemptToolRunContext(
   params: AttemptToolRunFacts & {
+    model?: Pick<EmbeddedRunAttemptParams["model"], "provider" | "id">;
     thinkLevel?: ThinkLevel;
     trigger?: EmbeddedRunTrigger;
     jobId?: string;
@@ -68,6 +73,7 @@ export function buildEmbeddedAttemptToolRunContext(
   });
   return {
     clientCaps: params.clientCaps,
+    gatewayUiCommandTarget: params.gatewayUiCommandTarget,
     pinnedWidgetAuthoring: params.pinnedWidgetAuthoring,
     toolBindings: params.toolBindings,
     chatType: params.chatType,
@@ -97,6 +103,10 @@ export function buildEmbeddedAttemptToolRunContext(
     sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
     taskSuggestionDeliveryMode: params.taskSuggestionDeliveryMode,
     requesterThinkingLevel: params.thinkLevel,
+    // modelId may still be a configured alias; children need the prepared identity.
+    requesterModel: params.model
+      ? { provider: params.model.provider, model: params.model.id }
+      : undefined,
     trigger: params.trigger,
     jobId: params.jobId,
     memoryFlushWritePath: params.memoryFlushWritePath,
@@ -114,4 +124,39 @@ export function buildEmbeddedAttemptToolRunContext(
     // rewrite the facts attached to tool calls already in flight.
     ...(params.trace ? { trace: freezeDiagnosticTraceContext(params.trace) } : {}),
   };
+}
+
+/** Project the original turn's source and current caller into its admitted Gateway tools. */
+export function createEmbeddedGatewayToolCallerIdentity(params: {
+  run: Pick<
+    RunEmbeddedAgentParams,
+    | "cronCreatorAuthorityCapability"
+    | "messageChannel"
+    | "messageProvider"
+    | "currentMessagingTarget"
+    | "currentChannelId"
+    | "agentAccountId"
+    | "currentThreadTs"
+  >;
+  admittedRunContext: AdmittedRunContext;
+  agentId: string;
+  sessionKey: string;
+}) {
+  const { run } = params;
+  return createAdmittedGatewayToolCallerIdentity({
+    admittedRunContext: params.admittedRunContext,
+    cronAuthorityCheck: run.cronCreatorAuthorityCapability?.isCurrent,
+    agentId: params.agentId,
+    sessionKey: params.sessionKey,
+    turnSourceChannel: run.messageChannel ?? run.messageProvider,
+    turnSourceLocal:
+      !run.messageChannel &&
+      !run.messageProvider &&
+      run.cronCreatorAuthorityCapability?.callerOrigin.kind === "local"
+        ? true
+        : undefined,
+    turnSourceTo: run.currentMessagingTarget ?? run.currentChannelId,
+    turnSourceAccountId: run.agentAccountId,
+    turnSourceThreadId: run.currentThreadTs,
+  });
 }

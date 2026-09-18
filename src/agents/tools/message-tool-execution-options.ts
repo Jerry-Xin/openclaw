@@ -19,6 +19,7 @@ export type MessageToolOptions = {
   config?: OpenClawConfig;
   preparedMessageToolCatalog?: PreparedMessageToolCatalog;
   getRuntimeConfig?: () => OpenClawConfig;
+  admitScheduledInvocation?: () => OpenClawConfig;
   getScopedChannelsCommandSecretTargets?: typeof getScopedChannelsCommandSecretTargets;
   resolveCommandSecretRefsViaGateway?: typeof resolveCommandSecretRefsViaGateway;
   runMessageAction?: typeof runMessageAction;
@@ -38,6 +39,7 @@ export type MessageToolOptions = {
   sandboxRoot?: string;
   sandboxContainerWorkdir?: string;
   sandboxFsBridge?: SandboxFsBridge;
+  sandboxReadOnlyResourceMounts?: readonly { hostPath: string; containerPath: string }[];
   sandboxWorkspaceMediaReadAllowed?: boolean;
   requireExplicitTarget?: boolean;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;

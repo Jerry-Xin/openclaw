@@ -1,6 +1,6 @@
 {
   "id": "zai",
-  "categories": ["models", "media"],
+  "categories": ["models"],
   "activation": {
     "onStartup": false
   },
@@ -9,7 +9,7 @@
   "providerEndpoints": [
     {
       "endpointClass": "zai-native",
-      "hosts": ["api.z.ai"]
+      "hosts": ["api.z.ai", "open.bigmodel.cn"]
     }
   ],
   "providerRequest": {

@@ -6,9 +6,11 @@ import {
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import type { SpawnResult } from "openclaw/plugin-sdk/process-runtime";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, vi } from "vitest";
 import * as managedBinary from "./crabbox-managed-binary.js";
+import { crabboxState } from "./crabbox-state.test-support.js";
 import {
   createNodeBootstrapFixture,
   createWorkerArchiveFixture,
@@ -39,6 +41,7 @@ afterEach(async () => {
   providers.clear();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  await closeOpenClawStateDatabaseAsync();
   resetPluginStateStoreForTests();
 });
 
@@ -82,12 +85,14 @@ export function createWarmProvider(
   > = {},
 ) {
   vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-  vi.spyOn(managedBinary, "ensureManagedCrabboxBinary").mockImplementation(
-    async (params) => params?.binary ?? "crabbox",
-  );
+  vi.spyOn(managedBinary, "ensureManagedCrabboxBinary").mockImplementation(async (params) => ({
+    binary: params?.binary ?? "crabbox",
+    version: "0.55.0",
+  }));
   const calls: CommandCall[] = [];
   const warn = vi.fn();
   const provider = createCrabboxWorkerProvider({
+    state: crabboxState,
     openclawRoot: path.resolve(path.sep, "workspace", "openclaw"),
     pathEnv: "",
     isExecutable: () => false,

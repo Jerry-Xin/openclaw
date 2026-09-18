@@ -1,9 +1,8 @@
 // Control UI view renders the Models settings page content.
 import { html, nothing, type TemplateResult } from "lit";
-import type { FastMode, GatewayAgentRow, ModelsProbeResult } from "../../api/types.ts";
+import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import type { FastMode, ModelAuthStatusResult, ModelsProbeResult } from "../../api/types.ts";
 import { titleForRoute } from "../../app-navigation.ts";
-import type { AgentSelectionCapability } from "../../app/agent-selection.ts";
-import { renderAgentScopeControl } from "../../components/agent-scope-control.ts";
 import { icons } from "../../components/icons.ts";
 import { renderProviderBrandIcon } from "../../components/provider-icon.ts";
 import { renderProviderUsageDetails } from "../../components/provider-usage.ts";
@@ -42,6 +41,8 @@ import { hasVerifiedProvider, renderProviderStatus } from "./view-status.ts";
 registerSettingsEnglish();
 
 type ModelProvidersViewProps = {
+  usageClient?: GatewayBrowserClient | null;
+  usageAgentId?: string;
   connected: boolean;
   loading: boolean;
   refreshing: boolean;
@@ -54,6 +55,8 @@ type ModelProvidersViewProps = {
   cards: ModelProviderCard[];
   configuredModels: ModelPickerEntry[];
   defaultModels: DefaultModelSelection;
+  authStatus?: ModelAuthStatusResult | null;
+  automaticUtilityModel?: string | null;
   thinkingLevel: string | undefined;
   thinkingOverridden: boolean;
   fastMode: FastMode | undefined;
@@ -68,6 +71,7 @@ type ModelProvidersViewProps = {
   canViewProfiles: boolean;
   canMutate: boolean;
   mutationBlockedReason: string | null;
+  defaultsMutationBlockedReason: string | null;
   /** Usage never converged before the retry budget ran out; cards lack usage. */
   providerUsageStalled: boolean;
   probeAvailable: boolean;
@@ -100,9 +104,11 @@ type ModelProvidersViewProps = {
   onThinkingReset: () => void;
   onFastModeChange: (mode: FastMode) => void;
   onFastModeReset: () => void;
-  onModelPickerOpen: () => void;
   onCatalogRetry: () => void;
   onOpenModelSetup: () => void;
+  onConnect: (card: ModelProviderCard) => void;
+  canConnect: (card: ModelProviderCard) => boolean;
+  loginBusy: boolean;
 };
 
 function configMutationDisabled(props: ModelProvidersViewProps): boolean {
@@ -153,7 +159,7 @@ function renderLocalCost(card: ModelProviderCard, costDays: number) {
       <div class="model-providers__local-cost-detail">
         ${t("modelProviders.localCostDetail", {
           tokens: formatCompactTokenCount(cost.totalTokens),
-          sessions: String(cost.sessionCount),
+          messages: String(cost.messageCount),
         })}
       </div>
     </div>
@@ -297,6 +303,18 @@ function renderProviderActions(card: ModelProviderCard, props: ModelProvidersVie
   return html`
     <div class="model-providers__card-actions">
       ${
+        props.canConnect(card) && card.profiles.length === 0
+          ? html`<button
+              class="btn btn--sm"
+              data-models-connect-provider=${card.id}
+              ?disabled=${mutationDisabled || props.loginBusy}
+              @click=${() => props.onConnect(card)}
+            >
+              ${t("modelProviders.login.action")}
+            </button>`
+          : nothing
+      }
+      ${
         isConfigured
           ? html`
               <button
@@ -320,16 +338,13 @@ function renderProviderActions(card: ModelProviderCard, props: ModelProvidersVie
                 title=${keyBlocked}
                 @click=${() => props.onOpenKeyEditor(card.id)}
               >
-                ${
-                  card.hasConfigApiKey
-                    ? t("modelProviders.apiKey.replace")
-                    : t("modelProviders.apiKey.set")
-                }
+                ${t("modelProviders.apiKey.set")}
               </button>
             `
       }
       ${
-        card.hasConfigApiKey
+        card.hasConfigApiKey ||
+        card.profiles.some((profile) => profile.type === "api_key" && profile.logoutSupported)
           ? html`
               <button
                 class="btn btn--sm danger"
@@ -372,11 +387,14 @@ function renderProviderRow(card: ModelProviderCard, props: ModelProvidersViewPro
       ${
         card.profiles.length > 0 && props.canViewProfiles
           ? renderProviderProfiles(card, {
+              usageClient: props.usageClient,
+              usageAgentId: props.usageAgentId,
               busy: props.busy,
               canMutate: props.canMutate && !props.configBusy,
               mutationBlockedReason: props.mutationBlockedReason,
               profileOrders: props.profileOrders,
-              onOpenModelSetup: props.onOpenModelSetup,
+              onAddAccount: props.canConnect(card) ? () => props.onConnect(card) : undefined,
+              addAccountDisabled: props.loginBusy || configMutationDisabled(props),
               onProfileOrderChange: props.onProfileOrderChange,
               onRequestLogout: props.onRequestLogout,
             })
@@ -525,37 +543,6 @@ export function renderModelProviders(props: ModelProvidersViewProps) {
       renderSettingsGroup(renderSettingsEmpty(t("modelProviders.disconnected"))),
     );
   }
-  if (props.loading) {
-    return renderSettingsPage(html`
-      <div id=${MODEL_SETTINGS_TARGET_IDS.behavior}>
-        ${renderDefaultModels({
-          models: props.configuredModels,
-          selection: props.defaultModels,
-          thinkingLevel: props.thinkingLevel,
-          thinkingOverridden: props.thinkingOverridden,
-          fastMode: props.fastMode,
-          fastModeOverridden: props.fastModeOverridden,
-          loading: true,
-          catalogDiscovering: props.catalogDiscovering,
-          catalogDiscoveryError: props.catalogDiscoveryError,
-          canMutate: !configMutationDisabled(props),
-          mutationBlockedReason: props.mutationBlockedReason,
-          busy: props.busy,
-          message: props.messages.defaults,
-          onPrimaryChange: props.onPrimaryChange,
-          onFallbackChange: props.onFallbackChange,
-          onUtilityChange: props.onUtilityChange,
-          onThinkingChange: props.onThinkingChange,
-          onThinkingReset: props.onThinkingReset,
-          onFastModeChange: props.onFastModeChange,
-          onFastModeReset: props.onFastModeReset,
-          onOpen: props.onModelPickerOpen,
-          onCatalogRetry: props.onCatalogRetry,
-        })}
-      </div>
-      ${renderSettingsGroup(renderSettingsLoadingSkeleton())}
-    `);
-  }
   const providerRows = html`
     <div class="model-providers__provider-list">
       ${props.error ? renderSettingsGroup(renderProviderNoticeRow(props.error)) : nothing}
@@ -577,21 +564,25 @@ export function renderModelProviders(props: ModelProvidersViewProps) {
       }
     </div>
   `;
-  const needsModelSetup = !props.configuredModels.some((model) => model.available !== false);
+  const needsModelSetup =
+    !props.loading && !props.configuredModels.some((model) => model.available !== false);
   return renderSettingsPage(html`
     ${needsModelSetup ? renderModelReadiness(props) : nothing}
     <div id=${MODEL_SETTINGS_TARGET_IDS.behavior}>
       ${renderDefaultModels({
         models: props.configuredModels,
         selection: props.defaultModels,
+        authStatus: props.authStatus,
+        automaticUtilityModel: props.automaticUtilityModel,
         thinkingLevel: props.thinkingLevel,
         thinkingOverridden: props.thinkingOverridden,
         fastMode: props.fastMode,
         fastModeOverridden: props.fastModeOverridden,
+        loading: props.loading,
         catalogDiscovering: props.catalogDiscovering,
         catalogDiscoveryError: props.catalogDiscoveryError,
-        canMutate: !configMutationDisabled(props),
-        mutationBlockedReason: props.mutationBlockedReason,
+        canMutate: props.defaultsMutationBlockedReason === null && !props.configBusy,
+        mutationBlockedReason: props.defaultsMutationBlockedReason,
         busy: props.busy,
         message: props.messages.defaults,
         onPrimaryChange: props.onPrimaryChange,
@@ -601,44 +592,47 @@ export function renderModelProviders(props: ModelProvidersViewProps) {
         onThinkingReset: props.onThinkingReset,
         onFastModeChange: props.onFastModeChange,
         onFastModeReset: props.onFastModeReset,
-        onOpen: props.onModelPickerOpen,
         onCatalogRetry: props.onCatalogRetry,
       })}
     </div>
-    ${renderSettingsSection(
-      {
-        title: t("modelProviders.title"),
-        count: props.cards.length,
-        actions: html`
-          ${
-            props.updatedAt
-              ? html`<span class="model-providers__updated"
-                  >${t("modelProviders.updated", {
-                    time: formatTimeMs(props.updatedAt, {
-                      hour: "numeric",
-                      minute: "2-digit",
-                    }),
-                  })}</span
-                >`
-              : nothing
-          }
-          <openclaw-tooltip
-            .content=${props.refreshing ? t("modelProviders.refreshing") : t("common.refresh")}
-          >
-            <button
-              type="button"
-              class="btn btn--icon btn--ghost btn--xs model-providers__refresh-button"
-              aria-label=${props.refreshing ? t("modelProviders.refreshing") : t("common.refresh")}
-              ?disabled=${props.refreshing}
-              @click=${() => props.onRefresh()}
-            >
-              ${icons.refresh}
-            </button>
-          </openclaw-tooltip>
-        `,
-      },
-      providerRows,
-    )}
+    ${
+      props.loading
+        ? renderSettingsGroup(renderSettingsLoadingSkeleton())
+        : renderSettingsSection(
+            {
+              title: t("modelProviders.title"),
+              count: props.cards.length,
+              actions: html`
+                ${
+                  props.updatedAt
+                    ? html`<span class="model-providers__updated"
+                        >${t("modelProviders.updated", {
+                          time: formatTimeMs(props.updatedAt, {
+                            hour: "numeric",
+                            minute: "2-digit",
+                          }),
+                        })}</span
+                      >`
+                    : nothing
+                }
+                <openclaw-tooltip
+                  .content=${props.refreshing ? t("modelProviders.refreshing") : t("common.refresh")}
+                >
+                  <button
+                    type="button"
+                    class="btn btn--icon btn--ghost btn--xs model-providers__refresh-button"
+                    aria-label=${props.refreshing ? t("modelProviders.refreshing") : t("common.refresh")}
+                    ?disabled=${props.refreshing}
+                    @click=${() => props.onRefresh()}
+                  >
+                    ${icons.refresh}
+                  </button>
+                </openclaw-tooltip>
+              `,
+            },
+            providerRows,
+          )
+    }
     ${props.quickAddSupported ? renderAddProvider(props) : nothing}
     ${
       props.providerUsageStalled
@@ -648,13 +642,14 @@ export function renderModelProviders(props: ModelProvidersViewProps) {
   `);
 }
 
-/** Page shell for the Models settings page: header, agent scope control, body. */
+/** Page shell for the Models settings page. */
 export function renderModelProvidersPageShell(props: {
-  agentSelection: AgentSelectionCapability;
-  agents: readonly GatewayAgentRow[];
   onOpenModelSetup: () => void;
-  selectedAgentId: string;
   body: TemplateResult;
+  onConnect: () => void;
+  connectDisabled: boolean;
+  login: TemplateResult;
+  loginMessage?: ModelProviderRowMessage;
 }): TemplateResult {
   return html`
     ${renderSettingsPageHeader({
@@ -662,17 +657,20 @@ export function renderModelProvidersPageShell(props: {
       subtitle: html`${t("modelProviders.subtitle")}
       ${renderLearnMoreLink("https://docs.openclaw.ai/concepts/model-providers")}`,
       actions: html`
-        ${renderAgentScopeControl({
-          agents: props.agents,
-          selection: props.agentSelection,
-          allowAll: false,
-          selectedId: props.selectedAgentId,
-        })}
-        <button class="btn" @click=${props.onOpenModelSetup}>
+        <button
+          class="btn"
+          data-models-connect
+          ?disabled=${props.connectDisabled}
+          @click=${props.onConnect}
+        >
+          ${t("modelProviders.login.action")}
+        </button>
+        <button class="btn btn--ghost" @click=${props.onOpenModelSetup}>
           ${icons.settings}<span>${t("modelProviders.configureModels")}</span>
         </button>
       `,
     })}
-    ${renderSettingsWorkspace(props.body)}
+    ${renderSettingsWorkspace(html`${renderMutationMessage(props.loginMessage)}${props.body}`)}
+    ${props.login}
   `;
 }

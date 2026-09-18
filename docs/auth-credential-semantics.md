@@ -47,9 +47,56 @@ Token credentials (`type: "token"`) support inline `token` and/or `tokenRef`.
 2. For eligible profiles, token material may be resolved from the inline value or `tokenRef`.
 3. Unresolvable refs produce `unresolved_ref` in `models status --probe` output.
 
+## Manual API keys
+
+Saving a manual API key in Models waits for the Gateway to apply any changed
+provider binding before refreshing model authentication. Replacing a key whose
+binding is unchanged needs only the authentication refresh. If the Gateway cannot
+confirm application, the key remains saved and the response includes a restart
+warning. This preserves the configured reload policy, including disabled reloads.
+Removing a key still rejects a binding or credential that changed concurrently.
+
+## Setup replacements
+
+Setup replacement credentials are saved under separate profile IDs with an
+internal `setup` descriptor in the existing credential payload. They cannot
+enter normal rotation, resolve through an explicit profile pin, or be copied to
+another agent. Only the owning setup operation can test the selected credential.
+After one successful tool-free turn, setup asks whether to activate it. Declining
+or failing the test keeps the saved credential inactive and preserves the current
+connection. Model Setup offers the same saved sign-in for a fresh test without
+another login. Gateway activation waits for config application; a required restart
+keeps the replacement inactive until setup is retried. Ordinary login remains
+immediate. The descriptor retains the selected model and connection settings for retry after
+restart, without caching a verification result. This adds no database schema or
+migration; older runtimes do not enforce the inactive state. Before downgrading,
+remove saved inactive replacements or restore the state from before setup.
+
+Noninteractive setup saves replacement credentials and prints a
+`openclaw models auth activate <profileId> --agent <id>` command to test and activate
+the saved sign-in. Model Setup offers the same operation. Interactive setup defaults
+to activation after a successful test. Reusing an existing credential
+and first-run noninteractive setup retain their existing behavior.
+
 ## Agent copy portability
 
 Agent auth inheritance is read-through. When an agent has no local profile, it resolves profiles from the shared auth store at runtime without copying secret material into its own credential store (`agents/<agentId>/agent/openclaw-agent.sqlite`). The shared store lives in `state/openclaw.sqlite` after `openclaw doctor --fix` performs the one-time relocation. Until then, doctor reports the legacy `agents/main/agent/openclaw-agent.sqlite` owner and leaves that agent undeletable.
+
+Auth usage and cooldown updates wait for write admission on their actual agent
+database owner, including the legacy shared store. Relocated shared-state auth
+uses its own coordinator. Queued updates retain their selected state root and
+shared owner, then read the current profile after admission. Runtime snapshots
+publish after the durable commit and before the next admitted writer; removing
+a profile while its health update waits does not recreate its health state.
+Cold agent opens validate integrity asynchronously and recheck ownership before
+writing.
+OAuth upserts recheck the current local or inherited credential after admission,
+before applying the existing generation-replacement rules.
+
+Gateway model metadata refreshes when credentials, profile ordering or ownership,
+or model availability changes, including cooldown and blocked-state transitions.
+Usage timestamps, success history, and failure counters remain recorded without
+invalidating chat metadata or broadcasting a change to connected clients.
 
 Explicit copy flows, such as `openclaw agents add`, use this portability policy:
 
@@ -148,10 +195,26 @@ they do not change message-execution profile rotation or session pins.
 
 ## External CLI credential discovery
 
-- Runtime-only credentials owned by external CLIs (Claude CLI for `claude-cli`, Codex CLI for `openai`, MiniMax CLI for `minimax-portal`) are discovered only when the provider, runtime, or auth profile is in scope for the current operation, or when a stored local profile for that external source already exists.
+- Supported external CLI credentials are discovered only when the provider, runtime, or auth profile is in scope for the current operation, or when a stored local profile for that external source already exists.
 - Auth-store callers choose an explicit external-CLI discovery mode: `none` for persisted/plugin auth only, `existing` for refreshing already stored external CLI profiles, or `scoped` for a concrete provider/profile set.
 - Read-only/status paths pass `allowKeychainPrompt: false`; they use file-backed external CLI credentials only and do not read or reuse macOS Keychain results.
 - `/models` reuses external login evidence already prepared with its catalog, so those providers remain visible without a second OpenClaw login. Opening the default menu does not repeat external CLI discovery; explicit auth order and route compatibility still apply.
+
+Codex owns its native login. Ordinary status and model reads do not import its
+credentials into OpenClaw profiles. To retain a configured CLI-backed
+`openai:default` profile, explicitly import the current Codex login with
+`openclaw models auth login --provider openai --method device-code`. When that
+OAuth profile is declared in `auth.profiles`, the source is the current native
+Codex home, and no other managed OpenAI OAuth profile exists, import preserves
+the profile ID and its existing model and session pins. The configured model
+and native credential file stay unchanged. An explicitly isolated agent home
+continues to use the imported OpenClaw profile through its isolated runtime.
+
+Fresh imports keep account-scoped profile IDs. A matching existing account and
+user reuse their stored profile. Import from another home, missing account/user
+identity, or an existing managed account does not claim the legacy pin. Use the
+reported imported profile explicitly in those cases. Source changes and
+conflicting profiles detected before persistence stop only the selected import.
 
 ## OAuth SecretRef Policy Guard
 

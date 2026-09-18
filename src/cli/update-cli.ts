@@ -51,6 +51,7 @@ type CommanderUpdateOptions = Record<string, unknown> & {
   dryRun?: boolean;
   json?: boolean;
   restart?: boolean;
+  reapplyLocalOverrides?: boolean;
   tag?: string;
   timeout?: string;
   yes?: boolean;
@@ -73,6 +74,11 @@ function createUpdateLeafAction(
 ) {
   return async (opts: Record<string, unknown>, command: Command) => {
     try {
+      if (inheritOptionFromParent<boolean>(command, "reapplyLocalOverrides")) {
+        throw new Error(
+          `--reapply-local-overrides is not supported for openclaw update ${command.name()}. Use it with openclaw update.`,
+        );
+      }
       if (!options.supportsDryRun && inheritOptionFromParent<boolean>(command, "dryRun")) {
         throw new Error(
           `--dry-run is not supported for \`openclaw update ${command.name()}\`. Run \`openclaw update --dry-run\` instead.`,
@@ -94,7 +100,7 @@ function registerUpdateFinalizationCommand(update: Command, name: string, hidden
     .option("--timeout <seconds>", "Override per-phase repair deadlines in seconds")
     .option("--yes", "Skip confirmation prompts (non-interactive)", false)
     .option("--accept-capabilities", "Accept widened plugin capabilities", false)
-    .option("--no-restart", "Accepted for update command parity; repair never restarts")
+    .option("--no-restart", "Skip update activation; Doctor may restore a service it stops")
     .addHelpText(
       "after",
       () =>
@@ -108,7 +114,7 @@ function registerUpdateFinalizationCommand(update: Command, name: string, hidden
           ["openclaw update repair --json", "JSON output for automation."],
         ])}\n\n${theme.heading("Notes:")}\n${theme.muted(
           "- Reconciles abandoned runs when the Gateway is healthy; otherwise repairs post-update state",
-        )}\n${theme.muted("- Runs doctor repair and plugin convergence, but never restarts the Gateway")}\n\n${theme.muted(
+        )}\n${theme.muted("- Runs Doctor repair and plugin convergence; repair restores only a service it stops")}\n\n${theme.muted(
           "Docs:",
         )} ${formatDocsLink("/cli/update", "docs.openclaw.ai/cli/update")}`,
     )
@@ -200,6 +206,7 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/update", "docs.openclaw.ai/cli/up
         await updateCommand({
           json: Boolean(opts.json),
           restart: Boolean(opts.restart),
+          reapplyLocalOverrides: Boolean(opts.reapplyLocalOverrides),
           dryRun: Boolean(opts.dryRun),
           channel: opts.channel,
           tag: opts.tag,

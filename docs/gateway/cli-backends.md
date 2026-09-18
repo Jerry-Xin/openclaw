@@ -220,7 +220,7 @@ Claude Code can drive a Chrome browser through the [Claude in Chrome extension](
 
 The backend maps OpenClaw `/think` levels to Claude Code's native `--effort` flag: `minimal`/`low` -> `low`, `medium` -> `medium`, and `high`/`xhigh`/`max` pass through directly. For models that allow fixed thinking budgets, it also launches Claude Code with `MAX_THINKING_TOKENS`: `off=0`, `minimal=1024`, `low=2048`, `medium=8192`, `high`/`xhigh=16384`, and `max=32768`. Positive fixed budgets disable adaptive thinking. Models that require adaptive thinking omit the fixed budget and continue to use `--effort`. `adaptive` removes configured effort flags and fixed-budget environment overrides, so Claude Code resolves effective thinking from its own environment, settings, and model defaults. Other CLI backends need their owning plugin to map the selected level before `/think` affects the spawned CLI.
 
-Before OpenClaw can use `claude-cli`, Claude Code itself must be logged in on the same host:
+For native login, sign in to Claude Code on the Gateway host:
 
 ```bash
 claude auth login
@@ -228,7 +228,20 @@ claude auth status --text
 openclaw models auth login --provider anthropic --method cli --set-default
 ```
 
-Docker installs need Claude Code installed and logged in inside the persisted container home, not only on the host. See [Claude CLI backend in Docker](/install/docker#claude-cli-backend-in-docker).
+Normal agent turns can also use a saved subscription token without a native login:
+
+```bash
+openclaw models auth paste-token --provider anthropic
+```
+
+New sessions select saved subscription credentials through the configured account
+order and forward them to the CLI through a protected file descriptor. Existing
+sessions keep their account until you select another or remove its saved profile.
+Explicit account selections and empty account orders remain authoritative. API keys saved
+for the `anthropic` provider require an explicit selection; they do not replace
+native subscription login automatically.
+
+Docker installs need Claude Code and the chosen credentials inside the persisted container home, not only on the host. See [Claude CLI backend in Docker](/install/docker#claude-cli-backend-in-docker).
 
 The gateway service must resolve `claude` on `PATH`. For a nonstandard path,
 register a small wrapper backend plugin.
@@ -245,6 +258,13 @@ register a small wrapper backend plugin.
 - Stored CLI sessions are provider-owned continuity. Automatic reset is disabled by default. `/reset` and explicit daily or idle `session.reset` policies still cut them.
 - Fresh CLI sessions can recover OpenClaw history from the canonical session SQLite database when its independent account boundary matches the selected credential. Compacted recovery includes the latest summary, retained messages, and subsequent turns on the active branch. A backend can opt in to bounded recovery before compaction with `reseedFromRawTranscriptWhenUncompacted: true`, including after its native session binding is cleared. Recovery includes saved tool-result text and error markers. It does not execute past tools. The current user turn is sent once, outside the recovered history.
 - Helper runs with a caller-owned in-memory transcript use that history for hooks, bounded session notes, and fresh-session reseeding, including meaningful history before compaction. Empty memory stays empty even when the run carries another session's storage identity. Context-engine maintenance rewrites that same memory before the helper returns, even when the engine requests background maintenance. Durable transcripts retain their background maintenance path. An explicitly owned native CLI binding can still resume. Resumed turns send the current prompt and bounded session notes without replaying the conversation history.
+
+When prompt content changes, a compatible CLI session can resume with an OpenClaw
+context note before the current user prompt. Chat history first matches imported
+Claude user turns against the full local text, including any literal quote of the
+note. If that does not match, it ignores one exact context note for comparison, so
+the same turn appears once. Stored transcript text and unmatched imported turns
+remain intact.
 
 ### History account boundaries
 
@@ -409,6 +429,18 @@ When bundle MCP is enabled, OpenClaw:
 - binds tool access to the Gateway-selected session, account, and channel context instead of trusting child-process headers
 - loads enabled bundle-MCP servers for the current workspace and merges them with any existing backend MCP config or settings shape
 - rewrites the launch config using the backend-owned integration mode from the owning plugin.
+
+With the Gateway's MCP bridge, channel-origin CLI turns can use the `message`
+tool for permitted reads and same-conversation actions, including reactions. The
+bridge retains the admitted sender, account, and conversation; channel access and
+write permissions still apply. That authority ends with the turn or its
+cancellation, including when a warm CLI process is reused for a later turn.
+
+Automations created through the bridge inherit its final permitted tool set and
+supported native tool capabilities. When Claude's native `Bash` supplies `exec`,
+the saved automation retains its Gateway host target, including with an explicit
+`toolsAllow: ["exec"]` cap. Current account, tool, sandbox, and approval restrictions
+still apply; capturing the target does not grant broader execution permission.
 
 The node-only `exec` tool is offered only when policy permits it and a connected
 node advertises `system.run`. Offline paired devices and approval-only phones do

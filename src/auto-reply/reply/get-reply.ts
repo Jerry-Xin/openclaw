@@ -14,9 +14,11 @@ import {
 import { resolveConversationCapabilityProfile } from "../../agents/conversation-capability-profile.js";
 import { projectConversationToolNames } from "../../agents/conversation-tool-policy-pipeline.js";
 import type { ModelCatalogSnapshot } from "../../agents/model-catalog.types.js";
+import { splitTrailingAuthProfile } from "../../agents/model-ref-profile.js";
 import { resolveModelRefFromString } from "../../agents/model-selection.js";
 import { publishedModelCatalogOwnerMatchesAgent } from "../../agents/prepared-model-catalog-owner.js";
 import { resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
+import { resolveIngressWorkspaceOverrideForSessionRun } from "../../agents/spawned-context.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { resolveEffectiveToolFsRootExpansionAllowed } from "../../agents/tool-fs-policy.js";
 import {
@@ -45,6 +47,7 @@ import {
 import { ensureSessionDiffBaseline } from "../../sessions/session-diff-baseline.js";
 import { resolveStoredModelOverride } from "../../sessions/stored-model-overrides.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
+import { readAgentDatabaseAdmissionRefusal } from "../../state/agent-database-admission.js";
 import {
   sessionDeliveryChannel,
   sessionDeliveryOrigin,
@@ -70,7 +73,7 @@ import {
 import { handleInlineActions } from "./get-reply-inline-actions.js";
 import { maybeResolveNativeSlashCommandFastReply } from "./get-reply-native-slash-fast-path.js";
 import { runPreparedReply } from "./get-reply-run.js";
-import type { InternalGetReplyOptions as BaseInternalGetReplyOptions } from "./get-reply.types.js";
+import type { InternalGetReplyOptions } from "./get-reply.types.js";
 import { finalizeInboundContext } from "./inbound-context.js";
 import {
   hasInboundAudio,
@@ -102,10 +105,6 @@ import { isStaleHeartbeatAutoFallbackOverride } from "./stored-model-override.js
 import { createTypingController } from "./typing.js";
 
 type ResetCommandAction = "new" | "reset";
-
-type RuntimeInternalGetReplyOptions = BaseInternalGetReplyOptions & {
-  extractedFileImages?: ExtractedFileImage[];
-};
 
 function classifyHeartbeatPendingFinalDelivery(text: string, ackMaxChars: number) {
   const stripped = stripHeartbeatToken(text, {
@@ -260,9 +259,9 @@ function collectStagedAttachmentPaths(ctx: MsgContext): ReadonlyMap<number, stri
 }
 
 function withExtractedFileImages(
-  opts: RuntimeInternalGetReplyOptions | undefined,
+  opts: InternalGetReplyOptions | undefined,
   extractedFileImages: ExtractedFileImage[] | undefined,
-): RuntimeInternalGetReplyOptions | undefined {
+): InternalGetReplyOptions | undefined {
   if (!extractedFileImages || extractedFileImages.length === 0) {
     return opts;
   }
@@ -351,6 +350,10 @@ export async function getReplyFromConfig(
       }),
     };
   });
+  const refusal = readAgentDatabaseAdmissionRefusal(initialAgentScope.agentId);
+  if (refusal) {
+    return { text: `${refusal.reason}\n${refusal.repairHint}`, isError: true };
+  }
   const agentSessionKey = initialAgentScope.agentSessionKey;
   const agentId = initialAgentScope.agentId;
   if (
@@ -401,9 +404,7 @@ export async function getReplyFromConfig(
   );
   const optsWithSkillFilter =
     mergedSkillFilter !== undefined ? { ...opts, skillFilter: mergedSkillFilter } : opts;
-  const internalOptsWithSkillFilter = optsWithSkillFilter as
-    | RuntimeInternalGetReplyOptions
-    | undefined;
+  const internalOptsWithSkillFilter = optsWithSkillFilter as InternalGetReplyOptions | undefined;
   let extractedFileImages: ExtractedFileImage[] | undefined;
   let enableLocalPathSelfServe: ApplyMediaUnderstandingResult["enableLocalPathSelfServe"];
   const agentCfg = cfg.agents?.defaults;
@@ -423,6 +424,7 @@ export async function getReplyFromConfig(
   let provider = defaultProvider;
   let model = defaultModel;
   let hasResolvedHeartbeatModelOverride = false;
+  let heartbeatAuthProfile: { provider: string; model: string; profileId: string } | undefined;
   if (opts?.isHeartbeat) {
     // Prefer the resolved per-agent heartbeat model passed from the heartbeat runner,
     // fall back to the global defaults heartbeat model for backward compatibility.
@@ -443,6 +445,8 @@ export async function getReplyFromConfig(
       provider = heartbeatRef.ref.provider;
       model = heartbeatRef.ref.model;
       hasResolvedHeartbeatModelOverride = true;
+      const profileId = splitTrailingAuthProfile(heartbeatRaw).profile;
+      heartbeatAuthProfile = profileId ? { ...heartbeatRef.ref, profileId } : undefined;
     }
   }
 
@@ -731,13 +735,13 @@ export async function getReplyFromConfig(
     provider = defaultProvider;
     model = defaultModel;
     hasResolvedHeartbeatModelOverride = false;
+    heartbeatAuthProfile = undefined;
   }
   // Utility-model narration is turn-local decoration. Initialize the durable
   // session first, then keep it completely outside model-locked native runs.
   const admittedSessionSettings =
     // SAFETY: Gateway dispatch owns this internal extension and forwards the same options object here.
-    (optsWithCommandQueueOverride as RuntimeInternalGetReplyOptions | undefined)
-      ?.admittedSessionSettings;
+    (optsWithCommandQueueOverride as InternalGetReplyOptions | undefined)?.admittedSessionSettings;
   const turnToolOverrides = admittedSessionSettings
     ? admittedSessionSettings.toolOverrides
     : sessionEntry.toolOverrides;
@@ -751,7 +755,7 @@ export async function getReplyFromConfig(
     opts: optsWithSessionSkillOverrides,
     disabled: sessionModelSelectionLocked,
   });
-  const internalResolvedOpts = resolvedOpts as RuntimeInternalGetReplyOptions | undefined;
+  const internalResolvedOpts = resolvedOpts as InternalGetReplyOptions | undefined;
   let { abortedLastRun } = sessionState;
   resolverTimingSessionKey = sessionKey ?? resolverTimingSessionKey;
   internalResolvedOpts?.onSessionPrepared?.({
@@ -1196,6 +1200,12 @@ export async function getReplyFromConfig(
     hasInboundMedia(ctx)
   ) {
     const { stageSandboxMedia } = await stageSandboxMediaRuntimeLoader.load();
+    const stagingWorkspaceDir =
+      resolveIngressWorkspaceOverrideForSessionRun({
+        spawnedBy: sessionEntry.spawnedBy,
+        workspaceDir: sessionEntry.spawnedWorkspaceDir,
+        cwd: sessionEntry.spawnedCwd,
+      }) ?? workspaceDir;
     const stageResult = await traceGetReplyPhase("reply.stage_media", () =>
       stageSandboxMedia({
         ctx,
@@ -1203,7 +1213,7 @@ export async function getReplyFromConfig(
         cfg,
         agentId,
         sessionKey,
-        workspaceDir,
+        workspaceDir: stagingWorkspaceDir,
         abortSignal: internalOptsWithSkillFilter?.abortSignal,
       }),
     );
@@ -1267,6 +1277,11 @@ export async function getReplyFromConfig(
       modelState: runModelState,
       provider: runProvider,
       model: runModel,
+      ...(hasResolvedHeartbeatModelOverride &&
+      heartbeatAuthProfile?.provider === runProvider &&
+      heartbeatAuthProfile.model === runModel
+        ? { configuredProfileId: heartbeatAuthProfile.profileId }
+        : {}),
       requestedRouteResolution: runAutoFallbackPrimaryProbe
         ? runModelState.requestedRouteResolution
         : requestedRouteResolution,

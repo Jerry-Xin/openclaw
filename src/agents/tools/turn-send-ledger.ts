@@ -30,6 +30,7 @@ import { normalizeAccountId } from "../../routing/account-id.js";
 import { normalizeMessageChannel } from "../../utils/message-channel-normalize.js";
 
 type TurnSendSlot = {
+  createdAt: number;
   // Monotonic identity of this exact slot instance. Every reserve that opens a slot for a
   // (session, run) pair stamps the next generation; the terminal clear deletes the slot,
   // so a later turn reusing the same logical key (an isolated cron reuses its durable
@@ -41,12 +42,16 @@ type TurnSendSlot = {
   // Sends that have landed this turn, per target. Admission compares committed +
   // pending against the cap; peek and the nudge read this committed count.
   committed: Map<string, number>;
+  // Successful sends that consume the text hard cap. Media remains visible to the
+  // general committed count used by the soft nudge, but never enters this map.
+  capCommitted: Map<string, number>;
   // In-flight reservations per target: a send that has been admitted but whose
   // delivery has not settled yet. Held separately from committed so a concurrent
   // same-target send counts toward the cap during the in-flight window (blocking
   // toward it, never past it) and so a rolled-back reservation leaves committed
   // untouched.
   pending: Map<string, number>;
+  capPending: Map<string, number>;
   // Operation identities already committed this turn. conversations_send derives a
   // stable operationId per (toolCallId, conversationRef); the Gateway resolves a
   // repeated one to the completed operation and returns "sent" without
@@ -155,9 +160,12 @@ function openSlotForReservation(sessionKey: string, runId: string): TurnSendSlot
     return existing;
   }
   return {
+    createdAt: Date.now(),
     generation: nextSlotGeneration++,
     committed: new Map<string, number>(),
+    capCommitted: new Map<string, number>(),
     pending: new Map<string, number>(),
+    capPending: new Map<string, number>(),
     seenOperations: new Set<string>(),
   };
 }
@@ -177,6 +185,7 @@ type ReservationState = "reserved" | "committed" | "released";
 export type TurnSendReservation = {
   readonly key: TurnSendKey;
   readonly operationId: string | undefined;
+  readonly chargeCap: boolean;
   readonly generation: number;
   state: ReservationState;
 };
@@ -210,27 +219,33 @@ export type TurnSendReserveResult =
  */
 export function reserveTurnSend(
   key: TurnSendKey,
-  options: { maxPerTurn?: number; operationId?: string },
+  options: { maxPerTurn?: number; operationId?: string; chargeCap?: boolean },
 ): TurnSendReserveResult {
   const storeKey = ledgerKey(key.sessionKey, key.runId);
   const slot = openSlotForReservation(key.sessionKey, key.runId);
   if (options.operationId !== undefined && slot.seenOperations.has(options.operationId)) {
     return { status: "replay" };
   }
-  const committed = slot.committed.get(key.targetKey) ?? 0;
-  const pending = slot.pending.get(key.targetKey) ?? 0;
+  const chargeCap = options.chargeCap !== false;
+  const committed = slot.capCommitted.get(key.targetKey) ?? 0;
+  const pending = slot.capPending.get(key.targetKey) ?? 0;
+  const generalPending = slot.pending.get(key.targetKey) ?? 0;
   // committed + pending, never committed alone: an in-flight reservation must count
   // toward the cap or two racing sends both admit before either commits.
   if (options.maxPerTurn !== undefined && committed + pending >= options.maxPerTurn) {
     return { status: "exhausted" };
   }
-  slot.pending.set(key.targetKey, pending + 1);
+  slot.pending.set(key.targetKey, generalPending + 1);
+  if (chargeCap) {
+    slot.capPending.set(key.targetKey, pending + 1);
+  }
   storeSlot(storeKey, slot);
   return {
     status: "reserved",
     reservation: {
       key,
       operationId: options.operationId,
+      chargeCap,
       generation: slot.generation,
       state: "reserved",
     },
@@ -261,6 +276,10 @@ export function commitTurnSend(reservation: TurnSendReservation): number {
   }
   reservation.state = "committed";
   releasePending(slot, targetKey);
+  if (reservation.chargeCap) {
+    releasePendingMap(slot.capPending, targetKey);
+    slot.capCommitted.set(targetKey, (slot.capCommitted.get(targetKey) ?? 0) + 1);
+  }
   const committed = (slot.committed.get(targetKey) ?? 0) + 1;
   slot.committed.set(targetKey, committed);
   if (reservation.operationId !== undefined) {
@@ -291,17 +310,24 @@ export function releaseTurnSend(reservation: TurnSendReservation): void {
   }
   reservation.state = "released";
   releasePending(slot, targetKey);
+  if (reservation.chargeCap) {
+    releasePendingMap(slot.capPending, targetKey);
+  }
 }
 
 // Decrement one pending reservation for `targetKey`, dropping the map entry at zero so
 // the pending map only holds targets with live in-flight sends. Clamped at zero: a
 // reservation must never drive the count negative.
 function releasePending(slot: TurnSendSlot, targetKey: string): void {
-  const pending = slot.pending.get(targetKey) ?? 0;
+  releasePendingMap(slot.pending, targetKey);
+}
+
+function releasePendingMap(pendingByTarget: Map<string, number>, targetKey: string): void {
+  const pending = pendingByTarget.get(targetKey) ?? 0;
   if (pending > 1) {
-    slot.pending.set(targetKey, pending - 1);
+    pendingByTarget.set(targetKey, pending - 1);
   } else {
-    slot.pending.delete(targetKey);
+    pendingByTarget.delete(targetKey);
   }
 }
 
@@ -332,6 +358,28 @@ export type TurnSendLedgerScope = {
   runId: string;
   agentId?: string;
 };
+
+export type TurnSendLedgerDiagnostic = {
+  sessionKey: string;
+  runId: string;
+  ageMs: number;
+  committed: number;
+  pending: number;
+};
+
+/** Read-only leak diagnostics. Inspection never expires or evicts a live scope. */
+export function inspectTurnSendLedger(now = Date.now()): TurnSendLedgerDiagnostic[] {
+  return [...turnSendBySession].map(([key, slot]) => {
+    const separator = key.lastIndexOf("\0");
+    return {
+      sessionKey: key.slice(0, separator),
+      runId: key.slice(separator + 1),
+      ageMs: Math.max(0, now - slot.createdAt),
+      committed: [...slot.committed.values()].reduce((total, count) => total + count, 0),
+      pending: [...slot.pending.values()].reduce((total, count) => total + count, 0),
+    };
+  });
+}
 
 /**
  * Deletes the exact (session, run) slot at a logical run's terminal boundary, freeing

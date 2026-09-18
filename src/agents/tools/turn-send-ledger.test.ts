@@ -4,6 +4,7 @@ import {
   buildTurnSendTargetKey,
   clearTurnSendLedgerForRun,
   commitTurnSend,
+  inspectTurnSendLedger,
   peekTurnSendCount,
   releaseTurnSend,
   reserveTurnSend,
@@ -52,7 +53,7 @@ function expectReserved(result: TurnSendReserveResult): TurnSendReservation {
 // reserve, then immediately commit as if delivery landed. Returns the committed count.
 function commitOne(
   key: LedgerKey,
-  options: { maxPerTurn?: number; operationId?: string } = {},
+  options: { maxPerTurn?: number; operationId?: string; chargeCap?: boolean } = {},
 ): number {
   const reservation = expectReserved(reserveTurnSend(key, options));
   return commitTurnSend(reservation);
@@ -69,6 +70,15 @@ describe("turn-send-ledger", () => {
     expect(commitOne(base)).toBe(1);
     expect(commitOne(base)).toBe(2);
     expect(commitOne(base)).toBe(3);
+  });
+
+  it("reports unclosed scopes without evicting their counts", () => {
+    const key = { sessionKey: "s1", runId: "run-leaked", targetKey: "tg:a" };
+    expect(commitOne(key)).toBe(1);
+    expect(inspectTurnSendLedger(Date.now() + OLD_TTL_MS * 2)).toEqual([
+      expect.objectContaining({ runId: "run-leaked", committed: 1, pending: 0 }),
+    ]);
+    expect(peekTurnSendCount(key)).toBe(1);
   });
 
   it("keeps separate committed counts per target inside the same turn", () => {
@@ -265,6 +275,27 @@ describe("turn-send-ledger reservations", () => {
     expect(second.status).toBe("reserved");
     expect(commitTurnSend(expectReserved(second))).toBe(2);
     expect(peekTurnSendCount(key)).toBe(2);
+  });
+
+  it("keeps media in the nudge count without consuming later text capacity", () => {
+    expect(commitOne(key, { maxPerTurn: 1, operationId: "media", chargeCap: false })).toBe(1);
+    const text = reserveTurnSend(key, { maxPerTurn: 1, operationId: "text" });
+    expect(text.status).toBe("reserved");
+    expect(commitTurnSend(expectReserved(text))).toBe(2);
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "text-2" }).status).toBe("exhausted");
+  });
+
+  it("admits concurrent media while a text reservation occupies the text cap", () => {
+    const text = expectReserved(reserveTurnSend(key, { maxPerTurn: 1, operationId: "text" }));
+    const media = reserveTurnSend(key, {
+      maxPerTurn: undefined,
+      operationId: "media",
+      chargeCap: false,
+    });
+    expect(media.status).toBe("reserved");
+    expect(reserveTurnSend(key, { maxPerTurn: 1, operationId: "text-2" }).status).toBe("exhausted");
+    expect(commitTurnSend(expectReserved(media))).toBe(1);
+    expect(commitTurnSend(text)).toBe(2);
   });
 });
 

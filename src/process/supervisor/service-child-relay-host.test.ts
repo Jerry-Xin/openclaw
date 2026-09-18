@@ -1,8 +1,9 @@
 import { performance } from "node:perf_hooks";
-import { Duplex } from "node:stream";
+import { Duplex, PassThrough } from "node:stream";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mockProcessPlatform } from "../../test-utils/vitest-spies.js";
+import { closeOwnedStdioProcess } from "../owned-stdio.js";
 import * as childAdapter from "./adapters/child.js";
 import { createStubChild, firstMockArg } from "./adapters/child.test-support.js";
 import { GRACEFUL_CANCEL_TIMEOUT_MS } from "./cancellation-policy.js";
@@ -11,8 +12,18 @@ import {
   type ServiceChildAnchorPayload,
   type ServiceChildControlMessage,
 } from "./service-child-protocol.js";
-import { createServiceChildRelayAdapter } from "./service-child-relay-host.js";
+import { createServiceChildRelayAdapter as startServiceChildRelayAdapter } from "./service-child-relay-host.js";
 import { createProcessSupervisor } from "./supervisor.js";
+
+// Direct factory assertions concern completed readiness; caller regressions
+// below consume the production split startup directly.
+async function createServiceChildRelayAdapter(
+  params: Parameters<typeof startServiceChildRelayAdapter>[0],
+) {
+  const { adapter, ready } = await startServiceChildRelayAdapter(params);
+  await ready;
+  return adapter;
+}
 
 const mocks = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock("node:child_process", async (importOriginal) => ({
@@ -37,7 +48,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function createRelay(platform: "linux" | "darwin" | "win32") {
+async function createRelay(platform: "linux" | "darwin" | "win32", retainLineage = false) {
   platformMock = mockProcessPlatform(platform);
   const groupProbe = vi.spyOn(process, "kill").mockImplementation(() => {
     throw Object.assign(new Error("synthetic missing process group"), { code: "ESRCH" });
@@ -60,8 +71,9 @@ async function createRelay(platform: "linux" | "darwin" | "win32") {
       }
     },
   });
+  const lineage = new PassThrough();
   Object.defineProperty(stub.child, "stdio", {
-    value: [stub.child.stdin, stub.child.stdout, stub.child.stderr, control],
+    value: [stub.child.stdin, stub.child.stdout, stub.child.stderr, control, lineage],
     configurable: true,
   });
   if (platform === "win32") {
@@ -120,6 +132,9 @@ async function createRelay(platform: "linux" | "darwin" | "win32") {
   };
   const closeControl = () => control.destroy();
   const exitRelay = () => {
+    if (!retainLineage) {
+      lineage.end();
+    }
     stub.disconnectMock();
     stub.emitExit(0);
   };
@@ -132,12 +147,27 @@ async function createRelay(platform: "linux" | "darwin" | "win32") {
   };
   const controlEncoding = () => control.readableEncoding;
   const killSpy = vi.spyOn(stub.child, "kill");
-  cleanups.push(close);
+  cleanups.push(() => {
+    close();
+    lineage.destroy();
+  });
   return {
     adapter,
     start,
     cancellations,
     acknowledgements,
+    acknowledgeRetirement: () => {
+      const request = stub.sendMock.mock.calls.at(-1)?.[0];
+      if (!isRecord(request) || request.type !== "cancel") {
+        throw new Error("Expected the relay retirement request");
+      }
+      stub.child.emit("message", {
+        type: "retirement",
+        generation,
+        sequence: request.sequence,
+        anchorExited: true,
+      });
+    },
     emit,
     completeRoot,
     endOutput,
@@ -148,6 +178,9 @@ async function createRelay(platform: "linux" | "darwin" | "win32") {
     controlEncoding,
     killSpy,
     groupProbe,
+    lineage,
+    stdout: stub.child.stdout,
+    stderr: stub.child.stderr,
   };
 }
 
@@ -160,13 +193,69 @@ function createWritableRelayChild() {
       callback();
     },
   });
+  const lineage = new PassThrough();
   Object.defineProperty(stub.child, "stdio", {
-    value: [stub.child.stdin, stub.child.stdout, stub.child.stderr, control],
+    value: [stub.child.stdin, stub.child.stdout, stub.child.stderr, control, lineage],
     configurable: true,
   });
   mocks.spawn.mockReturnValue(stub.child);
-  return { ...stub, control };
+  return { ...stub, control, lineage };
 }
+
+it.each(["before", "after"] as const)(
+  "checks launch policy %s relay start dispatch",
+  async (timing) => {
+    platformMock = mockProcessPlatform("linux");
+    const stub = createWritableRelayChild();
+    let allowed = true;
+    mocks.spawn.mockImplementation(() => {
+      if (timing === "before") {
+        allowed = false;
+      }
+      return stub.child;
+    });
+    const starting = createServiceChildRelayAdapter({
+      command: "synthetic-command",
+      args: [],
+      stdinMode: "pipe-closed",
+      oomScoreWrapperSelected: false,
+      beforeSpawn: () => {
+        if (!allowed) {
+          throw new Error("relay launch policy revoked");
+        }
+      },
+    });
+    try {
+      if (timing === "before") {
+        await expect(starting).rejects.toThrow("relay launch policy revoked");
+        expect(stub.sendMock.mock.calls.length).toBe(0);
+      } else {
+        const start = firstMockArg(stub.sendMock, "service start");
+        if (!isRecord(start) || typeof start.generation !== "string") {
+          throw new Error("Expected an admitted service generation");
+        }
+        const generation = start.generation;
+        allowed = false;
+        const emit = (payload: ServiceChildAnchorPayload, sequence: number) => {
+          stub.control.push(
+            Buffer.from(encodeServiceChildMessage({ ...payload, generation, sequence })),
+          );
+        };
+        emit({ type: "ready", commandPid: 1234, anchorPid: 1235 }, 1);
+        const adapter = await starting;
+        emit({ type: "root-result", code: 0, signal: null }, 2);
+        stub.child.stdout?.emit("end");
+        stub.child.stderr?.emit("end");
+        expect((await adapter.wait()).code).toBe(0);
+        expect(stub.killMock.mock.calls.length).toBe(0);
+      }
+    } finally {
+      stub.control.destroy();
+      stub.disconnectMock();
+      stub.emitExit(0);
+    }
+  },
+);
 
 it.each([
   { name: "construction aborts before ready", deferredStart: false },
@@ -251,7 +340,10 @@ it.each(["linux", "win32"] as const)(
 
 it("refreshes the supervisor deadline from text-only Windows Job output", async () => {
   const { adapter, emit, completeRoot, close } = await createRelay("win32");
-  vi.spyOn(childAdapter, "createChildAdapter").mockResolvedValue(adapter);
+  vi.spyOn(childAdapter, "createChildAdapter").mockResolvedValue({
+    adapter,
+    ready: Promise.resolve(),
+  });
   const nowSpy = vi.spyOn(performance, "now").mockReturnValue(10_000);
   const supervisor = createProcessSupervisor();
   const run = await supervisor.spawn({
@@ -471,6 +563,48 @@ it("drains output after losing cleanup authority without erasing the observed ro
   await expect(root).resolves.toEqual({ code: 23, signal: null });
 });
 
+it("keeps extinction pending after group retirement until lineage EOF", async () => {
+  const { adapter, completeRoot, emit, close, lineage } = await createRelay("linux", true);
+  completeRoot();
+  await adapter.wait();
+  emit({ type: "closing", reason: "cancel" });
+  await nextTurn();
+  const settled = vi.fn();
+  void adapter.waitForExtinction().then(settled, settled);
+  close();
+  await nextTurn();
+  expect(settled).not.toHaveBeenCalled();
+  lineage.end();
+  await expect(adapter.waitForExtinction()).resolves.toBeUndefined();
+});
+
+it.each(["error", "close", "timeout"])(
+  "rejects extinction when the outside-group lineage reader ends with %s",
+  async (failure) => {
+    const { adapter, completeRoot, emit, close, lineage } = await createRelay("linux", true);
+    completeRoot();
+    await adapter.wait();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      emit({ type: "closing", reason: "cancel" });
+      await nextTurn();
+      const rejected = expect(adapter.waitForExtinction()).rejects.toThrow(
+        failure === "timeout" ? "hard deadline" : "cleanup identity lost",
+      );
+      close();
+      await nextTurn();
+      if (failure === "timeout") {
+        await vi.advanceTimersByTimeAsync(GRACEFUL_CANCEL_TIMEOUT_MS);
+      } else {
+        lineage.destroy(failure === "error" ? new Error("synthetic lineage failure") : undefined);
+      }
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
 it("waits for relay reaping before observing POSIX group extinction", async () => {
   const { adapter, completeRoot, emit, closeControl, exitRelay, groupProbe } =
     await createRelay("darwin");
@@ -499,12 +633,14 @@ it("waits for relay reaping before observing POSIX group extinction", async () =
 });
 
 it("does not renew the group disappearance deadline after joining the relay", async () => {
-  const { adapter, completeRoot, emit, closeControl, exitRelay, groupProbe } =
+  const { adapter, completeRoot, emit, closeControl, exitRelay, groupProbe, lineage } =
     await createRelay("darwin");
-  const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+  const now = vi.spyOn(performance, "now").mockReturnValue(10_000);
   groupProbe.mockReturnValue(true);
   completeRoot();
   await adapter.wait();
+  lineage.end();
+  await nextTurn();
   emit({ type: "closing", reason: "lineage-closed" });
   await nextTurn();
   const settled = vi.fn();
@@ -519,7 +655,7 @@ it("does not renew the group disappearance deadline after joining the relay", as
 
   expect(settled).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({
-      message: expect.stringContaining("owned process group remained after its anchor closed"),
+      message: expect.stringContaining("hard deadline"),
     }),
   );
   expect(groupProbe).toHaveBeenCalledExactlyOnceWith(-1235, 0);
@@ -529,13 +665,11 @@ it("bounds relay reaping by the original graceful cleanup deadline", async () =>
   const { adapter, completeRoot, emit, closeControl, groupProbe } = await createRelay("darwin");
   completeRoot();
   await adapter.wait();
-  emit({ type: "closing", reason: "lineage-closed" });
-  await nextTurn();
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   try {
-    const rejected = expect(adapter.waitForExtinction()).rejects.toThrow(
-      "service child relay did not exit before cleanup deadline",
-    );
+    emit({ type: "closing", reason: "lineage-closed" });
+    await nextTurn();
+    const rejected = expect(adapter.waitForExtinction()).rejects.toThrow("hard deadline");
     closeControl();
     await nextTurn();
     await vi.advanceTimersByTimeAsync(GRACEFUL_CANCEL_TIMEOUT_MS);
@@ -549,7 +683,7 @@ it("bounds relay reaping by the original graceful cleanup deadline", async () =>
 it.each(["EPERM", "EIO", "still present"])(
   "keeps graceful cleanup uncertain when the kernel group is %s",
   async (failure) => {
-    const { adapter, completeRoot, emit, close, groupProbe } = await createRelay("linux");
+    const { adapter, completeRoot, emit, close, groupProbe, lineage } = await createRelay("linux");
     const cause =
       failure === "still present"
         ? undefined
@@ -562,37 +696,325 @@ it.each(["EPERM", "EIO", "still present"])(
     });
     completeRoot();
     await expect(adapter.wait()).resolves.toEqual({ code: 0, signal: null });
+    lineage.end();
+    await nextTurn();
+    // Exhaust the monotonic observation window without waiting on real process time.
+    const now = vi.spyOn(performance, "now").mockReturnValue(10_000);
     emit({ type: "closing", reason: "lineage-closed" });
     await nextTurn();
-    // Exhaust the bounded observation window without waiting on real process time.
-    vi.spyOn(Date, "now").mockReturnValueOnce(10_000).mockReturnValue(15_000);
+    now.mockReturnValue(15_000);
     close();
-    await expect(adapter.waitForExtinction()).rejects.toThrow("owned process group");
-    await expect(adapter.waitForExtinction()).rejects.toSatisfy(
-      (error: unknown) => error instanceof Error && error.cause === cause,
+    await expect(adapter.waitForExtinction()).rejects.toThrow(
+      failure === "EIO" ? "owned process group" : "hard deadline",
     );
+    if (failure === "EIO") {
+      await expect(adapter.waitForExtinction()).rejects.toSatisfy(
+        (error: unknown) => error instanceof Error && error.cause === cause,
+      );
+    } else {
+      await expect(adapter.waitForExtinction()).rejects.toMatchObject({
+        cause: { durationMs: GRACEFUL_CANCEL_TIMEOUT_MS, escalationAfterMs: undefined },
+      });
+    }
     await expect(adapter.wait()).resolves.toEqual({ code: 0, signal: null });
     expect(groupProbe).toHaveBeenCalledWith(-1235, 0);
     expect(groupProbe.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
   },
 );
 
-it("retains extinction ownership until the kernel group disappears", async () => {
-  const { adapter, completeRoot, emit, close, groupProbe } = await createRelay("linux");
-  groupProbe.mockReturnValueOnce(true);
-  completeRoot();
-  await adapter.wait();
-  const settled = vi.fn();
-  const extinction = adapter.waitForExtinction().then(settled);
-  emit({ type: "closing", reason: "lineage-closed" });
+it.each(["success", "EPERM"])(
+  "retains extinction ownership after %s until ESRCH",
+  async (probe) => {
+    const { adapter, completeRoot, emit, close, groupProbe } = await createRelay("linux");
+    groupProbe.mockImplementationOnce(() => {
+      if (probe === "EPERM") {
+        throw Object.assign(new Error("synthetic unsignalable group"), { code: "EPERM" });
+      }
+      return true;
+    });
+    completeRoot();
+    await adapter.wait();
+    const settled = vi.fn();
+    const extinction = adapter.waitForExtinction();
+    void extinction.then(settled, settled);
+    emit({ type: "closing", reason: "lineage-closed" });
+    await nextTurn();
+    expect(groupProbe).not.toHaveBeenCalled();
+    close();
+    await nextTurn();
+    expect(settled).not.toHaveBeenCalled();
+    await extinction;
+    expect(groupProbe.mock.calls).toEqual([
+      [-1235, 0],
+      [-1235, 0],
+    ]);
+  },
+);
+
+it.each(["before", "after"])(
+  "joins forced stdio cleanup when control closes %s the force request",
+  async (controlCloses) => {
+    const {
+      adapter,
+      completeRoot,
+      emit,
+      closeControl,
+      exitRelay,
+      groupProbe,
+      lineage,
+      acknowledgements,
+      cancellations,
+      killSpy,
+      acknowledgeRetirement,
+    } = await createRelay("linux");
+    completeRoot();
+    await adapter.wait();
+    lineage.end();
+    groupProbe.mockReturnValue(true);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      emit({ type: "closing", reason: "lineage-closed" });
+      await nextTurn();
+      expect(acknowledgements).toContainEqual(expect.objectContaining({ type: "closing-ack" }));
+      const extinct = vi.fn();
+      void adapter.waitForExtinction().then(extinct, extinct);
+      if (controlCloses === "before") {
+        closeControl();
+        await nextTurn();
+      }
+      const finished = vi.fn();
+      const closing = closeOwnedStdioProcess(adapter, { force: true });
+      void closing.then(finished, finished);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(finished).not.toHaveBeenCalled();
+      expect(extinct).not.toHaveBeenCalled();
+      expect(killSpy).not.toHaveBeenCalled();
+      if (controlCloses === "after") {
+        closeControl();
+        await nextTurn();
+      }
+      acknowledgeRetirement();
+      expect(killSpy).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+      expect(cancellations).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(finished).not.toHaveBeenCalled();
+      expect(extinct).not.toHaveBeenCalled();
+      const probesBeforeExit = groupProbe.mock.calls.length;
+      groupProbe.mockImplementation(() => {
+        throw Object.assign(new Error("synthetic absent group"), { code: "ESRCH" });
+      });
+      exitRelay();
+      await expect(closing).resolves.toMatchObject({
+        reason: "forced-relay-exit",
+        signalRequested: "SIGKILL",
+        exit: { code: 0, signal: null },
+      });
+      expect(groupProbe.mock.calls).toHaveLength(probesBeforeExit + 1);
+      expect(groupProbe.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+      expect(cancellations).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+it.each([
+  {
+    leg: "control EOF",
+    pending: {
+      controlClose: true,
+      relayExit: true,
+      lineageEof: true,
+      extinctionUnconfirmed: true,
+      stdoutEnd: false,
+      stderrEnd: false,
+    },
+  },
+  {
+    leg: "relay exit",
+    pending: {
+      controlClose: false,
+      relayExit: true,
+      lineageEof: true,
+      extinctionUnconfirmed: true,
+      stdoutEnd: false,
+      stderrEnd: false,
+    },
+  },
+  {
+    leg: "lineage EOF",
+    pending: {
+      controlClose: false,
+      relayExit: false,
+      lineageEof: true,
+      extinctionUnconfirmed: true,
+      stdoutEnd: false,
+      stderrEnd: false,
+    },
+  },
+  {
+    leg: "kernel group",
+    pending: {
+      controlClose: false,
+      relayExit: false,
+      lineageEof: false,
+      extinctionUnconfirmed: true,
+      stdoutEnd: false,
+      stderrEnd: false,
+    },
+  },
+  {
+    leg: "output EOF",
+    pending: {
+      controlClose: false,
+      relayExit: false,
+      lineageEof: false,
+      extinctionUnconfirmed: false,
+      stdoutEnd: true,
+      stderrEnd: true,
+    },
+  },
+])(
+  "settles every pending owner join at the hard deadline while waiting for $leg",
+  async ({ leg, pending }) => {
+    const relay = await createRelay("linux", leg === "lineage EOF");
+    const { adapter, emit, stdout, stderr } = relay;
+    emit({ type: "root-result", code: 23, signal: null });
+    if (leg !== "output EOF") {
+      relay.endOutput();
+    }
+    await nextTurn();
+    const root = adapter.wait();
+    const extinction = adapter.waitForExtinction();
+    const finished = vi.fn();
+    const outcomes = Promise.allSettled([root, extinction]).then((results) => {
+      finished();
+      return results;
+    });
+    if (leg === "kernel group") {
+      relay.groupProbe.mockReturnValue(true);
+    }
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      emit({ type: "closing", reason: "lineage-closed" });
+      await nextTurn();
+      if (leg === "relay exit") {
+        relay.closeControl();
+      } else if (leg !== "control EOF") {
+        relay.close();
+      }
+      await nextTurn();
+      if (leg === "output EOF") {
+        await expect(extinction).resolves.toBeUndefined();
+      } else {
+        await expect(root).resolves.toEqual({ code: 23, signal: null });
+      }
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(finished).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      const results = await outcomes;
+      const pendingIndex = leg === "output EOF" ? 0 : 1;
+      expect(results[pendingIndex]).toMatchObject({
+        status: "rejected",
+        reason: expect.objectContaining({
+          message:
+            "service child cleanup did not complete before its hard deadline; pending: " +
+            JSON.stringify({ closingReceipt: false, ...pending }),
+        }),
+      });
+      expect(results[1 - pendingIndex]?.status).toBe("fulfilled");
+      expect(stdout?.destroyed).toBe(true);
+      expect(stderr?.destroyed).toBe(true);
+      // Late native/output callbacks cannot replace a rejected join or erase a completed fact.
+      relay.endOutput();
+      relay.lineage.end();
+      relay.exitRelay();
+      expect(await Promise.allSettled([root, extinction])).toEqual(results);
+      expect(relay.cancellations).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+it("bounds hard cancellation without any closing receipt or root result", async () => {
+  const { adapter, cancellations, stdout, stderr } = await createRelay("linux");
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const outcomes = Promise.allSettled([adapter.wait(), adapter.waitForExtinction()]);
+    adapter.kill("SIGKILL");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await outcomes).toEqual([
+      expect.objectContaining({ status: "rejected", reason: expect.any(Error) }),
+      expect.objectContaining({ status: "rejected", reason: expect.any(Error) }),
+    ]);
+    expect(cancellations).toHaveLength(1);
+    expect(stdout?.destroyed).toBe(true);
+    expect(stderr?.destroyed).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it.each([-60_000, 60_000])(
+  "does not renew hard cleanup for repeated KILL, receipt, EOF or a %s ms wall-clock jump",
+  async (clockJump) => {
+    const { adapter, emit, closeControl, cancellations, groupProbe } = await createRelay("linux");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const settled = vi.fn();
+      const outcomes = Promise.allSettled([adapter.wait(), adapter.waitForExtinction()]);
+      void outcomes.then(settled);
+      adapter.kill("SIGKILL");
+      await vi.advanceTimersByTimeAsync(3_000);
+      adapter.kill("SIGKILL");
+      vi.setSystemTime(Date.now() + clockJump);
+      await vi.advanceTimersByTimeAsync(1_000);
+      emit({ type: "closing", reason: "cancel" });
+      await nextTurn();
+      await vi.advanceTimersByTimeAsync(500);
+      closeControl();
+      await nextTurn();
+      await vi.advanceTimersByTimeAsync(499);
+      expect(settled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await outcomes).map((result) => result.status)).toEqual(["rejected", "rejected"]);
+      expect(cancellations).toHaveLength(1);
+      expect(groupProbe).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+it("cannot revive lost authority with a late closing receipt while output remains open", async () => {
+  const { adapter, emit, cancellations, acknowledgements, endOutput, lineage } =
+    await createRelay("linux");
+  emit({ type: "root-result", code: 23, signal: null });
   await nextTurn();
-  expect(groupProbe).not.toHaveBeenCalled();
-  close();
-  await nextTurn();
-  expect(settled).not.toHaveBeenCalled();
-  await extinction;
-  expect(groupProbe.mock.calls).toEqual([
-    [-1235, 0],
-    [-1235, 0],
-  ]);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const outcomes = Promise.allSettled([adapter.wait(), adapter.waitForExtinction()]);
+    lineage.destroy(new Error("synthetic lineage observation lost"));
+    await nextTurn();
+    await expect(adapter.waitForExtinction()).rejects.toThrow("cleanup identity lost");
+    adapter.kill("SIGKILL");
+    emit({ type: "closing", reason: "cancel" });
+    await nextTurn();
+    adapter.kill("SIGKILL");
+    expect(acknowledgements).toHaveLength(0);
+    expect(cancellations).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(5_000);
+    const results = await outcomes;
+    expect(results.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+    expect(results[0]).toMatchObject({
+      reason: expect.objectContaining({ message: expect.stringContaining("hard deadline") }),
+    });
+    endOutput();
+    expect(await Promise.allSettled([adapter.wait(), adapter.waitForExtinction()])).toEqual(
+      results,
+    );
+  } finally {
+    vi.useRealTimers();
+  }
 });

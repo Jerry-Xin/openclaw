@@ -3,7 +3,7 @@ import { ref } from "lit/directives/ref.js";
 import { repeat } from "lit/directives/repeat.js";
 import { icons } from "../../components/icons.ts";
 import { t } from "../../i18n/index.ts";
-import { resolveSafeExternalUrl } from "../../lib/open-external-url.ts";
+import { registerSkillsBrowserEnglish } from "../../i18n/locales/en-skills-browser.ts";
 import { clawHubSkillRef } from "../../lib/skills/clawhub-search.ts";
 import { renderPluginCardSummary } from "../plugins/plugin-card.ts";
 import { skillDiscoveryEntries, type SkillDiscoveryEntry } from "./discovery.ts";
@@ -11,12 +11,14 @@ import { renderSkillStateStatus, verdictForSkill } from "./skill-status.ts";
 import type { SkillsProps } from "./view-types.ts";
 import "../../styles/skills-discovery.css";
 
+registerSkillsBrowserEnglish();
+
 function renderCard(entry: SkillDiscoveryEntry, props: SkillsProps) {
   const remote = entry.remote;
   const reference = remote ? clawHubSkillRef(remote) : "";
   const installed = Boolean(entry.skill || entry.library);
   const canOpen = installed || !remote?.installOnly;
-  const icon = remote?.icon ? resolveSafeExternalUrl(remote.icon, window.location.href) : null;
+  const icon = remote?.icon ? props.clawhubIconUrls?.[remote.icon] : undefined;
   const busy = props.operation?.kind === "clawhub" && props.operation.ref === reference;
   return html`<article
     class="plugin-catalog-card oc-card oc-card-interactive"

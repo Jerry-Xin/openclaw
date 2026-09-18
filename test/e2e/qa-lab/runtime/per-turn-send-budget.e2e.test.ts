@@ -35,6 +35,13 @@ import {
   resetTurnSendLedgerForTest,
 } from "../../../../src/agents/tools/turn-send-ledger.js";
 import { stopQaGatewayFixture } from "../../../helpers/qa-gateway-cleanup.js";
+import {
+  aggregateTurnSendProof,
+  createTurnSendProofOutcomes,
+  recordTurnSendProofSuccess,
+  type TurnSendScenarioId,
+  type TurnSendTerminalStatus,
+} from "./per-turn-send-budget-proof.js";
 
 const PRIMARY_MODEL = "mock-openai/gpt-5.6-luna";
 const ALTERNATE_MODEL = "mock-openai/gpt-5.6-luna-alt";
@@ -58,14 +65,19 @@ type OutboundMessage = {
 };
 
 type ScenarioVerdict = {
-  scenario: string;
-  deliveriesRecorded: number;
-  toolResults: Array<{ status: string; noticePresent: boolean; schemaValid: boolean }>;
-  ledgerCounts: Record<string, number>;
+  id: TurnSendScenarioId;
+  status: TurnSendTerminalStatus;
+  scenario?: string;
+  deliveriesRecorded?: number;
+  toolResults?: Array<{ status: string; noticePresent: boolean; schemaValid: boolean }>;
+  ledgerCounts?: Record<string, number>;
   pass: boolean;
 };
 
-const verdict: { pass: boolean; scenarios: ScenarioVerdict[] } = { pass: false, scenarios: [] };
+const verdict: { pass: boolean; scenarios: ScenarioVerdict[] } = {
+  pass: false,
+  scenarios: createTurnSendProofOutcomes() as ScenarioVerdict[],
+};
 
 function buildQaChannelTransport() {
   return {
@@ -162,7 +174,10 @@ afterAll(async () => {
   const outPath =
     process.env.OPENCLAW_PROOF_OUT?.trim() ||
     path.resolve(process.cwd(), ".artifacts/per-turn-send-budget-proof.json");
-  verdict.pass = verdict.scenarios.length > 0 && verdict.scenarios.every((entry) => entry.pass);
+  Object.assign(verdict, {
+    ...aggregateTurnSendProof(verdict.scenarios),
+    scenarios: verdict.scenarios,
+  });
   await fs.mkdir(path.dirname(outPath), { recursive: true });
   await fs.writeFile(outPath, `${JSON.stringify(verdict, null, 2)}\n`, "utf8");
 });
@@ -404,6 +419,15 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
         message.text.includes("SANITY-OK"),
       );
       expect(reply.conversation.id).toBe("qa-operator");
+      recordTurnSendProofSuccess(verdict.scenarios, {
+        id: "sanity",
+        status: "success",
+        scenario: "plain qa-channel DM turn delivers one outbound reply",
+        deliveriesRecorded: 1,
+        toolResults: [],
+        ledgerCounts: {},
+        pass: true,
+      });
     },
   );
 
@@ -448,7 +472,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       );
       expect(noticePresent).toBe(true);
 
-      verdict.scenarios.push({
+      recordTurnSendProofSuccess(verdict.scenarios, {
+        id: "soft-nudge",
+        status: "success",
         scenario: "message soft nudge counts confirmed deliveries",
         deliveriesRecorded: sendDeliveries.length,
         toolResults: [
@@ -544,7 +570,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const ledgerCount = peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey });
       expect(ledgerCount).toBe(1);
 
-      verdict.scenarios.push({
+      recordTurnSendProofSuccess(verdict.scenarios, {
+        id: "hard-cap",
+        status: "success",
         scenario: "hard cap returns schema-valid suppressed result",
         deliveriesRecorded: capDeliveries.length,
         toolResults: [
@@ -623,7 +651,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       expect(nudgeAtTwo).toBe(true);
       expect(nudgeAtThree).toBe(false);
 
-      verdict.scenarios.push({
+      recordTurnSendProofSuccess(verdict.scenarios, {
+        id: "suppressed-not-charged",
+        status: "success",
         scenario: "suppressed send does not charge the per-turn budget",
         deliveriesRecorded: sendDeliveries.length,
         toolResults: [
@@ -709,7 +739,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const ledgerCount = peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey });
       expect(ledgerCount).toBe(1);
 
-      verdict.scenarios.push({
+      recordTurnSendProofSuccess(verdict.scenarios, {
+        id: "idempotent-replay",
+        status: "success",
         scenario: "idempotent conversations_send replay does not re-deliver or double count",
         deliveriesRecorded: replayDeliveries.length,
         toolResults: [
@@ -834,7 +866,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const ledgerCount = peekTurnSendCount({ sessionKey: ledgerSessionKey, runId, targetKey });
       expect(ledgerCount).toBe(1);
 
-      verdict.scenarios.push({
+      recordTurnSendProofSuccess(verdict.scenarios, {
+        id: "concurrent-cap",
+        status: "success",
         scenario: "two concurrent distinct-op sends admit exactly one under the cap",
         deliveriesRecorded: concurrentDeliveries.length,
         toolResults: [
@@ -955,7 +989,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       const distinctExecutedIds = new Set(firstRoundWithBothSends);
       expect(distinctExecutedIds.size).toBe(2);
 
-      verdict.scenarios.push({
+      recordTurnSendProofSuccess(verdict.scenarios, {
+        id: "direct-repeat",
+        status: "success",
         scenario:
           "direct message-tool byte-identical repeat under cap is cap-blocked (exactly-once delivery)",
         deliveriesRecorded: repeatDeliveries.length,
@@ -1108,7 +1144,9 @@ describe("per-turn per-target send budget (real Gateway + qa-channel)", () => {
       );
       expect(spoofedDeliveries).toHaveLength(0);
 
-      verdict.scenarios.push({
+      recordTurnSendProofSuccess(verdict.scenarios, {
+        id: "authority-chain",
+        status: "success",
         scenario: "spoofed attach-grant principal refused before delivery I/O (authority chain)",
         deliveriesRecorded: spoofedDeliveries.length,
         toolResults: [

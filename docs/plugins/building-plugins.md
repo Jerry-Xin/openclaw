@@ -69,7 +69,7 @@ local proof.
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "typebox": "1.3.18"
+    "typebox": "1.3.30"
   },
   "peerDependencies": {
     "openclaw": ">=2026.3.24-beta.2"
@@ -93,7 +93,7 @@ local proof.
   "id": "my-plugin",
   "name": "My Plugin",
   "description": "Adds a custom tool to OpenClaw",
-  "categories": ["tools"],
+  "categories": ["other"],
   "contracts": {
     "tools": ["my_tool"]
   },
@@ -112,6 +112,11 @@ local proof.
     Published external plugins should point runtime entries at built JavaScript
     files. See [SDK entry points](/plugins/sdk-entrypoints) for the full entry
     point contract.
+
+    Choose one [catalog category](/plugins/manifest#catalog-categories) for the
+    plugin's main user purpose. This generic example uses `other`; a calendar
+    plugin would use `scheduling`, a coding helper would use `developer-tools`,
+    and an agent execution backend would use `agent-runtimes`.
 
     Every plugin needs a manifest, even with no config. Runtime tools must
     appear in `contracts.tools` so OpenClaw can discover ownership without
@@ -242,6 +247,19 @@ local proof.
 
   </Step>
 </Steps>
+
+## Add plugin artwork
+
+Ship `assets/icon.png` for plugin identity in catalogs, settings, and install
+cards. Use a separate monochrome `assets/activity.svg` for compact tool calls
+in chat. Check the activity shape at 16 px in both light and dark themes; avoid
+a filled square behind the mark.
+
+One activity icon covers the plugin. Add `assets/activity/<tool-name>.svg` only
+for tools that need a distinct shape, using their exact `tools.effective` IDs.
+Include the assets in your published package and verify their presence with
+`npm pack --dry-run`. See the [activity icon contract](/plugins/manifest/surfaces#inline-activity-icons)
+for supported SVG geometry, size bounds, and fallback behavior.
 
 <a id="registering-agent-tools"></a>
 

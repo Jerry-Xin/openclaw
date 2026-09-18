@@ -76,6 +76,7 @@ type StartChatDispatchParams = {
   skillWorkshopProposalRevision?: SkillWorkshopProposalRevisionConstraint;
   skillLibraryAuthoring?: import("../../skills/library/authoring.js").SkillLibraryAuthoringCapability;
   cronCreatorAuthority: ReturnType<ChatSendExternalAuthorityAdmission["resolve"]>;
+  assertDashboardReadCurrent?: () => void;
   externalAuthorityAdmission: ChatSendExternalAuthorityAdmission | undefined;
   injection: {
     beginCapturedMessageInjection: () => ReplyMessageInjectionAttempt | undefined;
@@ -118,6 +119,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
     skillWorkshopProposalRevision,
     skillLibraryAuthoring,
     cronCreatorAuthority,
+    assertDashboardReadCurrent,
     externalAuthorityAdmission,
     injection,
     request,
@@ -136,6 +138,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
     messageInjectionTarget,
     retainGatewayWorkAdmission,
     restartSafeAdmission,
+    sessionBinding,
   } = admission;
   const {
     activeRunScopeKey,
@@ -156,6 +159,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
     accountId,
     ctx,
     isInternalTextSlashCommandTurn,
+    managedMediaApplyMode,
     pluginBoundMediaPromise,
     queuedFollowupOwnerKey,
     replyOptionImages,
@@ -181,6 +185,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
     prepareAssistantTranscriptMessage: params.prepareAssistantTranscriptMessage,
     isAgentRunStarted: () => agentRunStarted,
     isRunCurrent,
+    abortSignal: activeRunAbort.controller.signal,
     onCommandBlock: isInternalTextSlashCommandTurn
       ? (text) =>
           broadcastChatDelta({
@@ -280,6 +285,18 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
           : operation(),
       ),
   };
+  const dashboardReadAdmission = assertDashboardReadCurrent
+    ? {
+        agentId,
+        runId: clientRunId,
+        sessionKey,
+        // Fresh-session initialization updates this original registration's SID.
+        get sessionId() {
+          return sessionBinding.sessionId;
+        },
+        assertCurrent: assertDashboardReadCurrent,
+      }
+    : undefined;
   const dispatch = replyDispatch
     .runAgentMediaTranscript(dispatchAdmission, () =>
       measureDiagnosticsTimelineSpan(
@@ -324,7 +341,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
           }
           const pluginBoundMedia = await pluginBoundMediaPromise;
           assertWorkspaceRunOwnership?.();
-          applyChatSendManagedMedia(ctx, pluginBoundMedia);
+          applyChatSendManagedMedia(ctx, pluginBoundMedia, managedMediaApplyMode);
           const dispatchInbound = () => {
             assertWorkspaceRunOwnership?.();
             return dispatchInboundMessageWithProjectedDispatcher({
@@ -340,6 +357,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
                   ? { admittedSessionSettings: admission.admittedSessionSettings }
                   : {}),
                 runId: clientRunId,
+                dashboardReadAdmission,
                 skillWorkshopProposalRevision,
                 skillLibraryAuthoring,
                 ...(cronCreatorAuthority
@@ -371,6 +389,13 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
                 resumeRequestedSession: reconnectResumeRequested,
                 onSessionPrepared: admission.onSessionPrepared,
                 abortSignal: activeRunAbort.controller.signal,
+                getProviderLoginConfig: context.getRuntimeConfig,
+                assertProviderLoginAuthority: () => {
+                  client?.connectionSignal?.throwIfAborted();
+                  if (client?.invalidated || !client?.connect.scopes?.includes("operator.admin")) {
+                    throw new Error("Provider login authority is no longer active.");
+                  }
+                },
                 // Keep a Gateway-owned cancel identity after this chat.send
                 // terminalizes while the prompt waits in followup/collect queue.
                 onFollowupQueueDisposition: queuedFollowup.onQueueDisposition,
@@ -395,10 +420,10 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
                     emitSessionsChanged(context, {
                       sessionKey,
                       agentId,
-                      reason: "chat.run.started",
+                      reason: "agent.run.started",
                     });
                   }
-                  agentRunStarted = replyDispatch.captureAgentTranscriptStart();
+                  agentRunStarted = replyDispatch.captureAgentTranscriptStart(runId);
                   emitServerTiming(
                     "agent-run-started",
                     runId !== clientRunId ? { agentRunId: runId } : undefined,
@@ -559,7 +584,12 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
               persistUserTurnTranscript: persistGatewayUserTurnTranscriptBestEffort,
               session,
               suppressReplies: !replyDispatchRun && replyDispatch.hasAppendedWebchatAgentMedia(),
-              runtimeOwnsTranscript: replyDispatchResult?.assistantTranscript !== undefined,
+              // Bound ACP writes its own transcript; the dashboard still needs its reply.
+              runtimeOwnsTranscript:
+                replyDispatchResult?.assistantTranscript?.agentId === agentId &&
+                replyDispatchResult.assistantTranscript.sessionKey === sessionKey &&
+                replyDispatchResult.assistantTranscript.sessionId ===
+                  activeRunAbort.entry?.sessionId,
               state: runtimeCancelled ? "aborted" : "final",
               stopReason: runtimeOutcome?.stopReason,
             });
@@ -659,7 +689,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
     } finally {
       await dispatchErrorLifecycle.finalize();
       // Terminal lifecycle can precede owner release; publish exact liveness after cleanup.
-      emitSessionsChanged(context, { sessionKey, agentId, reason: "chat.run.settled" });
+      emitSessionsChanged(context, { sessionKey, agentId, reason: "agent.input.settled" });
       if (userTurnRecorder.isBlocked() && attachments.offloadedRefs.length > 0) {
         // A blocked turn persists only the redacted block reason — no media
         // markers — so the prepared inbound media stays unreferenced forever

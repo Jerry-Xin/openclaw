@@ -129,6 +129,12 @@ choice persists as `wizard.accessMode`. With discovery allowed, onboarding
 detects AI access already available through configured models, API-key
 environment variables, and supported local CLIs. Detection only presents choices;
 it does not run live inference, install plugins, choose a model, or persist credentials.
+A provider marked **Setup and utility**, such as Apple Foundation Models, is
+verified and saved as `utilityModel` without replacing the primary model. On a
+fresh installation, it powers the OpenClaw setup assistant; choose a separate
+primary model before opening regular agent chat. Existing primary models and
+credentials remain unchanged when you add a utility model.
+
 Choose a detected connection or any supported provider in the shared picker.
 The selected connection runs a real completion. If it fails, the error is shown
 and the picker waits for your next choice. Cancellation stops the attempt without
@@ -419,6 +425,21 @@ Mistral:
 openclaw onboard --non-interactive --accept-risk --skip-health \
   --auth-choice mistral-api-key \
   --mistral-api-key "$MISTRAL_API_KEY"
+```
+
+Arcee AI. The `arcee` provider plugin supplies both choices and their flags, so
+install it before running onboarding non-interactively:
+
+```bash
+# Direct (chat.arcee.ai)
+openclaw onboard --non-interactive --accept-risk --skip-health \
+  --auth-choice arceeai-api-key \
+  --arceeai-api-key "$ARCEEAI_API_KEY"
+
+# Via OpenRouter
+openclaw onboard --non-interactive --accept-risk --skip-health \
+  --auth-choice arceeai-openrouter \
+  --openrouter-api-key "$OPENROUTER_API_KEY"
 ```
 
 ### Additional non-interactive flags

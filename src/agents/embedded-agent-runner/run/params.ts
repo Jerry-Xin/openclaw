@@ -49,6 +49,7 @@ import type {
   ToolProgressDetailMode,
   ToolResultFormat,
 } from "../../embedded-agent-subscribe.shared-types.js";
+import type { ExecSessionDefaults } from "../../exec-defaults.js";
 import type { FastModeAutoProgressState } from "../../fast-mode.js";
 import type { ContextEngineLogicalTurnLease } from "../../harness/context-engine-logical-turn.js";
 import type { ContextEngineTurnAttemptFacts } from "../../harness/context-engine-turn-attempt.js";
@@ -118,6 +119,7 @@ export type RunEmbeddedAgentParams = {
   messageProvider?: string;
   /** Capabilities declared by the gateway client that originated this run. */
   clientCaps?: string[];
+  gatewayUiCommandTarget?: import("../../../gateway/ui-command-target.types.js").GatewayUiCommandTarget;
   /** Host-admitted dashboard authoring without an originating inline renderer. */
   pinnedWidgetAuthoring?: boolean;
   /** Out-of-band plugin bindings attached by the run initiator. */
@@ -293,6 +295,8 @@ export type RunEmbeddedAgentParams = {
   expectedAgentHarnessRuntimeArtifact?: ExpectedAgentHarnessRuntimeArtifact;
   authProfileId?: string;
   authProfileIdSource?: "auto" | "user";
+  /** Disable fallback from the user-selected auth profile for a verification run. */
+  allowAuthProfileFallback?: boolean;
   thinkLevel?: ThinkLevel;
   fastMode?: FastMode;
   /** Stable outer-run start time for auto fast-mode cutoff across retries/fallbacks. */
@@ -332,6 +336,8 @@ export type RunEmbeddedAgentParams = {
   bootstrapPromptWarningSignaturesSeen?: string[];
   /** Last shown bootstrap truncation warning signature for this session. */
   bootstrapPromptWarningSignature?: string;
+  /** Canonical persisted exec policy for this session. */
+  execSession?: ExecSessionDefaults;
   execOverrides?: Pick<
     ExecToolDefaults,
     | "host"
@@ -492,6 +498,7 @@ export type EmbeddedForegroundPromptContext = Pick<
   | "messageChannel"
   | "messageProvider"
   | "clientCaps"
+  | "gatewayUiCommandTarget"
   | "toolBindings"
   | "chatType"
   | "agentAccountId"

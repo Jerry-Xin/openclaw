@@ -64,7 +64,7 @@ approval.
 openclaw plugins install @openclaw/buzz
 ```
 
-Restart the Gateway after installing or updating the plugin.
+Check the [application result](/plugins/manage-plugins#apply-changes-and-inspect) after installing or updating the plugin.
 
 ## Guided setup
 
@@ -108,6 +108,16 @@ exit setup.
 
 Every target room must contain the bot identity with the **Bot** role. An
 existing human member or ordinary room member role is not sufficient.
+
+At startup, OpenClaw skips active configured rooms where the bot lacks the Bot
+role and logs a warning for each skipped room. Other eligible rooms stay online.
+If active configured rooms remain but none has the Bot role, the account cannot
+start.
+
+When the relay reports a membership change for a skipped room, OpenClaw checks
+its signed roster again. A confirmed Bot role starts that room without restarting
+healthy rooms. A live Bot-role downgrade in a subscribed room still cancels the
+account's active work and reconnects with fresh memberships.
 
 Buzz desktop cannot reliably assign the Bot role to an externally managed
 OpenClaw identity. Use the Buzz CLI as the existing human room owner or admin:
@@ -624,7 +634,7 @@ Bot identity rotation requires admin approval for the new public key:
 
 1. Generate a new dedicated bot identity.
 2. Have an admin approve its public key for the relay and every configured room.
-3. Replace the configured private key and restart or reload the Gateway.
+3. Replace the configured private key and verify that [hot reload](/gateway/configuration/hot-reload) applies the change. Restart the Gateway if the key comes from a changed service environment.
 4. Test outbound and inbound messages.
 5. Remove the old public key from the rooms and relay.
 

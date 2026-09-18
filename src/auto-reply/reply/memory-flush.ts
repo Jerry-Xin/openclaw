@@ -6,8 +6,8 @@ import { normalizeStaticProviderModelId } from "../../agents/model-ref-shared.js
 import { normalizeProviderId } from "../../agents/model-selection.js";
 import { parseNonNegativeByteSize } from "../../config/byte-size.js";
 import {
+  findConfiguredProviderModel,
   resolveMergedModelProviderConfig,
-  resolveMergedModelProviderModels,
 } from "../../config/model-provider-config.js";
 import { resolveFreshSessionTotalTokens, type SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -23,6 +23,19 @@ function resolvePositiveTokenCount(value: number | undefined): number | undefine
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.floor(value)
     : undefined;
+}
+
+export function resolveEffectivePromptTokens(
+  basePromptTokens?: number,
+  lastOutputTokens?: number,
+  promptTokenEstimate?: number,
+): number {
+  const base = Math.max(0, basePromptTokens ?? 0);
+  const output = Math.max(0, lastOutputTokens ?? 0);
+  const estimate = Math.max(0, promptTokenEstimate ?? 0);
+  // Flush gating projects the next input context by adding the previous
+  // completion and the current user prompt estimate.
+  return base + output + estimate;
 }
 
 /** Resolves the blocking threshold using the selected reserve and server floor. */
@@ -51,10 +64,12 @@ export function resolveResponsesServerCompactionThreshold(params: {
   const normalizeModelId = (value: string) =>
     normalizeStaticProviderModelId(normalizedProvider, value).trim().toLowerCase();
   const providerConfig = resolveMergedModelProviderConfig(params.cfg, provider);
-  const configuredModel = resolveMergedModelProviderModels({
-    models: providerConfig?.models,
+  const configuredModel = findConfiguredProviderModel(
+    providerConfig,
+    provider,
+    modelId,
     normalizeModelId,
-  }).get(normalizeModelId(modelId));
+  );
   const { defaultParams, modelParams } = resolveModelExtraParamSources({
     config: params.cfg,
     provider,

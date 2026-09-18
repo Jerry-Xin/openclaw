@@ -42,6 +42,7 @@ import {
   buildCodexRingZeroThreadConfigPatch,
   readCodexInheritedMcpServerNames,
 } from "./thread-requests.js";
+import { resolveCodexPromptError } from "./usage-limit-error.js";
 
 const CODEX_APP_SERVER_ARGS_ENV_KEY = "OPENCLAW_CODEX_APP_SERVER_ARGS";
 const CODEX_BOUNDED_THREAD_CONFIG: JsonObject = {
@@ -154,8 +155,9 @@ async function runBoundedCodexAppServerTurnInWorkspace(
 ): Promise<CodexBoundedTurnResult> {
   const totalTimeoutMs = timing?.timeoutMs ?? resolveTimerTimeoutMs(params.timeoutMs, 100, 100);
   const timeoutError = new CodexBoundedTurnTimeoutError(params.taskLabel, totalTimeoutMs);
-  const deadline = timing?.deadline ?? Date.now() + totalTimeoutMs;
-  const timeoutMs = deadline - Date.now();
+  // Startup and selection retries share an elapsed budget, not a wall-clock deadline.
+  const deadline = timing?.deadline ?? performance.now() + totalTimeoutMs;
+  const timeoutMs = deadline - performance.now();
   if (timeoutMs <= 0) {
     throw timeoutError;
   }
@@ -215,7 +217,7 @@ async function runBoundedCodexAppServerTurnInWorkspace(
   } else {
     params.signal?.addEventListener("abort", abortFromCaller, { once: true });
   }
-  const remainingRunMs = deadline - Date.now();
+  const remainingRunMs = deadline - performance.now();
   if (remainingRunMs <= 0) {
     abortRun(timeoutError);
   }
@@ -322,11 +324,13 @@ async function runBoundedCodexAppServerTurnInWorkspace(
           resolveCodexBoundedTurnAbortError(abortController.signal, params.taskLabel, timeoutError),
       });
       if (result.error || result.turn?.status === "failed") {
-        throw new Error(
-          (result.error
-            ? readCodexErrorNotification(result.error)?.error.message
-            : result.turn?.error?.message) ?? `codex app-server ${params.taskLabel} turn failed`,
-        );
+        const source = result.error
+          ? readCodexErrorNotification(result.error)?.error
+          : result.turn?.error;
+        const failure = source ? resolveCodexPromptError(source) : undefined;
+        throw failure instanceof Error
+          ? failure
+          : new Error(failure ?? `codex app-server ${params.taskLabel} turn failed`);
       }
       if (result.turn?.status !== "completed") {
         throw new Error(

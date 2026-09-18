@@ -9,6 +9,7 @@ import { stopChildProcess } from "../../../test/helpers/stop-child-process.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { createConfigIO } from "../../config/config.js";
 import { hashConfigRaw } from "../../config/io.read-helpers.js";
+import type { OpenClawConfig } from "../../config/types.js";
 import { FILE_LOCK_TIMEOUT_ERROR_CODE, withFileLock } from "../../infra/file-lock.js";
 import { readUpdateStateSchemaVersions } from "../../infra/update-candidate-state.js";
 import {
@@ -25,13 +26,22 @@ import { createWindowsTaskAutoStartRecovery } from "./update-command-windows-tas
 const mocks = vi.hoisted(() => ({
   stop: vi.fn(),
   restart: vi.fn<typeof import("./update-command-service.js").maybeRestartService>(),
-  reachable: vi.fn(),
+  serviceState: vi.fn<typeof import("../../daemon/service.js").readGatewayServiceState>(),
+  revalidateService:
+    vi.fn<
+      typeof import("./update-command-service-maintenance.js").revalidateManagedGatewayServiceAfterUpdate
+    >(),
   execSchtasks: vi.fn<typeof import("../../daemon/schtasks-exec.js").execSchtasks>(),
 }));
 vi.mock("../../daemon/schtasks-exec.js", () => ({ execSchtasks: mocks.execSchtasks }));
+vi.mock("../../daemon/service.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../daemon/service.js")>()),
+  readGatewayServiceState: mocks.serviceState,
+}));
 vi.mock("./update-command-service-maintenance.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./update-command-service-maintenance.js")>()),
   createWindowsTaskAutoStartGuard: () => async () => {},
+  revalidateManagedGatewayServiceAfterUpdate: mocks.revalidateService,
 }));
 vi.mock("./update-command-service-command.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./update-command-service-command.js")>()),
@@ -47,13 +57,14 @@ vi.mock("./update-command-service.js", () => ({
   ) => stopped?.windowsTaskAutoStartRecovery?.restore(safe, guard),
   resolveUpdatedGatewayRestartPort: async () => 19101,
 }));
-vi.mock("../daemon-cli/restart-health-probe.js", () => ({
-  confirmGatewayReachable: mocks.reachable,
-}));
 import * as updateShared from "./shared.js";
 import { inspectActivatedUpdateState } from "./update-command-migrated.js";
 import * as packageModule from "./update-command-package.js";
 import { rollbackFailedUpdate } from "./update-command-rollback.js";
+import {
+  expectDoctorRollback,
+  writeWithRefreshFailure,
+} from "./update-command-rollback.test-support.js";
 import { completeUpdateCommandRun } from "./update-command-run.js";
 import { resolveUpdateResultNextAction } from "./update-recovery-guidance.js";
 
@@ -97,7 +108,25 @@ describe("verified package rollback", () => {
       `import ${JSON.stringify(pathToFileURL(path.resolve(worker)).href)};\n`,
     );
     vi.resetAllMocks();
-    mocks.reachable.mockResolvedValue({ reachable: true });
+    mocks.serviceState.mockResolvedValue({
+      installed: true,
+      loadState: { status: "loaded" },
+      running: false,
+      env: {},
+      command: {
+        programArguments: [
+          process.execPath,
+          path.join(previousRoot, "dist", "index.js"),
+          "gateway",
+        ],
+      },
+    });
+    mocks.revalidateService.mockResolvedValue({
+      kind: "owned",
+      root: previousRoot,
+      fingerprint: "fixture",
+      refreshDefinition: true,
+    });
     mocks.stop.mockResolvedValue({
       stopped: true,
       stoppedAtMs: 100,
@@ -113,13 +142,9 @@ describe("verified package rollback", () => {
       return "ok";
     });
   });
-  it.each([
-    { reachable: true, duringStop: false },
-    { reachable: false, duringStop: false },
-    { reachable: true, duringStop: true },
-  ])(
-    "records refused project rollback (reachable=$reachable, during stop=$duringStop)",
-    async ({ reachable, duringStop }) => {
+  it.each([false, true])(
+    "records refused project rollback without an additional stop (during stop=%s)",
+    async (duringStop) => {
       const env = { OPENCLAW_STATE_DIR: dirs.make("rollback-project-changed-") };
       const configSnapshot = await readPreviousConfig(env);
       const config = configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig;
@@ -139,7 +164,6 @@ describe("verified package rollback", () => {
         reason: "rollback-project-changed" as const,
         stderrTail: detail,
       }));
-      mocks.reachable.mockResolvedValue({ reachable });
       const detail = "Global project changed since staging: sibling";
       const outcome = await rollbackFailedUpdate({
         result: {
@@ -179,7 +203,7 @@ describe("verified package rollback", () => {
         root: candidateRoot,
       });
       expect(rollback).toHaveBeenCalledTimes(duringStop ? 1 : 0);
-      expect(mocks.stop).toHaveBeenCalledTimes(!reachable || duringStop ? 1 : 0);
+      expect(mocks.stop).toHaveBeenCalledTimes(duringStop ? 1 : 0);
       expect(mocks.restart).not.toHaveBeenCalled();
       completeUpdateCommandRun(outcome.result, run);
       const row = getUpdateRun(run.runId, { env })!;
@@ -192,11 +216,10 @@ describe("verified package rollback", () => {
       });
       const nextAction = resolveUpdateResultNextAction({
         result: outcome.result,
-        serviceRunning: reachable,
         env,
       });
       expect(renderUpdateRunReport(row, { nextAction }).markdown).toContain(
-        "Keep the candidate installed if its gateway is reachable; otherwise keep the gateway stopped.",
+        "The new installation was left unchanged.",
       );
     },
   );
@@ -321,6 +344,7 @@ describe("verified package rollback", () => {
         ]),
     { change: "doctor", previousVerified: true, restored: true, service: "stopped" },
     { change: "doctor-unchanged", previousVerified: true, restored: true, service: "stopped" },
+    { change: "doctor-compensated", previousVerified: true, restored: true, service: "stopped" },
     { change: "doctor-missing-input", previousVerified: true, restored: false, service: "stopped" },
     { change: "doctor-include", previousVerified: true, restored: true, service: "stopped" },
     { change: "doctor-include-edit", previousVerified: true, restored: false, service: "stopped" },
@@ -417,7 +441,7 @@ describe("verified package rollback", () => {
       }
       const result: UpdateRunResult = {
         status: "error",
-        reason: "version-mismatch",
+        reason: change === "doctor-compensated" ? "doctor-failed" : "version-mismatch",
         mode: "npm",
         root: change === "unknown-runtime" ? undefined : candidateRoot,
         before: { version: "2026.9.1" },
@@ -430,6 +454,7 @@ describe("verified package rollback", () => {
       if (change.startsWith("doctor")) {
         fs.writeFileSync(path.join(candidateRoot, "dist/entry.js"), "export {};\n");
         vi.spyOn(updateShared, "runUpdateStep").mockImplementationOnce(async (step) => {
+          let doctorError: Error | undefined;
           if (change === "doctor-input-edit") {
             fs.writeFileSync(
               configPath,
@@ -440,27 +465,30 @@ describe("verified package rollback", () => {
             const io = createConfigIO({ env: process.env, pluginValidation: "skip" });
             const input = await io.readConfigFileSnapshot();
             if (change !== "doctor-unchanged") {
-              await io.writeConfigFile(
-                {
-                  ...(input.sourceConfigBeforeMigrations ?? input.sourceConfig),
-                  meta: {
-                    migrations: { modelPolicyAllowlist: true },
-                    lastTouchedVersion: "2026.9.3",
-                  },
-                  agents: {
-                    defaults: {
-                      ...authored.agents.defaults,
-                      modelPolicy: { allow: ["openai/gpt-5.6-luna"] },
-                    },
-                  },
-                  wizard: { lastRunVersion: "2026.9.3", lastRunCommand: "doctor" },
+              const nextConfig: OpenClawConfig = {
+                ...(input.sourceConfigBeforeMigrations ?? input.sourceConfig),
+                meta: {
+                  migrations: { modelPolicyAllowlist: true },
+                  lastTouchedVersion: "2026.9.3",
                 },
-                {
-                  baseSnapshot: input,
-                  lastTouchedVersionOverride: "2026.9.3",
-                  skipPluginValidation: true,
+                agents: {
+                  defaults: {
+                    ...authored.agents.defaults,
+                    modelPolicy: { allow: ["openai/gpt-5.6-luna"] },
+                  },
                 },
-              );
+                wizard: { lastRunVersion: "2026.9.3", lastRunCommand: "doctor" },
+              };
+              const writeOptions = {
+                baseSnapshot: input,
+                lastTouchedVersionOverride: "2026.9.3",
+                skipPluginValidation: true,
+              };
+              if (change === "doctor-compensated") {
+                doctorError = await writeWithRefreshFailure(nextConfig, writeOptions, originalRaw);
+              } else {
+                await io.writeConfigFile(nextConfig, writeOptions);
+              }
             }
             if (change === "doctor-capture-edit") {
               operatorEdit();
@@ -468,7 +496,7 @@ describe("verified package rollback", () => {
             await writeUpdatePostInstallDoctorResult({
               resultPath: step.env!.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH!,
               result: {
-                status: "ok",
+                status: doctorError ? "error" : "ok",
                 configHash: capture.hash,
                 ...(change === "doctor-missing-input"
                   ? {}
@@ -481,10 +509,11 @@ describe("verified package rollback", () => {
             command: "doctor",
             cwd: candidateRoot,
             durationMs: 1,
-            exitCode: 0,
+            exitCode: doctorError ? 1 : 0,
+            ...(doctorError ? { stderrTail: doctorError.message } : {}),
           };
         });
-        await packageModule.runPackageUpdateDoctor({
+        const doctorStep = await packageModule.runPackageUpdateDoctor({
           root: candidateRoot,
           timeoutMs: 1_000,
           progress: {},
@@ -493,6 +522,17 @@ describe("verified package rollback", () => {
             activationConfig = snapshot;
           },
         });
+        if (change === "doctor-compensated") {
+          if (!doctorStep) {
+            throw new Error("Doctor compensation did not return an update step");
+          }
+          expect(doctorStep).toMatchObject({
+            exitCode: 1,
+            stderrTail: expect.stringContaining("Doctor runtime activation refused"),
+          });
+          expect(doctorStep.advisory).toBeUndefined();
+          result.steps.push(doctorStep);
+        }
         expect(fs.readFileSync(`${configPath}.pre-update`, "utf8")).toBe(originalRaw);
         const inspected = { ...result, status: "ok" as const };
         expect(
@@ -649,7 +689,12 @@ describe("verified package rollback", () => {
         expect(rollback).toHaveBeenCalledOnce();
         expect(fs.readFileSync(configPath, "utf8")).toBe(originalRaw);
       }
-      if (change === "doctor" || change === "doctor-unchanged" || change === "doctor-include") {
+      if (
+        change === "doctor" ||
+        change === "doctor-unchanged" ||
+        change === "doctor-compensated" ||
+        change === "doctor-include"
+      ) {
         expect(fs.readFileSync(configPath, "utf8")).toBe(originalRaw);
         if (process.platform !== "win32") {
           expect(fs.statSync(configPath).mode & 0o777).toBe(0o600);
@@ -667,12 +712,13 @@ describe("verified package rollback", () => {
           resolveUpdateResultNextAction({ result: outcome.result, env: process.env }),
         ).toContain(configPath);
       }
-      expect(outcome.rolledBack).toBe(restored);
+      expect(outcome.rolledBack, JSON.stringify(outcome)).toBe(restored);
       expect(rollback, JSON.stringify(outcome)).toHaveBeenCalledTimes(
         change === "none" ||
           change === "readonly-config" ||
           change === "doctor" ||
           change === "doctor-unchanged" ||
+          change === "doctor-compensated" ||
           change === "doctor-include" ||
           change === "doctor-restore-edit" ||
           change === "identity-read-failed" ||
@@ -683,7 +729,6 @@ describe("verified package rollback", () => {
       expect(mocks.restart).toHaveBeenCalledTimes(restored ? 1 : 0);
       if (service !== "stopped") {
         expect(mocks.stop).not.toHaveBeenCalled();
-        expect(mocks.reachable).not.toHaveBeenCalled();
         expect(outcome.result).toMatchObject({
           root: previousRoot,
           after: result.before,
@@ -700,8 +745,11 @@ describe("verified package rollback", () => {
         expect(outcome.result).toMatchObject({
           root: previousRoot,
           after: result.before,
-          reason: "version-mismatch",
+          reason: change === "doctor-compensated" ? "doctor-failed" : "version-mismatch",
         });
+        if (change === "doctor-compensated") {
+          expectDoctorRollback(activationConfig, outcome.result, configPath, originalRaw);
+        }
         expect(mocks.stop.mock.invocationCallOrder[0]).toBeLessThan(
           rollback.mock.invocationCallOrder[0]!,
         );
@@ -818,7 +866,7 @@ describe("verified package rollback", () => {
     expect(fs.readFileSync(configPath, "utf8")).toBe(candidate);
   });
 
-  it("leaves a failed rollback's task recovery with finalization", async () => {
+  it("leaves the original task recovery with finalization when rollback is blocked", async () => {
     const complete = vi.fn(async () => {});
     const stopped = {
       stopped: true,
@@ -831,8 +879,6 @@ describe("verified package rollback", () => {
         interrupted: () => false,
       },
     };
-    mocks.stop.mockResolvedValueOnce(stopped);
-    mocks.reachable.mockResolvedValueOnce({ reachable: false });
     const outcome = await rollbackFailedUpdate({
       result: {
         status: "error",
@@ -855,9 +901,12 @@ describe("verified package rollback", () => {
         runtimeInspected: true,
         running: true,
         serviceEnv: { OPENCLAW_STATE_DIR: dirs.make("rollback-finalization-") },
+        windowsTaskAutoStartRecovery: stopped.windowsTaskAutoStartRecovery,
       },
     });
-    expect(outcome).toMatchObject({ rolledBack: false, stoppedForRollback: stopped });
+    expect(outcome).toMatchObject({ rolledBack: false });
+    expect(outcome.stoppedForRollback).toBeUndefined();
+    expect(mocks.stop).not.toHaveBeenCalled();
     expect(complete).not.toHaveBeenCalled();
     expect(mocks.restart).not.toHaveBeenCalled();
   });

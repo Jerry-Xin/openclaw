@@ -16,6 +16,7 @@ import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { runBridgeRequest } from "../code-mode-bridge.js";
 import { createCodeModeCatalogProjection } from "../code-mode-catalog.js";
 import { CodeModeProgramDataInbox } from "../code-mode-program-data.js";
+import { createCodeModeResultsAccess } from "../code-mode-results.js";
 import { resolveCodeModeConfig } from "../code-mode-runtime.js";
 import type { AgentToolResult } from "../runtime/index.js";
 import { compactToolOutputHint } from "../tool-schema-hints.js";
@@ -816,7 +817,8 @@ describe("Code Mode bridge projects the send-budget notice into the guest value"
     // The bridge now settles the guest value through a reply lease and returns
     // void; the projected details are read back via reply.take()/json.
     const id = `bridge-${(bridgeSeq += 1)}`;
-    const inbox = new CodeModeProgramDataInbox(resolveCodeModeConfig({}));
+    const codeModeConfig = resolveCodeModeConfig({});
+    const inbox = new CodeModeProgramDataInbox(codeModeConfig);
     const reply = inbox.createReply(id);
     try {
       await runBridgeRequest({
@@ -826,6 +828,7 @@ describe("Code Mode bridge projects the send-budget notice into the guest value"
         parentToolCallId: "bridge-send-budget",
         codeModeRunId: "cm-send-budget",
         reply,
+        results: createCodeModeResultsAccess({ catalogRef: params.catalogRef }, codeModeConfig),
         remainingMs: 60_000,
         ctx: { catalogRef: params.catalogRef },
         request: {

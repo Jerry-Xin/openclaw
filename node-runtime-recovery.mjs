@@ -151,6 +151,10 @@ export const runRespawnedChild = (command, args, env) => {
   child.once("exit", (code, signal) => {
     detach();
     if (signal) {
+      if (process.platform !== "win32") {
+        process.kill(process.pid, signal);
+        return;
+      }
       const forwardedSignalExitCode =
         !hardKillBackstopStarted && signal === firstForwardedSignal
           ? signal === "SIGINT"
@@ -389,23 +393,23 @@ export function isUsableNode(nodePath, { allowCwd = false, trustedRoot, env = pr
       probeEnv[key] = value;
     }
   }
-  const result = spawnSync(
-    resolved,
-    [
-      "-e",
-      `const probe = ${SQLITE_CAPABILITY_PROBE}; process.stdout.write(JSON.stringify({ version: process.versions.node, probe }));`,
-    ],
-    {
-      encoding: "utf8",
-      env: probeEnv,
-      timeout: 5_000,
-      killSignal: "SIGKILL",
-      maxBuffer: 65_536,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
   try {
+    const result = spawnSync(
+      resolved,
+      [
+        "-e",
+        `const probe = ${SQLITE_CAPABILITY_PROBE}; process.stdout.write(JSON.stringify({ version: process.versions.node, probe }));`,
+      ],
+      {
+        encoding: "utf8",
+        env: probeEnv,
+        timeout: 5_000,
+        killSignal: "SIGKILL",
+        maxBuffer: 65_536,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     const details = JSON.parse(result.stdout);
     return result.status === 0 && !nodeRuntimeFailure(details.version, details.probe);
   } catch {
@@ -653,7 +657,7 @@ export async function recoverNodeRuntime({
     !process.argv[1] ||
     isForegroundGmailRunInvocation(process.argv) ||
     (process.platform !== "win32" && isNativeHookRelayInvocation(process.argv)) ||
-    !nodeRuntimeFailure(process.versions.node, detectCurrentSqliteCapabilities())
+    !nodeRuntimeFailure(process.versions.node, await detectCurrentSqliteCapabilities())
   ) {
     return false;
   }

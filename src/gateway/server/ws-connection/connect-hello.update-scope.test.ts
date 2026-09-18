@@ -121,6 +121,7 @@ function makeContext(role: "operator" | "node", scopes: string[]) {
     },
     configSnapshot: {},
     sendFrame: vi.fn(async () => undefined),
+    onHelloDelivered: vi.fn(),
     pendingNodePairingCleanup: {},
     releasePendingNodePairingCleanup: vi.fn(async () => undefined),
   };
@@ -456,6 +457,8 @@ describe("sendGatewayHello update detail scope", () => {
       GATEWAY_SERVER_CAPS.PROGRESS_CARD_AGENT_SCOPE,
     );
     expect(helloPayload(context)?.features.capabilities).toContain("session-scoped-chat-metadata");
+    expect(helloPayload(context)?.features.capabilities).toContain("session-scoped-model-catalog");
+    expect(helloPayload(context)?.features.capabilities).toContain("profile-binding-v1");
   });
 
   it("reports Gateway build identity separately from configured UI source", async () => {
