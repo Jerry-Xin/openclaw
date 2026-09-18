@@ -9,7 +9,6 @@ import {
 } from "../../infra/diagnostic-events.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import { readConfigMachineState } from "../../state/config-machine-state.js";
 import type { DB as OpenClawStateDatabase } from "../../state/openclaw-state-db.generated.js";
 import {
   openOpenClawStateDatabase,
@@ -17,7 +16,7 @@ import {
   type OpenClawStateDatabaseOptions,
 } from "../../state/openclaw-state-db.js";
 import { normalizeSkillIndexName } from "../discovery/skill-index.js";
-import { readSkillReviewOutcomes } from "./collection-review-state.js";
+import { readSkillCuratorReviewStatus } from "./collection-review-state.js";
 import { parseSkillProposalRow } from "./store-sqlite-record.js";
 import {
   listWritableWorkshopSkillSummaries,
@@ -48,13 +47,7 @@ export function getSkillCuratorStatus(
   options: OpenClawStateDatabaseOptions & { config: OpenClawConfig },
 ): SkillsCuratorLiveStatusResult {
   const { database, kysely } = curatorDb(options);
-  const state = readConfigMachineState<{
-    lastAttemptAtMs: number;
-    lastSuccessAtMs: number | null;
-    lastError: string | null;
-    lastResult: Record<string, unknown>;
-  }>("skills.curatorState", options);
-  const reviewOutcomes = readSkillReviewOutcomes(options);
+  const reviewStatus = readSkillCuratorReviewStatus(options);
   const proposalRows = executeSqliteQuerySync(
     database.db,
     kysely
@@ -124,11 +117,11 @@ export function getSkillCuratorStatus(
   );
   return {
     inventory: "live-workshop",
-    lastAttemptAtMs: state?.lastAttemptAtMs ?? null,
-    lastSuccessAtMs: state?.lastSuccessAtMs ?? null,
-    lastError: state?.lastError ?? null,
-    collectionReview: reviewOutcomes.collectionReviews,
-    experienceReview: reviewOutcomes.experienceReviews,
+    lastAttemptAtMs: reviewStatus.lastAttemptAtMs,
+    lastSuccessAtMs: reviewStatus.lastSuccessAtMs,
+    lastError: reviewStatus.lastError,
+    collectionReview: reviewStatus.collectionReviews,
+    experienceReview: reviewStatus.experienceReviews,
     counts: { active: skills.length, stale: 0, archived: 0 },
     skills,
     overlaps: [],

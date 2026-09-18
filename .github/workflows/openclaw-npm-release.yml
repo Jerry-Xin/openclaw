@@ -29,6 +29,11 @@ on:
         description: Exact successful Full Release Validation run attempt for this tag/SHA
         required: false
         type: string
+      stable_soak_waiver:
+        description: Operator reason for publishing a stable tag from Full Release Validation evidence recorded without soak; leave empty to require soak.
+        required: false
+        default: ""
+        type: string
       release_evidence_mode:
         description: Publication evidence contract
         required: true
@@ -308,6 +313,8 @@ jobs:
           printf '%s' "$RUN_JSON" | DIRECT_RELEASE_RECOVERY="${direct_recovery}" node scripts/validate-release-publish-approval.mjs
 
   publish_openclaw_npm:
+    outputs:
+      stable_soak_waiver: ${{ steps.full_manifest.outputs.stable_soak_waiver }}
     # KEEP THE REAL RELEASE/PUBLISH PATH ON A GITHUB-HOSTED RUNNER.
     # npm trusted publishing + provenance requires this to stay on ubuntu-latest.
     needs: [validate_publish_request]
@@ -864,8 +871,10 @@ jobs:
           echo "tarball_path=$ARTIFACT_TARBALL_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Verify full release validation target
+        id: full_manifest
         if: ${{ inputs.release_evidence_mode == 'full-release-validation' && inputs.full_release_validation_run_id != '' }}
         env:
+          STABLE_SOAK_WAIVER: ${{ inputs.stable_soak_waiver }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_NPM_DIST_TAG: ${{ inputs.npm_dist_tag }}
         run: |
@@ -888,8 +897,16 @@ jobs:
             exit 1
           fi
           if [[ "$RELEASE_TAG" != *"-alpha."* && "$RELEASE_TAG" != *"-beta."* && "$RUN_RELEASE_SOAK" != "true" ]]; then
-            echo "Stable releases require Full Release Validation with runReleaseSoak=true." >&2
-            exit 1
+            if [[ -z "${STABLE_SOAK_WAIVER//[[:space:]]/}" ]]; then
+              echo "Stable releases require Full Release Validation with runReleaseSoak=true." >&2
+              exit 1
+            fi
+            waiver_warning="${STABLE_SOAK_WAIVER//%/%25}"
+            waiver_warning="${waiver_warning//$'\r'/%0D}"
+            waiver_warning="${waiver_warning//$'\n'/%0A}"
+            echo "::warning::Stable soak waived by operator: ${waiver_warning}"
+            echo "stable_soak_waiver=$(jq -cn --arg reason "$STABLE_SOAK_WAIVER" '$reason')" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "- Stable soak waived by operator: ${STABLE_SOAK_WAIVER}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Recheck npm release request

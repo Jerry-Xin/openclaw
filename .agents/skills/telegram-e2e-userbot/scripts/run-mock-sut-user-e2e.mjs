@@ -591,6 +591,7 @@ export async function runCommand(command, args, options) {
     };
     child.once("exit", finish);
     child.once("error", (error) => {
+      child.spawnError = error;
       stderr = `${stderr}${error instanceof Error ? error.message : String(error)}`.slice(
         -1024 * 1024,
       );

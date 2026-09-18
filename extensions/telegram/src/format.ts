@@ -234,14 +234,12 @@ function popLastTagName(tags: string[], name: string): boolean {
   return false;
 }
 
-function isSupportedTelegramHtmlTag(rawTag: string, support: TelegramHtmlTagSupport): boolean {
-  const match = HTML_MODE_TAG_PATTERN.exec(rawTag);
-  if (!match) {
-    return false;
-  }
-  const closing = match[1] === "/";
-  const name = normalizeLowercaseStringOrEmpty(match[2]);
-  const attrs = match[3] ?? "";
+function isSupportedTelegramHtmlTag(
+  closing: boolean,
+  name: string,
+  attrs: string,
+  support: TelegramHtmlTagSupport,
+): boolean {
   if (closing) {
     return attrs.trim() === "" && (support.simpleTags.has(name) || support.attrPatterns.has(name));
   }
@@ -278,7 +276,7 @@ function preserveTelegramHtmlTag(
     }
     return "<code>";
   }
-  if (!isSupportedTelegramHtmlTag(rawTag, support)) {
+  if (!isSupportedTelegramHtmlTag(closing, tagName, attrs, support)) {
     return escapeTag(rawTag);
   }
   if (closing) {

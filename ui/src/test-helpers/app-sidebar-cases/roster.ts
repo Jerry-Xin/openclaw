@@ -329,11 +329,11 @@ describe("AppSidebar agent roster", () => {
     "archived",
     "archived child",
     "child of main",
-    "subagent of main outside the window",
+    "child of main outside the window",
   ])("keeps a directly opened session visible when %s", async (variant) => {
-    const subagent = variant === "subagent of main outside the window";
-    const mainParent = variant === "child of main" || subagent;
-    const key = subagent ? "agent:working:subagent:older" : "agent:working:older";
+    const childOutsideWindow = variant === "child of main outside the window";
+    const mainParent = variant === "child of main" || childOutsideWindow;
+    const key = "agent:working:older";
     const parentKey = mainParent ? "agent:main:main" : "agent:main:parent";
     const current = session("working", 1, {
       key,
@@ -350,7 +350,11 @@ describe("AppSidebar agent roster", () => {
     });
     const bounded = [
       session("main", 10, { key: "agent:main:recent", isMain: false }),
-      ...(variant === "outside the window" ? [] : subagent ? [current] : [current, parent]),
+      ...(variant === "outside the window"
+        ? []
+        : childOutsideWindow
+          ? [current]
+          : [current, parent]),
     ];
     const { sidebar, context } = await mountRoster(roster, bounded, undefined, [current, parent]);
     sidebar.sidebarAgentsMode = "roster";

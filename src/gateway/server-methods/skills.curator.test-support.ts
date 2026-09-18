@@ -58,28 +58,67 @@ export function registerSkillCuratorHandlerSuite({
     return skillFile;
   }
 
-  it("returns the stored review outcomes from curator status", async () => {
-    writeConfigMachineState(
-      "skills.curatorState",
-      {
-        lastAttemptAtMs: 100,
-        lastSuccessAtMs: 100,
-        lastError: null,
-        lastResult: {
-          collectionReviews: { workspace: { attemptedAtMs: 100, succeededAtMs: 101 } },
-          experienceReviews: { workspace: { attemptedAtMs: 102, outcome: "nothing" } },
-        },
-      },
-      { env: getTestState().env },
-    );
-
+  it("returns fresh review metadata and outcomes from curator status", async () => {
     await expect(callHandler("skills.curator.status", {})).resolves.toMatchObject({
       ok: true,
       response: {
-        collectionReview: { workspace: { attemptedAtMs: 100, succeededAtMs: 101 } },
-        experienceReview: { workspace: { attemptedAtMs: 102, outcome: "nothing" } },
+        lastAttemptAtMs: null,
+        lastSuccessAtMs: null,
+        lastError: null,
+        collectionReview: {},
+        experienceReview: {},
       },
     });
+    for (const attemptedAtMs of [100, 200]) {
+      const collectionReviews = { workspace: { attemptedAtMs, succeededAtMs: attemptedAtMs + 1 } };
+      const experienceReviews = {
+        workspace: { attemptedAtMs: attemptedAtMs + 2, outcome: "nothing" },
+      };
+      writeConfigMachineState(
+        "skills.curatorState",
+        {
+          lastAttemptAtMs: attemptedAtMs,
+          lastSuccessAtMs: attemptedAtMs + 1,
+          lastError: "Previous review failed",
+          lastResult: { collectionReviews, experienceReviews },
+        },
+        { env: getTestState().env },
+      );
+      await expect(callHandler("skills.curator.status", {})).resolves.toMatchObject({
+        ok: true,
+        response: {
+          lastAttemptAtMs: attemptedAtMs,
+          lastSuccessAtMs: attemptedAtMs + 1,
+          lastError: "Previous review failed",
+          collectionReview: collectionReviews,
+          experienceReview: experienceReviews,
+        },
+      });
+    }
+  });
+
+  it.each([
+    { name: "invalid JSON", valueJson: "{", updatedAtMs: 100n, error: SyntaxError },
+    { name: "missing lastResult", valueJson: "{}", updatedAtMs: 100n, error: TypeError },
+    {
+      name: "null lastResult",
+      valueJson: '{"lastResult":null}',
+      updatedAtMs: 100n,
+      error: TypeError,
+    },
+    {
+      name: "unsafe timestamp before invalid JSON",
+      valueJson: "{",
+      updatedAtMs: 9223372036854775807n,
+      error: RangeError,
+    },
+  ])("preserves curator state errors for $name", async ({ valueJson, updatedAtMs, error }) => {
+    const { db } = openOpenClawStateDatabase({ env: getTestState().env });
+    db.prepare(
+      "INSERT INTO config_machine_state (state_key, value_json, updated_at_ms) VALUES (?, ?, ?)",
+    ).run("skills.curatorState", valueJson, updatedAtMs);
+
+    await expect(callHandler("skills.curator.status", {})).rejects.toThrow(error);
   });
 
   it("returns live Workshop inventory from current runtime roots without proposal history", async () => {

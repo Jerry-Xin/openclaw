@@ -190,8 +190,6 @@ export type RunEmbeddedAgentParams = {
   requireExplicitMessageTarget?: boolean;
   /** If true, omit the message tool from the tool list. */
   disableMessageTool?: boolean;
-  /** Host-prepared proof that the exact session can request Gateway publication. */
-  githubPublicationAvailable?: boolean;
   swarmCollector?: boolean;
   swarmOutputSchema?: Record<string, unknown>;
   /** Restrict this reconstructed run to restart-safe tools. */
@@ -529,7 +527,6 @@ export type EmbeddedForegroundPromptContext = Pick<
   | "replyToMode"
   | "requireExplicitMessageTarget"
   | "disableMessageTool"
-  | "githubPublicationAvailable"
   | "conversationRecall"
   | "toolOverrides"
   | "permissionMode"
@@ -557,6 +554,8 @@ export type EmbeddedForegroundPromptContext = Pick<
   | "modelThinkingCapability"
   | "modelFallbacksOverride"
 > & {
+  /** SDK observation of the completed attempt; new runs recheck publication availability. */
+  githubPublicationAvailable?: boolean;
   agentId: string;
   workspaceDir: string;
   cwd?: string;

@@ -621,6 +621,8 @@ describe("AppSidebar agent chip", () => {
             kind: "direct",
             label: "Spawned thread",
             updatedAt: 4,
+            hasActiveRun: true,
+            status: "running",
           },
         ],
       },
@@ -631,5 +633,37 @@ describe("AppSidebar agent chip", () => {
     expect(sidebar.querySelector(`[data-session-key="${key}"]`)).toBeNull();
     expect(sidebar.querySelector(`[data-child-session-toggle="${key}"]`)).toBeNull();
     expect(sidebar.querySelector('[data-session-key="agent:main:subagent:thread-a"]')).toBeNull();
+    expect(
+      sidebar.querySelector('.nav-item--home .session-glyph__ring[aria-label="Subagents working"]'),
+    ).not.toBeNull();
+
+    const result = harness.sessions.state.result!;
+    harness.publishList({
+      result: {
+        ...result,
+        ts: 3,
+        sessions: result.sessions.map((row) =>
+          row.key === "agent:main:subagent:thread-a"
+            ? Object.assign({}, row, {
+                hasActiveRun: false,
+                status: "failed",
+                endedAt: 6,
+                updatedAt: 6,
+                lastRunError: "Review failed",
+              })
+            : row,
+        ),
+      },
+    });
+    await sidebar.updateComplete;
+    expect(sidebar.querySelectorAll(".nav-item--home")).toHaveLength(1);
+    expect(sidebar.querySelector(`[data-session-key="${key}"]`)).toBeNull();
+    expect(sidebar.querySelector(".nav-item--home .session-glyph__ring")).toBeNull();
+    expect(
+      sidebar.querySelector('.nav-item--home [data-session-attention="error"]'),
+    ).not.toBeNull();
+    expect(sidebar.querySelector(".nav-item--home")?.textContent).toContain(
+      "Child session Spawned thread failed: Review failed",
+    );
   });
 });

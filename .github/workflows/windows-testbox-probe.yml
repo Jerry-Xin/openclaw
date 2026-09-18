@@ -43,7 +43,7 @@ on:
         default: false
         type: boolean
       installed_startup_package:
-        description: "Optional JSON binding a Package Acceptance run, attempt, workflowSha, artifactId, artifactDigest, packageSha256, and sourceSha"
+        description: "Optional Package Acceptance binding, or {baseline, candidate} bindings for a matched comparison"
         required: false
         default: ""
         type: string
@@ -95,30 +95,41 @@ jobs:
           if ($env:STARTUP_NODE_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw "Installed startup requires an exact Node version." }
           $toolingSha = (git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $toolingSha -cne $env:TARGET_REF) { throw "Tooling checkout differs from target_ref." }
-          $binding = $env:STARTUP_PACKAGE | ConvertFrom-Json
-          foreach ($field in @("runId", "runAttempt", "artifactId")) {
-            if ([string]$binding.$field -notmatch '^[1-9][0-9]*$') { throw "Invalid package identity field: $field" }
+          $selection = $env:STARTUP_PACKAGE | ConvertFrom-Json
+          $paired = $selection.PSObject.Properties.Name -contains "baseline" -or $selection.PSObject.Properties.Name -contains "candidate"
+          $packages = [ordered]@{ baseline = $selection }
+          if ($paired) {
+            if (-not $selection.baseline -or -not $selection.candidate) { throw "Comparison requires both baseline and candidate bindings." }
+            $packages = [ordered]@{ baseline = $selection.baseline; candidate = $selection.candidate }
           }
-          foreach ($field in @("sourceSha", "workflowSha")) {
-            if ([string]$binding.$field -cnotmatch '^[0-9a-f]{40}$') { throw "Invalid package identity field: $field" }
-          }
-          if ($binding.packageSha256 -cnotmatch '^[0-9a-f]{64}$' -or $binding.artifactDigest -cnotmatch '^sha256:[0-9a-f]{64}$') { throw "Invalid package digest." }
-          $producerRaw = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$($binding.runId)"
-          if ($LASTEXITCODE -ne 0) { throw "Cannot inspect package producer." }
-          $producer = ($producerRaw -join "`n") | ConvertFrom-Json
-          if ($producer.run_attempt -ne $binding.runAttempt -or $producer.head_sha -cne $binding.workflowSha -or $producer.conclusion -ne "success" -or $producer.path -ne ".github/workflows/package-acceptance.yml") { throw "Package Acceptance producer does not match the binding." }
-          $artifactRaw = gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$($binding.artifactId)"
-          if ($LASTEXITCODE -ne 0) { throw "Cannot inspect package artifact." }
-          $artifact = ($artifactRaw -join "`n") | ConvertFrom-Json
-          if ($artifact.expired -or $artifact.digest -cne $binding.artifactDigest -or $artifact.workflow_run.id -ne $binding.runId -or $artifact.name -cne "package-under-test-$($binding.runId)-$($binding.runAttempt)") { throw "Package artifact does not match the binding." }
           $evidence = Join-Path $env:GITHUB_WORKSPACE ".artifacts/windows-installed-startup"
           New-Item -ItemType Directory -Path $evidence | Out-Null
-          $binding | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidence "package-binding.json")
-          $producer | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $evidence "producer.json")
-          $artifact | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $evidence "artifact.json")
-          "artifact_id=$($binding.artifactId)" >> $env:GITHUB_OUTPUT
-          "run_id=$($binding.runId)" >> $env:GITHUB_OUTPUT
-          "package_sha256=$($binding.packageSha256)" >> $env:GITHUB_OUTPUT
+          foreach ($arm in $packages.Keys) {
+            $binding = $packages[$arm]
+            foreach ($field in @("runId", "runAttempt", "artifactId")) {
+              if ([string]$binding.$field -notmatch '^[1-9][0-9]*$') { throw "Invalid package identity field: $field" }
+            }
+            foreach ($field in @("sourceSha", "workflowSha")) {
+              if ([string]$binding.$field -cnotmatch '^[0-9a-f]{40}$') { throw "Invalid package identity field: $field" }
+            }
+            if ($binding.packageSha256 -cnotmatch '^[0-9a-f]{64}$' -or $binding.artifactDigest -cnotmatch '^sha256:[0-9a-f]{64}$') { throw "Invalid package digest." }
+            $producerRaw = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$($binding.runId)"
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect package producer." }
+            $producer = ($producerRaw -join "`n") | ConvertFrom-Json
+            if ($producer.run_attempt -ne $binding.runAttempt -or $producer.head_sha -cne $binding.workflowSha -or $producer.conclusion -ne "success" -or $producer.path -ne ".github/workflows/package-acceptance.yml") { throw "Package Acceptance producer does not match the binding." }
+            $artifactRaw = gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$($binding.artifactId)"
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect package artifact." }
+            $artifact = ($artifactRaw -join "`n") | ConvertFrom-Json
+            if ($artifact.expired -or $artifact.digest -cne $binding.artifactDigest -or $artifact.workflow_run.id -ne $binding.runId -or $artifact.name -cne "package-under-test-$($binding.runId)-$($binding.runAttempt)") { throw "Package artifact does not match the binding." }
+            $prefix = if ($paired) { "$arm-" } else { "" }
+            $binding | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidence "${prefix}package-binding.json")
+            $producer | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $evidence "${prefix}producer.json")
+            $artifact | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $evidence "${prefix}artifact.json")
+            $outputPrefix = if ($arm -eq "candidate") { "comparison_" } else { "" }
+            "${outputPrefix}artifact_id=$($binding.artifactId)" >> $env:GITHUB_OUTPUT
+            "${outputPrefix}run_id=$($binding.runId)" >> $env:GITHUB_OUTPUT
+          }
+          $packages | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidence "packages.json")
           "tooling_sha=$toolingSha" >> $env:GITHUB_OUTPUT
 
       - name: Download installed startup package
@@ -129,6 +140,15 @@ jobs:
           run-id: ${{ steps.startup_input.outputs.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/startup-package-input
+
+      - name: Download comparison startup package
+        if: ${{ steps.startup_input.outputs.comparison_artifact_id != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ steps.startup_input.outputs.comparison_artifact_id }}
+          run-id: ${{ steps.startup_input.outputs.comparison_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/startup-package-comparison-input
 
       - name: Probe native Windows
         env:
@@ -350,46 +370,55 @@ jobs:
       - name: Install and bind startup candidate
         if: ${{ inputs.installed_startup_package != '' }}
         env:
-          PACKAGE_SHA256: ${{ steps.startup_input.outputs.package_sha256 }}
           TOOLING_SHA: ${{ steps.startup_input.outputs.tooling_sha }}
           STARTUP_NODE_VERSION: ${{ inputs.startup_node_version }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           $ErrorActionPreference = "Stop"
           $evidence = Join-Path $env:GITHUB_WORKSPACE ".artifacts/windows-installed-startup"
-          $candidateDir = Join-Path $env:RUNNER_TEMP "startup-package-resolved"
-          node --import ./scripts/tsx.mjs scripts/resolve-openclaw-package-candidate.mts --source artifact --artifact-dir (Join-Path $env:RUNNER_TEMP "startup-package-input") --package-sha256 $env:PACKAGE_SHA256 --output-dir $candidateDir --metadata (Join-Path $candidateDir "package-candidate.json")
-          if ($LASTEXITCODE -ne 0) { throw "Canonical package resolution failed." }
-          $candidate = Get-Content -LiteralPath (Join-Path $candidateDir "package-candidate.json") -Raw | ConvertFrom-Json
-          $binding = Get-Content -LiteralPath (Join-Path $evidence "package-binding.json") -Raw | ConvertFrom-Json
-          if ($candidate.packageSourceSha -cne $binding.sourceSha -or $candidate.sha256 -cne $binding.packageSha256) { throw "Resolved source or package bytes differ." }
-          Copy-Item -LiteralPath (Join-Path $candidateDir "package-candidate.json") -Destination (Join-Path $evidence "package-candidate.json")
-          $tarball = (Resolve-Path -LiteralPath $candidate.tarball).Path
-          $installRoot = Join-Path $env:RUNNER_TEMP "startup-package-installed"
-          New-Item -ItemType Directory -Path $installRoot | Out-Null
-          npm install --prefix $installRoot --no-audit --no-fund --ignore-scripts=false $tarball
-          if ($LASTEXITCODE -ne 0) { throw "Normal npm installation failed." }
-          npm rebuild --prefix $installRoot --ignore-scripts=false
-          if ($LASTEXITCODE -ne 0) { throw "Normal npm rebuild failed." }
-          $packageRoot = Join-Path $installRoot "node_modules/openclaw"
-          foreach ($marker in @(".openclaw-lifecycle-pending", "dist/openclaw-install-guard")) {
-            if (Test-Path -LiteralPath (Join-Path $packageRoot $marker)) { throw "Installed lifecycle has not settled: $marker" }
-          }
-          $packageLock = Join-Path $installRoot "package-lock.json"
-          $packageLockHash = (Get-FileHash -LiteralPath $packageLock -Algorithm SHA256).Hash.ToLowerInvariant()
-          Copy-Item -LiteralPath $packageLock -Destination (Join-Path $evidence "installed-package-lock.json")
+          $packages = Get-Content -LiteralPath (Join-Path $evidence "packages.json") -Raw | ConvertFrom-Json -AsHashtable
+          $paired = $packages.Contains("candidate")
+          $records = [ordered]@{}
           $nodePath = (node -p 'process.execPath').Trim()
           $nodeVersion = (node --version).Trim()
           if ($nodeVersion -cne "v$env:STARTUP_NODE_VERSION") { throw "Installed startup Node version differs." }
-          $inputRecord = [ordered]@{
-            sourceSha = $binding.sourceSha; toolingSha = $env:TOOLING_SHA
-            tarball = $tarball; candidate = $candidate; installRoot = $installRoot
-            stateRoot = (Join-Path $env:RUNNER_TEMP "startup-cohort-state")
-            runtime = @{ version = $nodeVersion; sha256 = (Get-FileHash -LiteralPath $nodePath -Algorithm SHA256).Hash.ToLowerInvariant() }
-            artifact = @{ id = $binding.artifactId; runId = $binding.runId; runAttempt = $binding.runAttempt; workflowSha = $binding.workflowSha; digest = $binding.artifactDigest }
+          foreach ($arm in $packages.Keys) {
+            $binding = $packages[$arm]
+            $prefix = if ($paired) { "$arm-" } else { "" }
+            $armRoot = if ($paired) { Join-Path $env:RUNNER_TEMP "startup-comparison/$arm" } else { $env:RUNNER_TEMP }
+            $candidateDir = Join-Path $armRoot "startup-package-resolved"
+            $artifactDir = Join-Path $env:RUNNER_TEMP $(if ($arm -eq "candidate") { "startup-package-comparison-input" } else { "startup-package-input" })
+            node --import ./scripts/tsx.mjs scripts/resolve-openclaw-package-candidate.mts --source artifact --artifact-dir $artifactDir --package-sha256 $binding.packageSha256 --output-dir $candidateDir --metadata (Join-Path $candidateDir "package-candidate.json")
+            if ($LASTEXITCODE -ne 0) { throw "Canonical package resolution failed." }
+            $candidate = Get-Content -LiteralPath (Join-Path $candidateDir "package-candidate.json") -Raw | ConvertFrom-Json
+            if ($candidate.packageSourceSha -cne $binding.sourceSha -or $candidate.sha256 -cne $binding.packageSha256) { throw "Resolved source or package bytes differ." }
+            Copy-Item -LiteralPath (Join-Path $candidateDir "package-candidate.json") -Destination (Join-Path $evidence "${prefix}package-candidate.json")
+            $tarball = (Resolve-Path -LiteralPath $candidate.tarball).Path
+            $installRoot = Join-Path $armRoot "startup-package-installed"
+            New-Item -ItemType Directory -Path $installRoot | Out-Null
+            npm install --prefix $installRoot --no-audit --no-fund --ignore-scripts=false $tarball
+            if ($LASTEXITCODE -ne 0) { throw "Normal npm installation failed." }
+            npm rebuild --prefix $installRoot --ignore-scripts=false
+            if ($LASTEXITCODE -ne 0) { throw "Normal npm rebuild failed." }
+            $packageRoot = Join-Path $installRoot "node_modules/openclaw"
+            foreach ($marker in @(".openclaw-lifecycle-pending", "dist/openclaw-install-guard")) {
+              if (Test-Path -LiteralPath (Join-Path $packageRoot $marker)) { throw "Installed lifecycle has not settled: $marker" }
+            }
+            $packageLock = Join-Path $installRoot "package-lock.json"
+            $packageLockHash = (Get-FileHash -LiteralPath $packageLock -Algorithm SHA256).Hash.ToLowerInvariant()
+            Copy-Item -LiteralPath $packageLock -Destination (Join-Path $evidence "${prefix}installed-package-lock.json")
+            $records[$arm] = [ordered]@{
+              sourceSha = $binding.sourceSha; toolingSha = $env:TOOLING_SHA
+              tarball = $tarball; candidate = $candidate; installRoot = $installRoot
+              stateRoot = (Join-Path $armRoot "startup-cohort-state")
+              runtime = @{ version = $nodeVersion; sha256 = (Get-FileHash -LiteralPath $nodePath -Algorithm SHA256).Hash.ToLowerInvariant() }
+              artifact = @{ id = $binding.artifactId; runId = $binding.runId; runAttempt = $binding.runAttempt; workflowSha = $binding.workflowSha; digest = $binding.artifactDigest }
+            }
+            @{ workflowSha = $env:WORKFLOW_SHA; toolingSha = $env:TOOLING_SHA; packageSourceSha = $binding.sourceSha; installedPackageLockSha256 = $packageLockHash; runner = $env:RUNNER_NAME; node = $nodeVersion; nodePath = $nodePath } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence "${prefix}execution.json")
           }
-          $inputRecord | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidence "input.json")
-          @{ workflowSha = $env:WORKFLOW_SHA; toolingSha = $env:TOOLING_SHA; packageSourceSha = $binding.sourceSha; installedPackageLockSha256 = $packageLockHash; runner = $env:RUNNER_NAME; node = $nodeVersion; nodePath = $nodePath } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence "execution.json")
+          $inputRecord = $records.baseline
+          if ($paired) { $inputRecord.comparison = $records.candidate }
+          $inputRecord | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $evidence "input.json")
 
       - name: Measure installed startup cohort
         if: ${{ inputs.installed_startup_package != '' }}

@@ -256,18 +256,27 @@ export function renderAppSidebarHomeRow(host: AppSidebarRenderHost) {
   const agentId = host.expandedAgentId();
   const mainKey = host.selectedAgentMainSessionKey(agentId);
   const mainRow = host.mainSessionRow(agentId);
-  const attention = host.resolveHomeSessionAttention(mainKey, mainRow);
+  const session = mainRow ? host.projectHomeSession(mainRow, agentId) : null;
+  const attention = session?.attention ?? host.resolveHomeSessionAttention(mainKey, mainRow);
   const attentionLabel = sessionAttentionTooltipLabel(attention);
   const outboxAttentionCount = host.outboxAttentionCountForSession(mainKey);
   const active =
     isSessionRouteId(host.activeRouteId) &&
     areUiSessionKeysEquivalent(host.getRouteSessionKey(), mainKey);
   const hasComposerDraft = host.hasSessionDraft(mainKey);
-  const running = mainRow ? isSessionRunActive(mainRow) : false;
-  const queued = running && mainRow?.status === "queued";
-  const unread = mainRow?.unread === true && !active;
+  const ownRun = mainRow ? isSessionRunActive(mainRow) : false;
+  const subagentsWorking = (session?.runningChildCount ?? 0) > 0;
+  const running = ownRun || subagentsWorking;
+  const queued = ownRun && mainRow?.status === "queued" && !subagentsWorking;
+  const unread = (mainRow?.unread === true || (session?.unreadChildCount ?? 0) > 0) && !active;
   const activeRunLabel = running
-    ? t(queued ? "sessionsView.statusQueued" : "sessionsView.activeRun")
+    ? t(
+        subagentsWorking && (!ownRun || mainRow?.status === "queued")
+          ? "sessionsView.subagentsWorking"
+          : queued
+            ? "sessionsView.statusQueued"
+            : "sessionsView.activeRun",
+      )
     : "";
   const unreadLabel = unread ? t("sessionsView.unread") : "";
   const homeDescription =
@@ -281,6 +290,7 @@ export function renderAppSidebarHomeRow(host: AppSidebarRenderHost) {
         : renderSessionAttentionIcon(attention, true),
     running,
     queued,
+    runningLabel: activeRunLabel,
     badge: unread && !running ? renderSessionUnreadBadge() : nothing,
   });
   return html`

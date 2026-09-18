@@ -7,6 +7,7 @@ import { resolveNodeCompileCacheEnv } from "./node-compile-cache-env.js";
 import { runtimeProcessEntrypoints } from "./runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
 import {
+  assertSqliteWorkerActorReusable,
   captureSqliteWorkerOpen,
   captureSqliteWorkerAdmissionPaths,
   findUnclaimedSharedStateActors,
@@ -159,12 +160,7 @@ export class SqliteWorkerBroker {
       );
     }
     if (actor) {
-      if (actor.slot.failed) {
-        throw actor.slot.failed;
-      }
-      if (actor.moduleUrl !== moduleUrl || actor.inputHash !== inputHash) {
-        throw new Error("SQLite database already belongs to another worker backend");
-      }
+      assertSqliteWorkerActorReusable(actor, moduleUrl, inputHash, options.stateContext);
       actor.references += 1;
     } else {
       const slot = await this.acquireSlot();
@@ -322,13 +318,10 @@ export class SqliteWorkerBroker {
     stateContext?: SqliteWorkerStateContext,
     assertCurrent?: (commandType: PropertyKey) => void,
     createAdmission?: SqliteWorkerAdmissionFactory,
+    requireStateLifecycle = false,
   ): Promise<T> {
-    const client = this.stores.get(store);
-    if (!client || client.sealed || this.draining) {
-      return Promise.reject(new SqliteWorkerError("SQLite worker store is closed", "closed"));
-    }
     return runSqliteWorkerClientOperation(
-      client,
+      this.draining ? undefined : this.stores.get(store),
       operation,
       stateContext,
       (pending) => {
@@ -337,6 +330,7 @@ export class SqliteWorkerBroker {
       },
       assertCurrent,
       createAdmission,
+      requireStateLifecycle,
     );
   }
 
@@ -501,6 +495,7 @@ export class SqliteWorkerBroker {
     }
     const result = createDeferredCore<unknown>();
     const job: Job = {
+      requireStateLifecycle: scope?.requireStateLifecycle,
       maintenanceScope,
       createAdmission,
       assertCurrent,
