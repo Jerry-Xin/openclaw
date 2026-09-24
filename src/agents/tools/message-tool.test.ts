@@ -8,8 +8,6 @@ import type { DecisionReceiptV1 } from "../../../packages/gateway-protocol/src/i
 import { createExecutionIdentityAdmissionToken } from "../../audit/execution-identity-admission.js";
 import { configureMessageActionDecisionSink } from "../../audit/message-action-decision.js";
 import { markInboundContextLabel } from "../../auto-reply/reply/inbound-context-marker.js";
-import type { ChannelMessageAdapterShape } from "../../channels/message/types.js";
-import type { ChannelMessageCapability } from "../../channels/plugins/message-capabilities.js";
 import type { ChannelMessageActionName, ChannelPlugin } from "../../channels/plugins/types.js";
 import {
   mintMessageActionTurnCapability,
@@ -42,7 +40,9 @@ import { createOpenClawTools } from "../openclaw-tools.js";
 import { withGatewayToolCallerIdentity } from "./gateway-caller-context.js";
 import { createMessageTool } from "./message-tool-execution.js";
 import { sanitizeMessageToolVisiblePayload } from "./message-tool-visible-content.js";
+import { createChannelPlugin, type RunMessageActionInput } from "./message-tool.test-support.js";
 import { runSessionsSendA2AFlow } from "./sessions-send-tool.a2a.js";
+import { resetTurnSendLedgerForTest } from "./turn-send-ledger.js";
 
 type CreateMessageTool = typeof createMessageTool;
 
@@ -53,12 +53,6 @@ const EMPTY_PREPARED_MESSAGE_TOOL_CATALOG = {
   channels: [],
   getChannel: () => undefined,
 } as const;
-
-type DescribeMessageTool = NonNullable<
-  NonNullable<ChannelPlugin["actions"]>["describeMessageTool"]
->;
-type MessageToolDiscoveryContext = Parameters<DescribeMessageTool>[0];
-type MessageToolSchema = NonNullable<ReturnType<DescribeMessageTool>>["schema"];
 
 function createTelegramPollExtraToolSchemas() {
   return {
@@ -168,54 +162,6 @@ vi.mock("../../channels/plugins/bundled.js", async () => {
   };
 });
 
-type RunMessageActionInput = {
-  actionOrigin?: "message-tool";
-  agentId?: string;
-  broadcastAccountPlan?: {
-    accountId: string;
-    candidateChannels: string[];
-    secretChannels: string[];
-  };
-  cfg?: unknown;
-  conversationReadOrigin?: "delegated" | "direct-operator";
-  executionIdentityToken?: unknown;
-  defaultAccountId?: string;
-  gateway?: {
-    timeoutMs?: unknown;
-    terminalSourceReplyReceiptOwner?: "caller";
-    resolveAgentRuntimeIdentityToken?: (context?: {
-      sourceReplyFinal?: boolean;
-      sourceReplyToolCallId?: string;
-    }) => Promise<string | undefined>;
-  };
-  params?: Record<string, unknown>;
-  requesterAccountId?: string;
-  requesterSenderId?: string;
-  requesterSenderName?: string;
-  requesterSenderUsername?: string;
-  requesterSenderE164?: string;
-  runId?: string;
-  messageActionAuthorization?: {
-    requesterAccountId?: string;
-    requesterSenderId?: string;
-    toolContext?: RunMessageActionInput["toolContext"];
-  };
-  sandboxRoot?: string;
-  sessionKey?: string;
-  sourceReplyDeliveryMode?: string;
-  sourceReplyFinal?: boolean;
-  sourceReplyToolCallId?: string;
-  inboundAudio?: boolean;
-  toolContext?: {
-    currentChannelId?: string;
-    currentChatType?: string;
-    currentMessagingTarget?: string;
-    currentChannelProvider?: string;
-    currentThreadTs?: string;
-    replyToMode?: string;
-  };
-};
-
 function firstRunMessageActionInput(): RunMessageActionInput | undefined {
   return mocks.runMessageAction.mock.calls[0]?.[0] as RunMessageActionInput | undefined;
 }
@@ -253,6 +199,9 @@ const openClawToolsFactoryMocks = vi.hoisted(() => {
   });
   return {
     tool,
+    // Captures the options createOpenClawTools passes into the conversation tools
+    // so the assembly test can prove runId/session reach conversations_send.
+    conversationSendOptions: [] as Array<Record<string, unknown>>,
   };
 });
 
@@ -291,6 +240,14 @@ vi.mock("../../channels/plugins/message-tool-api.js", () => ({
 
 vi.mock("./agents-list-tool.js", () => ({
   createAgentsListTool: () => openClawToolsFactoryMocks.tool("agents"),
+}));
+vi.mock("./conversation-tools.js", () => ({
+  createConversationsListTool: () => openClawToolsFactoryMocks.tool("conversations_list"),
+  createConversationsSendTool: (options: Record<string, unknown>) => {
+    openClawToolsFactoryMocks.conversationSendOptions.push(options);
+    return openClawToolsFactoryMocks.tool("conversations_send");
+  },
+  createConversationsTurnTool: () => openClawToolsFactoryMocks.tool("conversations_turn"),
 }));
 vi.mock("./cron-tool.js", () => ({
   createCronTool: () => openClawToolsFactoryMocks.tool("cron"),
@@ -416,59 +373,8 @@ afterEach(() => {
   for (const token of mintedTurnCapabilities.splice(0)) {
     revokeMessageActionTurnCapability(token);
   }
+  resetTurnSendLedgerForTest();
 });
-
-function createChannelPlugin(params: {
-  id: string;
-  label: string;
-  docsPath: string;
-  blurb: string;
-  aliases?: string[];
-  actions?: ChannelMessageActionName[];
-  capabilities?: readonly ChannelMessageCapability[];
-  toolSchema?: MessageToolSchema | ((params: MessageToolDiscoveryContext) => MessageToolSchema);
-  describeMessageTool?: DescribeMessageTool;
-  messageActionTargetAliases?: NonNullable<ChannelPlugin["actions"]>["messageActionTargetAliases"];
-  config?: Partial<ChannelPlugin["config"]>;
-  message?: ChannelMessageAdapterShape;
-  messaging?: ChannelPlugin["messaging"];
-  outbound?: ChannelPlugin["outbound"];
-}): ChannelPlugin {
-  return {
-    id: params.id as ChannelPlugin["id"],
-    meta: {
-      id: params.id as ChannelPlugin["id"],
-      label: params.label,
-      selectionLabel: params.label,
-      docsPath: params.docsPath,
-      blurb: params.blurb,
-      aliases: params.aliases,
-    },
-    capabilities: { chatTypes: ["direct", "group"], media: true },
-    config: {
-      listAccountIds: () => ["default"],
-      resolveAccount: () => ({}),
-      ...params.config,
-    },
-    ...(params.message ? { message: params.message } : {}),
-    ...(params.messaging ? { messaging: params.messaging } : {}),
-    ...(params.outbound ? { outbound: params.outbound } : {}),
-    actions: {
-      describeMessageTool:
-        params.describeMessageTool ??
-        ((ctx) => {
-          const schema =
-            typeof params.toolSchema === "function" ? params.toolSchema(ctx) : params.toolSchema;
-          return {
-            actions: params.actions ?? [],
-            capabilities: params.capabilities,
-            ...(schema ? { schema } : {}),
-          };
-        }),
-      messageActionTargetAliases: params.messageActionTargetAliases,
-    },
-  };
-}
 
 function registerMessagingPlugin(id: string, messaging: NonNullable<ChannelPlugin["messaging"]>) {
   setActivePluginRegistry(
@@ -5334,6 +5240,28 @@ describe("message tool sandbox passthrough", () => {
       currentChannelProvider: "discord",
       currentChannelId: "forged-current",
       skipCrossContextDecoration: true,
+    });
+  });
+});
+
+describe("per-turn send budget wiring", () => {
+  it("wires the same run into both message and conversations_send tools", () => {
+    openClawToolsFactoryMocks.conversationSendOptions.length = 0;
+    setActivePluginRegistry(createTestRegistry([]));
+    const tools = createOpenClawTools({
+      agentSessionKey: "agent:main:reef:direct:operator",
+      runId: "run-assembly-1",
+      config: {} as never,
+      agentChannel: "reef",
+    });
+    const names = tools.map((candidate) => candidate.name);
+    expect(names).toContain("message");
+    expect(names).toContain("conversations_send");
+    // conversations_send must receive the same runId so it shares the per-turn
+    // ledger (a module-level map) with the message tool instead of a stale turn.
+    expect(openClawToolsFactoryMocks.conversationSendOptions.at(-1)).toMatchObject({
+      runId: "run-assembly-1",
+      agentSessionKey: "agent:main:reef:direct:operator",
     });
   });
 });

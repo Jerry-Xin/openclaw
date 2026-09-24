@@ -61,7 +61,6 @@ import { hasAgentRosterProperty, resolveAgentWorkspaceDir } from "../agent-scope
 import { resolveAgentDir, resolveSessionAgentIds } from "../agent-scope.js";
 import { hasUsableOAuthCredential } from "../auth-profiles/credential-state.js";
 import { externalCliDiscoveryForProviderAuth } from "../auth-profiles/external-cli-discovery.js";
-import { buildOAuthRefreshFailureLoginCommand } from "../auth-profiles/oauth-refresh-failure.js";
 import { resolveApiKeyForProfile } from "../auth-profiles/oauth.js";
 import { resolveAuthProfileOrder } from "../auth-profiles/order.js";
 import { isSetupCredentialAccessible } from "../auth-profiles/setup-access.js";
@@ -137,6 +136,10 @@ import {
   isWorkspaceBootstrapPending as isWorkspaceBootstrapPendingImpl,
 } from "../workspace.js";
 import { CliAuthProfilePreparationError } from "./auth-profile-preparation-error.js";
+import {
+  buildCliAuthProfileResolutionError,
+  shouldResolveAuthProfileForExecution,
+} from "./auth-profile-resolution.js";
 import { canTransportSystemPrompt, resolveCliBootstrapPromptHash } from "./bootstrap-transport.js";
 import {
   applyClaudeManagedMcpTimeout,
@@ -145,10 +148,7 @@ import {
 import { prepareCliBundleMcpConfig, resolveCliNativeWebSearchEnabled } from "./bundle-mcp.js";
 import { prepareClaudeCliSkillsPlugin } from "./claude-skills-plugin.js";
 import { runCliCleanup } from "./cleanup.js";
-import {
-  resolveBundledCliBackendAuthPolicy,
-  type BundledCliBackendAuthPolicy,
-} from "./cli-backend-auth-policy.js";
+import { resolveBundledCliBackendAuthPolicy } from "./cli-backend-auth-policy.js";
 import { getCliLiveSessionGeneration } from "./cli-live-session-registry.js";
 import { resolveCliSessionId } from "./cli-run-recovery.js";
 import {
@@ -372,58 +372,6 @@ if (process.env.VITEST || process.env.NODE_ENV === "test") {
       setCliRunnerPrepareTestDeps(overrides as Partial<typeof prepareDeps>);
     },
   };
-}
-
-function shouldResolveAuthProfileForExecution(params: {
-  policy?: BundledCliBackendAuthPolicy;
-  authCredential?: AuthProfileCredential;
-}): boolean {
-  if (!params.policy) {
-    return false;
-  }
-  if (!params.authCredential) {
-    return params.policy.strictSelectedProfile;
-  }
-  if (params.authCredential.type === "oauth") {
-    return params.policy.oauthRefreshOwner === "core";
-  }
-  return params.authCredential.type === "api_key" || params.authCredential.type === "token";
-}
-
-type CliAuthProfileResolutionFailure =
-  | { kind: "unmaterialized" }
-  | { kind: "resolved-as-other"; resolvedProfileId: string };
-
-function describeCliAuthProfileResolutionFailure(
-  profileId: string,
-  failure: CliAuthProfileResolutionFailure,
-): string {
-  switch (failure.kind) {
-    case "resolved-as-other":
-      return `selected auth profile "${profileId}" resolved as "${failure.resolvedProfileId}"`;
-    case "unmaterialized":
-      return `could not materialize selected auth profile "${profileId}"`;
-  }
-  return failure satisfies never;
-}
-
-function buildCliAuthProfileResolutionError(params: {
-  backendId: string;
-  profileId: string;
-  provider: string;
-  agentDir: string;
-  failure: CliAuthProfileResolutionFailure;
-}): CliAuthProfilePreparationError {
-  const loginCommand = buildOAuthRefreshFailureLoginCommand(params.provider, {
-    profileId: params.profileId,
-  });
-  const reason = describeCliAuthProfileResolutionFailure(params.profileId, params.failure);
-  return new CliAuthProfilePreparationError({
-    message: `CLI backend "${params.backendId}" ${reason}. Re-authenticate with: ${loginCommand}. OpenClaw did not start the run.`,
-    profileId: params.profileId,
-    provider: params.provider,
-    agentDir: params.agentDir,
-  });
 }
 
 /** Builds the complete context required to execute a CLI-backed agent run. */
@@ -2305,6 +2253,21 @@ async function prepareCliRunContextWithinReadFence(
       ...(promptContext ? { promptContext, promptForHooks } : {}),
       ...(nodeSkillWorkshop ? { nodeSkillWorkshop } : {}),
       ...(openClawHistoryPrompt ? { openClawHistoryPrompt } : {}),
+      // Record the exact ledger slot the loopback send tools write under so the
+      // settlement terminal can delete only that (session, run) pair. runId is
+      // required for a slot to exist; without it no send was keyed to this run.
+      // The loopback tools are granted mcpProjectionContext, whose (agentId,
+      // sessionKey, runId) identity is mcpContextBase; toolsAllow projection never
+      // shifts that key, so mcpContextBase is the authoritative slot identity here.
+      ...(mcpContextBase?.runId
+        ? {
+            turnSendLedgerScope: {
+              agentId: mcpContextBase.agentId,
+              sessionKey: mcpContextBase.sessionKey,
+              runId: mcpContextBase.runId,
+            },
+          }
+        : {}),
     };
   } catch (err) {
     try {
