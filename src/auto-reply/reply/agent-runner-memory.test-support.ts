@@ -152,6 +152,7 @@ export function createMemoryRunEntryMockImplementation(deps: {
           modelRoutingProvenance: options.modelRoutingProvenance,
           contextEngineLogicalTurnLease: {} as never,
           onContextEngineTurnCandidate: () => {},
+          onDeferredTurnSendLedgerScope: () => {},
         }),
     })) as {
       outcome?: "completed" | "exhausted";

@@ -1,20 +1,15 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import type { SourceReplyDeliveryMode } from "../../auto-reply/get-reply-options.types.js";
 import { resolveActiveReplyOperationForSessionId } from "../../auto-reply/reply/reply-run-registry.js";
-import type { ChatType } from "../../channels/chat-type.js";
-import type { InboundEventKind } from "../../channels/inbound-event/kind.js";
-import type { ConversationReadInvocationOrigin } from "../../channels/plugins/conversation-read-origin.js";
-import type { PreparedMessageToolCatalog } from "../../channels/plugins/message-action-discovery.js";
 import { isScheduledMessageWriteAction } from "../../channels/plugins/message-action-dispatch.js";
 import type { ChannelMessageActionName } from "../../channels/plugins/types.public.js";
 import { resolveCommandSecretRefsViaGateway } from "../../cli/command-secret-gateway.js";
 import { getScopedChannelsCommandSecretTargets } from "../../cli/command-secret-targets.js";
 import { resolveMessageSecretScope } from "../../cli/message-secret-scope.js";
 import { getRuntimeConfig } from "../../config/config.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import * as messageActionTurnCapability from "../../gateway/message-action-turn-capability.js";
 import type { MessageActionAuthorization } from "../../gateway/message-action-turn-capability.js";
 import { resolveMessageChannelSelection } from "../../infra/outbound/channel-selection.js";
@@ -34,7 +29,6 @@ import { withPreparedChannelReadAuthority } from "../../shared/channel-read-auth
 import { resolveSessionAgentId } from "../agent-scope.js";
 import * as embeddedMessageDelivery from "../embedded-agent-message-delivery.js";
 import { createSandboxBridgeReadFile } from "../sandbox-media-paths.js";
-import type { SandboxFsBridge } from "../sandbox/fs-bridge.js";
 import { type AnyAgentTool, jsonResult, readToolStringParam } from "./common.js";
 import { captureGatewayToolCallerAssertion } from "./gateway-caller-context.js";
 import {
@@ -49,13 +43,12 @@ import {
   resolveEffectiveCurrentChannelContext,
   resolveMessageToolActionSchemaActions,
 } from "./message-tool-discovery.js";
+import type { MessageToolOptions } from "./message-tool-execution-options.js";
 import { createMessageToolExplicitTargetGuard } from "./message-tool-explicit-target.js";
 import { createMessageToolGateway } from "./message-tool-gateway.js";
 import { prepareMessageToolGroupThread } from "./message-tool-group-thread.js";
-import {
-  buildMessageToolDeliveryFingerprint,
-  normalizeMessageToolIdempotencyKeyPart,
-} from "./message-tool-idempotency.js";
+import { deriveMessageToolIdempotency } from "./message-tool-idempotency.js";
+import { resolveOutboundActionRoute } from "./message-tool-outbound-route.js";
 import {
   projectScheduledMessageActionPartialResult,
   shouldRevalidateCompletedMessageAction,
@@ -71,6 +64,10 @@ import {
 } from "./message-tool-source-policy.js";
 import { createMessageToolTurnAuthority } from "./message-tool-turn-authority.js";
 import {
+  prepareMessageToolTurnSendBudget,
+  resolveTurnSendBudgetContext,
+} from "./message-tool-turn-send-budget.js";
+import {
   hasSanitizedSendPayloadContent,
   sanitizeMessageToolVisiblePayload,
   type VisibleTextSuppressionReason,
@@ -80,50 +77,7 @@ import {
   resolvePollVoteEchoRoute,
   suppressPollVoteEcho,
 } from "./poll-vote-echo.js";
-
-type MessageToolOptions = {
-  agentAccountId?: string;
-  agentSessionKey?: string;
-  runSessionKey?: string;
-  runId?: string;
-  sessionId?: string;
-  agentId?: string;
-  config?: OpenClawConfig;
-  preparedMessageToolCatalog?: PreparedMessageToolCatalog;
-  getRuntimeConfig?: () => OpenClawConfig;
-  admitScheduledInvocation?: () => OpenClawConfig;
-  getScopedChannelsCommandSecretTargets?: typeof getScopedChannelsCommandSecretTargets;
-  resolveCommandSecretRefsViaGateway?: typeof resolveCommandSecretRefsViaGateway;
-  runMessageAction?: typeof runMessageAction;
-  currentChannelId?: string;
-  currentChatType?: ChatType;
-  currentMessagingTarget?: string;
-  messageActionTurnCapability?: string;
-  currentChannelProvider?: string;
-  currentThreadTs?: string;
-  agentThreadId?: string | number;
-  currentMessageId?: string | number;
-  currentInboundAudio?: boolean;
-  hasCurrentInboundAudio?: () => boolean;
-  replyToMode?: "off" | "first" | "all" | "batched";
-  hasRepliedRef?: { value: boolean };
-  sameChannelThreadRequired?: boolean;
-  sandboxRoot?: string;
-  sandboxContainerWorkdir?: string;
-  sandboxFsBridge?: SandboxFsBridge;
-  sandboxReadOnlyResourceMounts?: readonly { hostPath: string; containerPath: string }[];
-  sandboxWorkspaceMediaReadAllowed?: boolean;
-  requireExplicitTarget?: boolean;
-  sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
-  inputProvenance?: import("../../sessions/input-provenance.js").InputProvenance;
-  /** Process-local completion authority: send only to the current source route. */
-  sourceReplyOnly?: boolean;
-  inboundEventKind?: InboundEventKind;
-  requesterSenderId?: string;
-  senderIsOwner?: boolean;
-  conversationReadOrigin?: ConversationReadInvocationOrigin;
-  workspaceDir?: string;
-};
+import { buildTurnSendLedgerSessionKey } from "./turn-send-ledger.js";
 
 export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
   const loadConfigForTool = options?.getRuntimeConfig ?? getRuntimeConfig;
@@ -158,10 +112,9 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           config: options?.config,
         })
       : undefined);
+  const turnSendSessionKey = buildTurnSendLedgerSessionKey(resolvedAgentId, rawPollEchoSessionKey);
   const pollEchoSessionKey =
-    rawPollEchoSessionKey && resolvedAgentId && sourceReplySinkDeliveryMode === "message_tool_only"
-      ? `${resolvedAgentId}\0${rawPollEchoSessionKey}`
-      : undefined;
+    sourceReplySinkDeliveryMode === "message_tool_only" ? turnSendSessionKey : undefined;
   const turnAuthority = createMessageToolTurnAuthority({
     token: options?.messageActionTurnCapability,
     agentId: resolvedAgentId,
@@ -263,7 +216,6 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         action,
         params,
         accountId: requestedAccountId ?? agentAccountId,
-        preparedMessageToolCatalog,
       });
       const decisions = createMessageToolDecisionRecorder({
         actionId: toolCallId,
@@ -446,6 +398,21 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         currentMessagingTarget: effectiveCurrentChannel.currentMessagingTarget,
         preparedMessageToolCatalog,
       });
+      const outboundActionRoute = resolveOutboundActionRoute({
+        action,
+        args: params,
+        channel: scope.channel ?? effectiveCurrentChannel.currentChannelProvider,
+        accountId,
+        currentChannelId: effectiveCurrentChannel.currentChannelId,
+        currentMessagingTarget: effectiveCurrentChannel.currentMessagingTarget,
+      });
+      const budgetContext = resolveTurnSendBudgetContext({
+        action,
+        outboundActionRoute,
+        sessionKey: turnSendSessionKey,
+        runId: options?.runId,
+        isDryRun: Boolean(params.dryRun),
+      });
       if (suppressPollVoteEcho(pollEchoSessionKey, pollVoteEchoRoute, action, params)) {
         decisions.recordPollVoteEchoSuppressed();
         return jsonResult({
@@ -496,24 +463,35 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       if (groupThread.silent) {
         return jsonResult({ status: "suppressed", reason: "silent_reply" });
       }
-      let autogeneratedDeliveryFingerprint: string | undefined;
-      let actionIdempotencyKey = normalizeOptionalString(params.idempotencyKey);
-      if (!actionIdempotencyKey && options?.runId) {
-        autogeneratedDeliveryFingerprint = buildMessageToolDeliveryFingerprint({ action, params });
-        actionIdempotencyKey = failedAutogeneratedIdempotencyKeys.get(
-          autogeneratedDeliveryFingerprint,
-        );
-        if (!actionIdempotencyKey) {
-          const operationId =
-            normalizeMessageToolIdempotencyKeyPart(toolCallId) ??
-            String(++generatedIdempotencyCounter);
-          const runId = normalizeMessageToolIdempotencyKeyPart(options.runId) ?? options.runId;
-          actionIdempotencyKey = `${runId}:message-tool:${autogeneratedDeliveryFingerprint}:${operationId}`;
-        }
-      }
+      const { actionIdempotencyKey, autogeneratedDeliveryFingerprint } =
+        deriveMessageToolIdempotency({
+          action,
+          params,
+          explicitIdempotencyKey: params.idempotencyKey,
+          runId: options?.runId,
+          toolCallId,
+          failedAutogeneratedKeys: failedAutogeneratedIdempotencyKeys,
+          nextOperationId: () => String(++generatedIdempotencyCounter),
+        });
       const actionParams = actionIdempotencyKey
         ? { ...params, idempotencyKey: actionIdempotencyKey }
         : params;
+      const turnSendBudget = prepareMessageToolTurnSendBudget({
+        budgetContext,
+        action,
+        cfg: rawConfig,
+        agentId: resolvedAgentId,
+        gatewayPresent: gateway !== undefined,
+        deliveryChannel: scope.channel ?? effectiveCurrentChannel.currentChannelProvider,
+        actionIdempotencyKey,
+      });
+      if (turnSendBudget.exhaustedMessage) {
+        return jsonResult({
+          status: "suppressed",
+          reason: "turn_send_budget_exhausted",
+          message: turnSendBudget.exhaustedMessage,
+        });
+      }
       const hasExactSourceTurn =
         action === "send" &&
         sourceReplySinkDeliveryMode === "message_tool_only" &&
@@ -590,6 +568,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             if (partialResult) {
               result = partialResult;
             } else {
+              turnSendBudget.release();
               if (autogeneratedDeliveryFingerprint && actionIdempotencyKey) {
                 failedAutogeneratedIdempotencyKeys.set(
                   autogeneratedDeliveryFingerprint,
@@ -678,11 +657,33 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             recordPollVote(pollEchoSessionKey, pollVoteEchoRoute, details?.pollVotedOption);
           }
           const response = toolResult ?? jsonResult(result.payload);
-          const notice =
+          const normalizationNotice =
             result.kind === "send" && !result.dryRun ? result.normalization?.notice : undefined;
+          const deliveryStatus =
+            result.kind === "send" ? result.sendResult?.deliveryStatus : undefined;
+          const landed =
+            result.kind !== "broadcast" &&
+            !result.dryRun &&
+            deliveryStatus !== "suppressed" &&
+            deliveryStatus !== "failed";
+          const turnSendNotice = turnSendBudget.commitAndResolveNotice(landed);
+          const appendedNotices = [normalizationNotice, turnSendNotice].filter(
+            (value): value is string => Boolean(value),
+          );
+          const detailsWithNotice =
+            turnSendNotice && isRecord(response.details)
+              ? { ...response.details, turnSendNotice }
+              : undefined;
           return embeddedMessageDelivery.attachEmbeddedMessageDeliveryFact(
-            notice
-              ? { ...response, content: [...response.content, { type: "text", text: notice }] }
+            appendedNotices.length > 0
+              ? {
+                  ...response,
+                  content: [
+                    ...response.content,
+                    ...appendedNotices.map((text) => ({ type: "text" as const, text })),
+                  ],
+                  ...(detailsWithNotice ? { details: detailsWithNotice } : {}),
+                }
               : response,
             messageDelivery,
           );
