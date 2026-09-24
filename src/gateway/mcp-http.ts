@@ -393,7 +393,8 @@ async function startMcpLoopbackServer(
                     approvalReviewerDeviceId: requestContext.approvalReviewerDeviceId,
                     channelId: requestContext.currentChannelId,
                     turnSourceChannel: requestContext.messageProvider,
-                    turnSourceTo: requestContext.currentChannelId,
+                    turnSourceTo:
+                      requestContext.currentMessagingTarget ?? requestContext.currentChannelId,
                     turnSourceAccountId: requestContext.accountId,
                     turnSourceThreadId: requestContext.currentThreadTs,
                     loopDetection: resolveToolLoopDetectionConfig({
@@ -435,7 +436,8 @@ async function startMcpLoopbackServer(
                       requestContext.cronCreatorCallerOrigin?.kind === "local"
                         ? true
                         : undefined,
-                    turnSourceTo: requestContext.currentChannelId,
+                    turnSourceTo:
+                      requestContext.currentMessagingTarget ?? requestContext.currentChannelId,
                     turnSourceAccountId: requestContext.accountId,
                     turnSourceThreadId: requestContext.currentThreadTs,
                   })
