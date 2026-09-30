@@ -70,6 +70,8 @@ overrides:
   "werift-ice@0.2.2>ip": "npm:neoip@3.1.0"
   ip-address: 10.7.0
   "mailauth@5.0.3>nodemailer": 10.0.8
+  # Mailauth pins a Joi release affected by GHSA-6h2x-m376-mqjq.
+  "mailauth@5.0.3>joi": 18.2.9
   # Mailauth pins vulnerable Undici; remove when its direct dependency is fixed.
   "mailauth@5.0.3>undici": 8.10.2
   "mailparser@3.9.20>nodemailer": 10.0.8
