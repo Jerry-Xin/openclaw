@@ -33,6 +33,8 @@ minimumReleaseAgeExclude:
   - "jszip@3.10.2"
   # GHSA-prgh-xp8r-p3m5 / GHSA-v53p-9fqp-m79j security fixes; remove after 2026-09-18.
   - "nodemailer@10.0.8"
+  # Pinned baseline for the srt-sandbox backend (extensions/srt-sandbox).
+  - "@anthropic-ai/sandbox-runtime@0.0.76"
 
 # Isolated installs let pnpm reuse whole-package APFS clones instead of relinking every file.
 nodeLinker: isolated
@@ -62,12 +64,14 @@ overrides:
   request: "npm:@cypress/request@4.0.1"
   request-promise: "npm:@cypress/request-promise@5.0.0"
   basic-ftp: 6.2.1
-  brace-expansion: 5.0.9
+  brace-expansion: 5.0.12
   file-type: 22.0.2
   form-data: 4.0.6
   "werift-ice@0.2.2>ip": "npm:neoip@3.1.0"
   ip-address: 10.7.0
   "mailauth@5.0.3>nodemailer": 10.0.8
+  # Mailauth pins a Joi release affected by GHSA-6h2x-m376-mqjq.
+  "mailauth@5.0.3>joi": 18.2.9
   # Mailauth pins vulnerable Undici; remove when its direct dependency is fixed.
   "mailauth@5.0.3>undici": 8.10.2
   "mailparser@3.9.20>nodemailer": 10.0.8

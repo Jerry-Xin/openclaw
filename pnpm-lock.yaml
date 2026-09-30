@@ -126,12 +126,13 @@ overrides:
   request: npm:@cypress/request@4.0.1
   request-promise: npm:@cypress/request-promise@5.0.0
   basic-ftp: 6.2.1
-  brace-expansion: 5.0.9
+  brace-expansion: 5.0.12
   file-type: 22.0.2
   form-data: 4.0.6
   werift-ice@0.2.2>ip: npm:neoip@3.1.0
   ip-address: 10.7.0
   mailauth@5.0.3>nodemailer: 10.0.8
+  mailauth@5.0.3>joi: 18.2.9
   mailauth@5.0.3>undici: 8.10.2
   mailparser@3.9.20>nodemailer: 10.0.8
   minimatch: 10.2.6
@@ -1993,6 +1994,19 @@ importers:
         specifier: workspace:*
         version: link:../../packages/plugin-sdk
 
+  extensions/srt-sandbox:
+    dependencies:
+      '@anthropic-ai/sandbox-runtime':
+        specifier: 0.0.76
+        version: 0.0.76
+      zod:
+        specifier: 4.5.4
+        version: 4.5.4
+    devDependencies:
+      '@openclaw/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+
   extensions/stepfun:
     devDependencies:
       '@openclaw/plugin-sdk':
@@ -2834,6 +2848,11 @@ packages:
       '@anthropic-ai/sdk': 0.124.0
       '@modelcontextprotocol/sdk': ^1.29.0
       zod: ^4.0.0
+
+  '@anthropic-ai/sandbox-runtime@0.0.76':
+    resolution: {integrity: sha512-wIC++TvCopRPJcX/v/PCp/SjYOWk/cAVq+VF9v6E3WwkriFP9uu2wvPJ2E+wMrNa3i3h3ew9zTpHcmyGLBKo0w==}
+    engines: {node: '>=20.11.0'}
+    hasBin: true
 
   '@anthropic-ai/sdk@0.124.0':
     resolution: {integrity: sha512-cN5O8i9UVxHeOQAzj/XjshWXG8KiibJDw9OGpH2Z/eR3n/RBxdoLxDJOcfqAJWvjaMDFfHTBADU04hWRJVkDyA==}
@@ -4824,6 +4843,9 @@ packages:
   '@polka/url@1.0.0-next.29':
     resolution: {integrity: sha512-wwQAWhWSuHaag8c4q/KN/vCoeOJYshAIvMQwD4GpSb3OiZklFfvAgmj0VCBBImRpuF/aFgIRzllXlVX93Jevww==}
 
+  '@pondwader/socks5-server@1.0.10':
+    resolution: {integrity: sha512-bQY06wzzR8D2+vVCUoBsr5QS2U6UgPUQRmErNwtsuI6vLcyRKkafjkr3KxbtGFf9aBBIV2mcvlsKD1UYaIV+sg==}
+
   '@postalsys/vmc@1.1.5':
     resolution: {integrity: sha512-WwleGWC51o/VWQFTId6xMiO9aqkIVCM7ODy6UWfzFoQ6UzXewsNrm3ANa4HbBcyYaTK6YPvp4Gt0U+1cXLTbzw==}
 
@@ -6301,8 +6323,8 @@ packages:
   bowser@2.14.1:
     resolution: {integrity: sha512-tzPjzCxygAKWFOJP011oxFHs57HzIhOEracIgAePE4pqB3LikALKnSzUyU4MGs9/iCEUuHlAJTjTc5M+u7YEGg==}
 
-  brace-expansion@5.0.9:
-    resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
+  brace-expansion@5.0.12:
+    resolution: {integrity: sha512-YovQ3rzhaLMIrDjNDMkNS01tea93qhEhG5xy8f6+R0l+dw3Ki+5sCoIoI942iuLZTHWogWktgwVDhU09iNEimQ==}
     engines: {node: 20 || >=22}
 
   braces@3.0.3:
@@ -6456,6 +6478,10 @@ packages:
   command-line-usage@7.0.4:
     resolution: {integrity: sha512-85UdvzTNx/+s5CkSgBm/0hzP80RFHAa7PsfeADE5ezZF3uHz3/Tqj9gIKGT9PTtpycc3Ua64T0oVulGfKxzfqg==}
     engines: {node: '>=12.20.0'}
+
+  commander@12.1.0:
+    resolution: {integrity: sha512-Vw8qHK3bZM9y/P10u3Vib8o/DdkvA2OtPtZvD871QKjy74Wj1WSKFILMPRPSdUSx5RFK1arlJzEtA4PkFgnbuA==}
+    engines: {node: '>=18'}
 
   commander@15.0.0:
     resolution: {integrity: sha512-z67u4ZhzCL/Tydu1lJARtEZYWbWaN7oYLHbsuzocr6y4N6WZAagG3RQ4FW61V1/0+jImpj293XfrcYnd1qxtPg==}
@@ -7591,8 +7617,8 @@ packages:
     resolution: {integrity: sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ==}
     hasBin: true
 
-  joi@18.2.3:
-    resolution: {integrity: sha512-N5A3KTWQpPWT4ExxxPlUx7WmykGXRzhNidWhV41d6Abu9YfI2NyWCJuxdPnslJCPWtbRpSVOWSnSS6GakLM/Rg==}
+  joi@18.2.9:
+    resolution: {integrity: sha512-2mD929bUVKUhOLQQEVhlf6EZ0Mlo0DeRb5MO7cViR9AXLtBauuccEtB1py9Ocxpo/P7ucnh442iY/iOwrh3IQw==}
     engines: {node: '>= 20'}
 
   jose@4.15.9:
@@ -8353,6 +8379,10 @@ packages:
   node-fetch@3.3.2:
     resolution: {integrity: sha512-dRB78srN/l6gqWulah9SrxeYnxeddIG30+GOqK/9OlLVyLg3HPnr6SqOWTWOXKRwC2eGYCkZ59NNuSgvSrpgOA==}
     engines: {node: ^12.20.0 || ^14.13.1 || >=16.0.0}
+
+  node-forge@1.4.0:
+    resolution: {integrity: sha512-LarFH0+6VfriEhqMMcLX2F7SwSXeWwnEAJEsYm5QKWchiVYVvJyV9v7UDvUv+w5HO23ZpQTXDv/GxdDdMyOuoQ==}
+    engines: {node: '>= 6.13.0'}
 
   node-gyp-build@4.8.4:
     resolution: {integrity: sha512-LA4ZjwlnUblHVgq0oBF3Jl/6h/Nvs5fzBLwdEF4nuxnFdsfajde4WfxtJr3CaiH+F6ewcIB/q4jQ4UzPyid+CQ==}
@@ -10031,6 +10061,13 @@ snapshots:
       '@anthropic-ai/claude-agent-sdk-linux-x64-musl': 0.3.257
       '@anthropic-ai/claude-agent-sdk-win32-arm64': 0.3.257
       '@anthropic-ai/claude-agent-sdk-win32-x64': 0.3.257
+
+  '@anthropic-ai/sandbox-runtime@0.0.76':
+    dependencies:
+      '@pondwader/socks5-server': 1.0.10
+      commander: 12.1.0
+      node-forge: 1.4.0
+      zod: 3.25.76
 
   '@anthropic-ai/sdk@0.124.0(zod@4.5.4)':
     dependencies:
@@ -12321,6 +12358,8 @@ snapshots:
 
   '@polka/url@1.0.0-next.29': {}
 
+  '@pondwader/socks5-server@1.0.10': {}
+
   '@postalsys/vmc@1.1.5':
     dependencies:
       '@peculiar/asn1-schema': 2.8.0
@@ -13688,7 +13727,7 @@ snapshots:
 
   bowser@2.14.1: {}
 
-  brace-expansion@5.0.9:
+  brace-expansion@5.0.12:
     dependencies:
       balanced-match: 4.0.4
 
@@ -13847,6 +13886,8 @@ snapshots:
       chalk-template: 0.4.0
       table-layout: 4.1.1
       typical: 7.3.0
+
+  commander@12.1.0: {}
 
   commander@15.0.0: {}
 
@@ -15102,7 +15143,7 @@ snapshots:
 
   jiti@2.7.0: {}
 
-  joi@18.2.3:
+  joi@18.2.9:
     dependencies:
       '@hapi/address': 5.1.1
       '@hapi/formula': 3.0.2
@@ -15534,7 +15575,7 @@ snapshots:
       commander: 15.0.0
       fast-xml-parser: 5.11.1
       ipaddr.js: 2.5.0
-      joi: 18.2.3
+      joi: 18.2.9
       libmime: 5.4.1
       nodemailer: 10.0.8
       punycode.js: 2.3.1
@@ -16032,7 +16073,7 @@ snapshots:
 
   minimatch@10.2.6:
     dependencies:
-      brace-expansion: 5.0.9
+      brace-expansion: 5.0.12
 
   minimist@1.2.8: {}
 
@@ -16135,6 +16176,8 @@ snapshots:
       data-uri-to-buffer: 4.0.1
       fetch-blob: 3.2.0
       formdata-polyfill: 4.0.10
+
+  node-forge@1.4.0: {}
 
   node-gyp-build@4.8.4: {}
 
