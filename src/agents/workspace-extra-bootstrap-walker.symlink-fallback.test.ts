@@ -139,10 +139,9 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
   it.runIf(process.platform !== "win32")(
     "(2) discards a fallback descent whose symlink target escapes the workspace",
     async () => {
-      // Escape discard: descent is now attempted through `linked`, but the shared
-      // realpath-containment filter drops every match whose canonical path leaves
-      // the workspace, so out-of-tree bootstrap content never reaches the prompt and
-      // the resolver does not throw.
+      // Escape discard: `linked` is named literally, but its target leaves the
+      // workspace, so the fallback never descends it — the external tree is not
+      // even listed — and out-of-tree bootstrap content never reaches the prompt.
       const rootDir = await createWorkspaceDir("escape");
       const workspaceDir = path.join(rootDir, "workspace");
       const outsideDir = path.join(rootDir, "outside");
@@ -154,13 +153,22 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
         return;
       }
 
-      await withoutNativeGlobApis(async () => {
-        const { matches } = await resolveExtraBootstrapPatternPaths(
-          workspaceDir,
-          "**/pkg/linked/**/AGENTS.md",
-        );
-        expect(matches).toStrictEqual([]);
-      });
+      const outsideRealpath = await fs.realpath(outsideDir);
+      const readdirSpy = vi.spyOn(fs, "readdir");
+      try {
+        await withoutNativeGlobApis(async () => {
+          const { matches } = await resolveExtraBootstrapPatternPaths(
+            workspaceDir,
+            "**/pkg/linked/**/AGENTS.md",
+          );
+          expect(matches).toStrictEqual([]);
+        });
+        const listedDirs = readdirSpy.mock.calls.map(([dir]) => String(dir));
+        expect(listedDirs.some((dir) => dir.startsWith(path.join(pkgDir, "linked")))).toBe(false);
+        expect(listedDirs.some((dir) => dir.startsWith(outsideRealpath))).toBe(false);
+      } finally {
+        readdirSpy.mockRestore();
+      }
     },
   );
 
@@ -431,10 +439,10 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
   it.runIf(process.platform !== "win32")(
     "(11) discards an escaping symlink descent with path.matchesGlob also absent",
     async () => {
-      // matchesGlob-absent escape: descent through `linked` is attempted (so the
-      // alignment step runs its segment match with path.matchesGlob absent), but the
-      // shared realpath-containment filter drops the out-of-workspace match, so the
-      // resolver returns no match and does not throw once the fix is applied.
+      // matchesGlob-absent escape: the alignment step runs its segment match for
+      // `linked` with path.matchesGlob absent, the containment check refuses to
+      // descend the escaping link, and the resolver returns no match without
+      // throwing.
       const rootDir = await createWorkspaceDir("matchesglob-escape");
       const workspaceDir = path.join(rootDir, "workspace");
       const outsideDir = path.join(rootDir, "outside");
@@ -629,6 +637,35 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback symlink desc
         expect(matches).toStrictEqual(["pkg/core"]);
         expect(matches).toStrictEqual(oracle);
         expect(matches.filter((m) => m === "pkg/core")).toHaveLength(1);
+      });
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "(19) keeps symlink descent scoped to the brace alternative that names the link",
+    async () => {
+      // Node walks each brace alternative with its own state. `pkg/linked/SOUL.md`
+      // names the link literally, but `**/AGENTS.md` never follows it (or enters
+      // `.hidden`), so `pkg/linked/AGENTS.md` must not match through the first
+      // alternative's descent.
+      const workspaceDir = await createWorkspaceDir("brace-scoped-descent");
+      await fs.mkdir(path.join(workspaceDir, ".hidden"), { recursive: true });
+      await fs.mkdir(path.join(workspaceDir, "pkg"), { recursive: true });
+      await fs.writeFile(path.join(workspaceDir, ".hidden", "AGENTS.md"), "hidden", "utf-8");
+      if (
+        !(await trySymlink(path.join("..", ".hidden"), path.join(workspaceDir, "pkg", "linked")))
+      ) {
+        return;
+      }
+
+      const pattern = "{pkg/linked/SOUL.md,**/AGENTS.md}";
+      const oracle = await nodeGlobRelative(workspaceDir, pattern);
+      expect(oracle).not.toContain("pkg/linked/AGENTS.md");
+      await withoutNativeGlobApis(async () => {
+        const matches = (
+          await resolveExtraBootstrapPatternPaths(workspaceDir, pattern)
+        ).matches.toSorted();
+        expect(matches).toStrictEqual(oracle);
       });
     },
   );

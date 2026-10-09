@@ -32,8 +32,8 @@
  *   so `**\/pkg/linked/**\/AGENTS.md` yielded nothing and the configured bootstrap
  *   file was dropped with no operator-visible trace. Loading it here, with fs.glob
  *   absent, is exactly the drop the fix removes. Termination is structural (pattern
- *   progress, never a visited-realpath set), so the escape case below is discarded
- *   by containment, not by refusing to walk the link.
+ *   progress, never a visited-realpath set); the escape case below is discarded by
+ *   a containment check before descent, so the external tree is never listed.
  *
  * Honest limits:
  *   - Directory symlinks may be unconstructible in some sandboxes (EPERM/ENOSYS);
