@@ -1,4 +1,3 @@
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
@@ -64,6 +63,7 @@ import {
 } from "./message-tool-source-policy.js";
 import { createMessageToolTurnAuthority } from "./message-tool-turn-authority.js";
 import {
+  appendMessageToolNotices,
   prepareMessageToolTurnSendBudget,
   resolveTurnSendBudgetContext,
 } from "./message-tool-turn-send-budget.js";
@@ -216,6 +216,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         action,
         params,
         accountId: requestedAccountId ?? agentAccountId,
+        preparedMessageToolCatalog,
       });
       const decisions = createMessageToolDecisionRecorder({
         actionId: toolCallId,
@@ -657,8 +658,6 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             recordPollVote(pollEchoSessionKey, pollVoteEchoRoute, details?.pollVotedOption);
           }
           const response = toolResult ?? jsonResult(result.payload);
-          const normalizationNotice =
-            result.kind === "send" && !result.dryRun ? result.normalization?.notice : undefined;
           const deliveryStatus =
             result.kind === "send" ? result.sendResult?.deliveryStatus : undefined;
           const landed =
@@ -666,25 +665,12 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
             !result.dryRun &&
             deliveryStatus !== "suppressed" &&
             deliveryStatus !== "failed";
-          const turnSendNotice = turnSendBudget.commitAndResolveNotice(landed);
-          const appendedNotices = [normalizationNotice, turnSendNotice].filter(
-            (value): value is string => Boolean(value),
-          );
-          const detailsWithNotice =
-            turnSendNotice && isRecord(response.details)
-              ? { ...response.details, turnSendNotice }
-              : undefined;
           return embeddedMessageDelivery.attachEmbeddedMessageDeliveryFact(
-            appendedNotices.length > 0
-              ? {
-                  ...response,
-                  content: [
-                    ...response.content,
-                    ...appendedNotices.map((text) => ({ type: "text" as const, text })),
-                  ],
-                  ...(detailsWithNotice ? { details: detailsWithNotice } : {}),
-                }
-              : response,
+            appendMessageToolNotices(
+              response,
+              result.kind === "send" && !result.dryRun ? result.normalization?.notice : undefined,
+              turnSendBudget.commitAndResolveNotice(landed),
+            ),
             messageDelivery,
           );
         },
