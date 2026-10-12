@@ -1,6 +1,7 @@
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isEmbeddedMode } from "../../../infra/embedded-mode.js";
+import type { StageTiming } from "../../../shared/stage-timing.js";
 import { buildBootstrapBudgetState, buildBootstrapInjectionStats } from "../../bootstrap-budget.js";
 import {
   hasCompletedBootstrapTurn,
@@ -24,7 +25,7 @@ import {
 import { log } from "../logger.js";
 import { remapInjectedContextFilesToWorkspace } from "./attempt-setup.js";
 import type { EmbeddedAttemptSetup } from "./attempt-setup.js";
-import { measureBootstrapSubstage } from "./attempt-stage-timing.js";
+import { logEmbeddedRunStageSummary, measureBootstrapSubstage } from "./attempt-stage-timing.js";
 import type { EmbeddedRunAttemptBase, EmbeddedRunAttemptParams } from "./types.js";
 
 export async function prepareEmbeddedAttemptBootstrap(params: {
@@ -61,9 +62,13 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
   // Bootstrap-context can stall the event loop; record per-substage timings so a
   // slow run reports where it spent time instead of a single opaque total.
   const bootstrapContextStartedAt = performance.now();
-  const bootstrapContextSubstageTimings: Array<{ name: string; durationMs: number }> = [];
+  const bootstrapContextSubstageTimings: StageTiming[] = [];
   const recordBootstrapContextSubstage = (name: string, durationMs: number) => {
-    bootstrapContextSubstageTimings.push({ name, durationMs: Math.max(0, durationMs) });
+    bootstrapContextSubstageTimings.push({
+      name,
+      durationMs: Math.max(0, Math.round(durationMs)),
+      elapsedMs: Math.max(0, Math.round(performance.now() - bootstrapContextStartedAt)),
+    });
   };
   const resolveWorkspaceBootstrapFiles = (workspaceDir: string) =>
     resolveBootstrapFilesForRunWithTiming({
@@ -174,18 +179,27 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
     deliversCompleteWorkspaceContext &&
     !hookAdjustedBootstrapFiles.some(isUnreadableWorkspaceBootstrapFile) &&
     (bootstrapMode === "full" || effectiveContextInjectionMode === "continuation-skip");
-  const bootstrapContextTotalMs = performance.now() - bootstrapContextStartedAt;
-  if (bootstrapContextTotalMs > 2_000) {
-    const substages =
-      bootstrapContextSubstageTimings.length > 0
-        ? bootstrapContextSubstageTimings
-            .map((stage) => `${stage.name}:${stage.durationMs.toFixed(1)}ms`)
-            .join(",")
-        : "none";
-    log.warn(
-      `[trace:embedded-run] bootstrap-context substages: sessionId=${attempt.sessionId} totalMs=${bootstrapContextTotalMs.toFixed(1)} substages=${substages}`,
-    );
-  }
+  const bootstrapContextTotalMs = Math.max(
+    0,
+    Math.round(performance.now() - bootstrapContextStartedAt),
+  );
+  // The parent stage lets the owner's per-stage threshold flag a slow bootstrap
+  // even when no single substage crosses it.
+  logEmbeddedRunStageSummary(
+    {
+      totalMs: bootstrapContextTotalMs,
+      stages: [
+        ...bootstrapContextSubstageTimings,
+        {
+          name: "bootstrap-context",
+          durationMs: bootstrapContextTotalMs,
+          elapsedMs: bootstrapContextTotalMs,
+        },
+      ],
+    },
+    log,
+    () => `[trace:embedded-run] bootstrap-context substages: sessionId=${attempt.sessionId}`,
+  );
   params.setup.prepStages?.mark("bootstrap-context");
   const injectedContextFiles = bootstrapRouting.includeBootstrapInSystemContext
     ? resolvedContextFiles
