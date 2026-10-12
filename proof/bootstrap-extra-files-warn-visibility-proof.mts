@@ -26,18 +26,21 @@
  *   benign "missing" skips stay at log.debug and stay hidden.
  *
  * PART B — slow bootstrap-context substage breakdown (src/agents/embedded-agent-runner/run/attempt-bootstrap-prepare.ts):
- *   When bootstrap-context assembly exceeds 2000ms the runner now emits the
- *   per-substage breakdown at log.warn (previously log.debug — invisible at the
- *   default info level, so a multi-second stall left no operator trace). This half
- *   drives the REAL prepareEmbeddedAttemptBootstrap over a large on-disk workspace,
- *   with the bundled bootstrap-extra-files hook registered exactly as production
- *   registers it, and REAL time from REAL fs.glob work — no performance.now mock.
- *   Real slowness is produced by a large workspace plus several broad `**` glob
- *   patterns (each a full-tree walk; a legitimate multi-pattern operator config),
- *   so the `hook-overrides` substage alone clears 2s. The captured warn line's
- *   totalMs is the production number the changed code measured, not a harness timer.
- *   A fast control run over a tiny workspace stays under 2s and emits NO such line,
- *   proving the warn is gated on genuine slowness, not always emitted.
+ *   The per-substage breakdown flows through the embedded-run stage-timing owner
+ *   (logEmbeddedRunStageSummary in attempt-stage-timing.ts) with a parent
+ *   `bootstrap-context` stage equal to the total. The owner's default policy
+ *   applies: warn when any stage >= 5000ms (so a bootstrap-context >= 5s always
+ *   warns via its parent stage) or the total >= 10000ms; below that the breakdown
+ *   is trace-only. This half drives the REAL prepareEmbeddedAttemptBootstrap over a
+ *   large on-disk workspace, with the bundled bootstrap-extra-files hook registered
+ *   exactly as production registers it, and REAL time from REAL fs.glob work — no
+ *   performance.now mock. Real slowness is produced by a large workspace plus
+ *   several broad `**` glob patterns (each a full-tree walk; a legitimate
+ *   multi-pattern operator config). The captured warn line's totalMs is the
+ *   production number the changed code measured, not a harness timer. A fast
+ *   control run over a tiny workspace stays under 5s and emits NO line at the
+ *   default info level, while the same run at a raised trace level prints the
+ *   breakdown at trace — proving the warn is gated on genuine slowness.
  *
  * DEFAULT LEVEL: the console level is left to resolve naturally to `info`
  *   (src/logging/console.ts normalizeConsoleLevel default) via a hermetic env
@@ -239,7 +242,7 @@ function makeSlowBootstrapConfig(patterns: string[]): OpenClawConfig {
 // default `contextInjection: "always"` mode the SQLite session-target probe
 // (hasCompletedBootstrapTurn) is never awaited, so no session store is needed —
 // the heavy loaders themselves are the same ones the event-loop proof drives
-// standalone. The changed >2000ms guard runs against real elapsed time here.
+// standalone. The stage-timing owner's thresholds run against real elapsed time here.
 async function runRealBootstrapPrepare(params: {
   workspace: string;
   config: OpenClawConfig;
@@ -285,32 +288,40 @@ async function runRealBootstrapPrepare(params: {
 
 const TRACE_SUBSTAGE_MARKER = "bootstrap-context substages:";
 
-function findTraceSummaryWarn(lines: CapturedLine[]): CapturedLine | undefined {
-  return lines.find((l) => l.sink === "warn" && l.text.includes(TRACE_SUBSTAGE_MARKER));
+function findSubstageSummary(lines: CapturedLine[]): CapturedLine | undefined {
+  return lines.find((l) => l.text.includes(TRACE_SUBSTAGE_MARKER));
 }
 
 function parseTraceTotalMs(text: string): number {
-  const match = text.match(/totalMs=([\d.]+)/u);
+  const match = text.match(/totalMs=(\d+)/u);
   return match ? Number(match[1]) : Number.NaN;
 }
 
-function parseTraceSubstages(text: string): string {
-  const match = text.match(/substages=(\S+)/u);
+function parseTraceStages(text: string): string {
+  const match = text.match(/stages=(\S+)/u);
   return match ? (match[1] ?? "") : "";
 }
 
+// Parent stage the prepare path appends; its duration must equal the total.
+function parseParentStageMs(stages: string): number {
+  const match = stages.match(/(?:^|,)bootstrap-context:(\d+)ms@(\d+)ms(?:,|$)/u);
+  return match ? Number(match[1]) : Number.NaN;
+}
+
 // ---------------------------------------------------------------------------
-// Fixture knobs. Defaults are sized so the real hook-overrides walk clears 2s
-// with margin on the reference host; override via env to retune per machine.
+// Fixture knobs. 300x120 (~36k dirs, ~600 nested AGENTS.md) measured ~4.97s on
+// the reference host, just under the owner's 5s stage threshold; 300x240 doubles
+// the tree so bootstrap-context clears 5s with margin. Override via env to retune
+// per machine.
 // ---------------------------------------------------------------------------
 const SLOW_TOP_DIRS = Number(process.env.PROOF_TOP_DIRS ?? 300);
-const SLOW_SUB_DIRS = Number(process.env.PROOF_SUB_DIRS ?? 120);
+const SLOW_SUB_DIRS = Number(process.env.PROOF_SUB_DIRS ?? 240);
 const SLOW_FILES_PER_LEAF = Number(process.env.PROOF_FILES_PER_LEAF ?? 2);
 const SLOW_AGENTS_EVERY = Number(process.env.PROOF_AGENTS_EVERY ?? 60);
 // One real pattern (has matches, exercises resolve+read) plus several broad
 // globstar patterns that walk the whole tree and match nothing (pure readdir
 // cost, no file reads). Multiple configured extra-bootstrap patterns is a real
-// operator configuration; together they push hook-overrides past 2s honestly.
+// operator configuration; together they push bootstrap-context past 5s honestly.
 const SLOW_PATTERNS = [
   "**/AGENTS.md",
   "**/__deep_scan_a__.md",
@@ -495,6 +506,7 @@ async function main(): Promise<void> {
 
   let slowCapture: CapturedLine[] = [];
   let fastCapture: CapturedLine[] = [];
+  let fastTraceCapture: CapturedLine[] = [];
   let slowWallMs = 0;
   let fastWallMs = 0;
   try {
@@ -507,7 +519,7 @@ async function main(): Promise<void> {
       sessionId: "proof-warmup",
     });
 
-    // Fast control: tiny workspace, single cheap pattern -> under 2s -> no trace warn.
+    // Fast control: tiny workspace, single cheap pattern -> under 5s -> nothing at info.
     process.stderr.write("[part B] fast control run ...\n");
     const fastConfig = makeSlowBootstrapConfig(["**/AGENTS.md"]);
     const fastStart = performance.now();
@@ -521,7 +533,27 @@ async function main(): Promise<void> {
     });
     fastWallMs = performance.now() - fastStart;
 
-    // Headline: large workspace + broad patterns -> real >2s -> trace warn visible.
+    // Same fast run with the console raised to trace: the owner emits the
+    // breakdown at trace level, never warn.
+    loggingState.overrideSettings = {
+      consoleLevel: "trace",
+    } as typeof loggingState.overrideSettings;
+    invalidateConsoleSettingsCache();
+    try {
+      fastTraceCapture = await captureConsole(async () => {
+        await runRealBootstrapPrepare({
+          workspace: fastWs,
+          config: fastConfig,
+          runId: "proof-fast-trace",
+          sessionId: "proof-fast-trace",
+        });
+      });
+    } finally {
+      loggingState.overrideSettings = null;
+      invalidateConsoleSettingsCache();
+    }
+
+    // Headline: large workspace + broad patterns -> real >=5s -> warn visible.
     process.stderr.write("[part B] slow headline run (real fs.glob work) ...\n");
     const slowConfig = makeSlowBootstrapConfig(SLOW_PATTERNS);
     const slowStart = performance.now();
@@ -541,10 +573,13 @@ async function main(): Promise<void> {
     await fsp.rm(cfgHome, { recursive: true, force: true });
   }
 
-  const slowTraceWarn = findTraceSummaryWarn(slowCapture);
+  const slowTraceWarn = findSubstageSummary(slowCapture);
   const slowTotalMs = slowTraceWarn ? parseTraceTotalMs(slowTraceWarn.text) : Number.NaN;
-  const slowSubstages = slowTraceWarn ? parseTraceSubstages(slowTraceWarn.text) : "";
-  const fastTraceWarn = findTraceSummaryWarn(fastCapture);
+  const slowSubstages = slowTraceWarn ? parseTraceStages(slowTraceWarn.text) : "";
+  const slowParentMs = parseParentStageMs(slowSubstages);
+  const fastInfoSummary = findSubstageSummary(fastCapture);
+  const fastTraceSummary = findSubstageSummary(fastTraceCapture);
+  const fastTraceStages = fastTraceSummary ? parseTraceStages(fastTraceSummary.text) : "";
 
   // ---------------------------------------------------------------- report A
   w(
@@ -645,18 +680,19 @@ async function main(): Promise<void> {
     "                 (1 real match pattern + broad globstar walks; a real multi-pattern operator config)",
   );
   w(
-    "threshold:       attempt-bootstrap-prepare.ts emits the substage breakdown at log.warn when totalMs > 2000",
+    "threshold:       logEmbeddedRunStageSummary owner policy: warn when any stage >= 5000ms (parent bootstrap-context",
   );
+  w("                 stage = total) or total >= 10000ms; trace-only below");
   w("");
 
-  w("-- CASE 5: genuinely slow assembly (>2000ms), DEFAULT compact style, DEFAULT info level --");
+  w("-- CASE 5: genuinely slow assembly (>=5000ms), DEFAULT compact style, DEFAULT info level --");
   w(
     "   (the changed log.warn; totalMs below is the PRODUCTION number the code measured, not a harness timer)",
   );
   if (slowTraceWarn) {
     w(`   WARN VISIBLE >>> ${redactWorkspace(slowTraceWarn.text, redactPaths)}`);
     w(
-      `   parsed -> sink=${slowTraceWarn.sink} totalMs=${Number.isFinite(slowTotalMs) ? slowTotalMs.toFixed(1) : "NaN"} substages=${slowSubstages}`,
+      `   parsed -> sink=${slowTraceWarn.sink} totalMs=${slowTotalMs} parentStageMs=${slowParentMs} stages=${slowSubstages}`,
     );
   } else {
     w("   (no bootstrap-context substage warn captured — FAIL)");
@@ -674,13 +710,23 @@ async function main(): Promise<void> {
 
   w("-- CASE 6: FAST CONTROL — tiny workspace, single cheap pattern, DEFAULT info level --");
   w(
-    "   (assembly stays under 2000ms -> NO substage warn -> proves the warn is gated on real slowness)",
+    "   (assembly stays under 5000ms -> NO substage line at info -> proves the warn is gated on real slowness)",
   );
   w(`   wall-clock around the real call:   ${fastWallMs.toFixed(1)}ms`);
-  w(`   bootstrap-context substage warns:  ${fastTraceWarn ? 1 : 0} (expect 0)`);
+  w(`   bootstrap-context substage lines:  ${fastInfoSummary ? 1 : 0} (expect 0)`);
   w(`   total console lines captured:      ${fastCapture.length}`);
   for (const line of fastCapture) {
     w(`     [${line.sink}] ${redactWorkspace(line.text, redactPaths)}`);
+  }
+  w("");
+
+  w("-- CASE 7: CONTRAST ONLY — same fast run, console level raised to trace (NOT the default) --");
+  w("   (the breakdown still exists for fast runs, at trace level and never as a warn)");
+  if (fastTraceSummary) {
+    w(`   TRACE >>> ${redactWorkspace(fastTraceSummary.text, redactPaths)}`);
+    w(`   parsed -> sink=${fastTraceSummary.sink} stages=${fastTraceStages}`);
+  } else {
+    w("   (no bootstrap-context substage trace captured — FAIL)");
   }
   w("");
 
@@ -698,13 +744,17 @@ async function main(): Promise<void> {
   const benignExistsAsDebug = benignDebug.length === 1;
 
   const slowWarnVisible = Boolean(slowTraceWarn) && slowTraceWarn?.sink === "warn";
-  const slowOverThreshold = Number.isFinite(slowTotalMs) && slowTotalMs > 2_000;
+  const slowOverThreshold = Number.isFinite(slowTotalMs) && slowTotalMs >= 5_000;
   const slowHasSubstages =
-    slowSubstages.length > 0 &&
-    slowSubstages !== "none" &&
-    slowSubstages.includes("hook-overrides") &&
-    slowSubstages.includes("automatic-memory-provenance");
-  const fastStaysSilent = !fastTraceWarn;
+    slowSubstages.includes("hook-overrides:") &&
+    slowSubstages.includes("automatic-memory-provenance:") &&
+    slowParentMs === slowTotalMs;
+  const fastStaysSilent = !fastInfoSummary;
+  const fastTraceOnly =
+    fastTraceSummary !== undefined &&
+    fastTraceSummary.sink !== "warn" &&
+    Number.isFinite(parseParentStageMs(fastTraceStages)) &&
+    parseParentStageMs(fastTraceStages) < 5_000;
 
   const partAPass =
     warnVisibleAtInfo &&
@@ -712,15 +762,29 @@ async function main(): Promise<void> {
     extraLoadedAfterFault &&
     noWarnOnBenign &&
     benignExistsAsDebug;
-  const partBPass = slowWarnVisible && slowOverThreshold && slowHasSubstages && fastStaysSilent;
+  const partBPass =
+    slowWarnVisible && slowOverThreshold && slowHasSubstages && fastStaysSilent && fastTraceOnly;
   const pass = partAPass && partBPass;
 
   w("PRE-FIX CONTRAST NOTE:");
-  w("   Previously an operator at the default info console level saw NOTHING for either case — an");
+  w(
+    "   Before this PR an operator at the default info console level saw NOTHING for either case — an",
+  );
   w(
     "   fs.glob failure silently swallowed by the fallback (PART A) and a multi-second bootstrap-context",
   );
   w("   stall with no trace (PART B). The visible warn lines above are this PR's effect.");
+  w("   The prior PART B revision warned independently above 2000ms in its own format");
+  w(
+    "   (`... sessionId=<id> totalMs=<ms.d> substages=<name>:<ms.d>ms,...` — no elapsed, no parent stage)",
+  );
+  w(
+    "   and printed nothing at trace for fast runs; CASE 5 now requires the owner format (pid/threadId,",
+  );
+  w(
+    "   `stages=<name>:<d>ms@<e>ms`, parent bootstrap-context stage) and CASE 7 the trace-only path, so",
+  );
+  w("   that revision fails both.");
   w("");
   w("-- PART A (extra-files glob-failure recovery warn) --");
   w(`  fault warn visible at DEFAULT info level:        ${warnVisibleAtInfo ? "YES" : "NO"}`);
@@ -731,13 +795,14 @@ async function main(): Promise<void> {
   w(`  PART A:                                          ${partAPass ? "PASS" : "FAIL"}`);
   w("-- PART B (slow bootstrap-context summary warn) --");
   w(
-    `  real assembly exceeded 2000ms (production totalMs): ${slowOverThreshold ? `YES (${slowTotalMs.toFixed(1)}ms)` : "NO"}`,
+    `  real assembly reached 5000ms (production totalMs):  ${slowOverThreshold ? `YES (${slowTotalMs}ms)` : `NO (${slowTotalMs}ms)`}`,
   );
   w(`  substage breakdown warn visible at DEFAULT info:    ${slowWarnVisible ? "YES" : "NO"}`);
   w(
-    `  breakdown names substages incl. hook-overrides + provenance: ${slowHasSubstages ? "YES" : "NO"}`,
+    `  breakdown names hook-overrides + provenance + parent stage = total: ${slowHasSubstages ? "YES" : "NO"}`,
   );
-  w(`  fast run (<2s) stays silent (gated on slowness):    ${fastStaysSilent ? "YES" : "NO"}`);
+  w(`  fast run (<5s) silent at DEFAULT info:              ${fastStaysSilent ? "YES" : "NO"}`);
+  w(`  fast run breakdown is trace-only (never warn):      ${fastTraceOnly ? "YES" : "NO"}`);
   w(`  PART B:                                             ${partBPass ? "PASS" : "FAIL"}`);
   w("");
   w(`VERDICT:                                             ${pass ? "PASS" : "FAIL"}`);
