@@ -28,7 +28,7 @@ describe.skipIf(process.platform === "win32")("normal exec lifecycle custody", (
         await expect(
           custody.run(
             { argv: [process.execPath, "-e", "0"], env, stdinMode: "pipe-open" },
-            { timeoutMs: 2000 },
+            { timeoutMs: 2000, maxBufferBytes: 1024 * 1024 },
           ),
         ).rejects.toThrow(/startup|environment/i);
         expect(existsSync(marker)).toBe(false);

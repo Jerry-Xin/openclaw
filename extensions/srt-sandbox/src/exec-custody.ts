@@ -1,10 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
-import {
-  SANDBOX_COMMAND_MAX_BUFFER_BYTES,
-  type SandboxBackendExecSpec,
-} from "openclaw/plugin-sdk/sandbox";
+import type { SandboxBackendExecSpec } from "openclaw/plugin-sdk/sandbox";
 import { resolvePreferredOpenClawTmpDir, tempWorkspaceSync } from "openclaw/plugin-sdk/temp-path";
 
 const SOCKET_ENV = "SRT_CUSTODY_SOCKET";
@@ -118,7 +115,7 @@ export class ExecCustody {
       timeoutMs: number;
       signal?: AbortSignal;
       cleanup?: () => void;
-      maxBufferBytes?: number;
+      maxBufferBytes: number;
     },
   ): Promise<{ stdout: Buffer; stderr: Buffer; code: number; timedOut: boolean }> {
     options.signal?.throwIfAborted();
@@ -137,9 +134,10 @@ export class ExecCustody {
     const abort = () => {
       void prepared.terminate();
     };
-    // Same per-stream capture limit as the container and remote-shell
-    // transports: an overflowing stream kills the command and fails the run.
-    const maxBufferBytes = options.maxBufferBytes ?? SANDBOX_COMMAND_MAX_BUFFER_BYTES;
+    // Per-stream capture limit (callers pass the SDK's shared sandbox limit;
+    // the value import stays out of this module so it loads without the
+    // sandbox barrel). An overflowing stream kills the command and fails the run.
+    const { maxBufferBytes } = options;
     let overflowed: "stdout" | "stderr" | undefined;
     const collect = (stream: "stdout" | "stderr") => {
       const chunks: Buffer[] = [];

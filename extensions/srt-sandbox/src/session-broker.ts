@@ -5,7 +5,11 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
-import { resolvePreferredOpenClawTmpDir, shellEscape } from "openclaw/plugin-sdk/sandbox";
+import {
+  resolvePreferredOpenClawTmpDir,
+  SANDBOX_COMMAND_MAX_BUFFER_BYTES,
+  shellEscape,
+} from "openclaw/plugin-sdk/sandbox";
 import {
   buildBrokerRuntimeConfig,
   sameParentProxy,
@@ -525,6 +529,7 @@ export class SessionBroker {
           timeoutMs,
           signal: params.signal,
           cleanup: command.cleanup,
+          maxBufferBytes: SANDBOX_COMMAND_MAX_BUFFER_BYTES,
         },
       );
     } catch (error) {
