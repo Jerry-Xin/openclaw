@@ -237,7 +237,11 @@ export class SessionBroker {
       }
       rmSync(dir, { recursive: true, force: true });
     };
-    let argv = [this.nodePath, this.srtCliPath, "--settings", settingsPath, "-c", script];
+    // The pinned srt CLI wraps `-c` without a shell argument, so on Linux the
+    // command always starts under bash. Re-exec the configured binShell inside
+    // the sandbox so per-session commands match the ordinary route.
+    const shellScript = `exec ${shellEscape(this.deps.binShell)} -c ${shellEscape(script)}`;
+    let argv = [this.nodePath, this.srtCliPath, "--settings", settingsPath, "-c", shellScript];
     if (process.platform === "darwin") {
       const helper = new URL("./macos-process-custody.js", import.meta.url);
       if (!existsSync(helper)) {

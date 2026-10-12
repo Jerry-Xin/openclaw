@@ -1,4 +1,5 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 // Tests for the per-session network broker (Stage S4-P1).
 //
@@ -21,7 +22,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { buildBrokerRuntimeConfig, sameParentProxy } from "./broker-config.js";
 import { findLinuxProcessByArgv0 } from "./process-proof.test-helpers.js";
 import { isSrtSandboxAvailable } from "./sandbox-availability.test-helpers.js";
@@ -152,6 +153,51 @@ describe("session broker fail-closed + parentProxy guard", () => {
         parentProxy: { http: "http://different" },
       }),
     ).rejects.toBeInstanceOf(SessionBrokerParentProxyError);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("session broker Linux command shell", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("runs per-session commands under the configured binShell", () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    const dir = mkdtempSync(path.join(tmpdir(), "srt-binshell-"));
+    const reaper = new ScopeChildReaper();
+    try {
+      // Stand-in shell that reports how it was invoked instead of running the script.
+      const fakeShell = path.join(dir, "fake-shell");
+      writeFileSync(fakeShell, '#!/bin/sh\nprintf "%s|%s|%s" "$0" "$1" "$2"\n');
+      chmodSync(fakeShell, 0o755);
+      const broker = new SessionBroker({
+        reaper,
+        writableRoots: [],
+        policy: { allowedDomains: [] },
+        cwd: dir,
+        binShell: fakeShell,
+        rpcTimeoutMs: 5_000,
+        srtCliPath: "/opt/srt/cli.js",
+      });
+      const script = `echo "it's $HOME" && setopt NO_NOMATCH`;
+      const prepared = broker.prepareCommand(script, {});
+      try {
+        expect(prepared.argv.slice(1, 3)).toEqual(["/opt/srt/cli.js", "--settings"]);
+        expect(prepared.argv.at(-2)).toBe("-c");
+        // srt 0.0.76 runs the `-c` string under bash inside the sandbox.
+        const result = spawnSync("/bin/bash", ["-c", prepared.argv.at(-1) ?? ""], {
+          encoding: "utf8",
+        });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe(`${fakeShell}|-c|${script}`);
+      } finally {
+        prepared.cleanup();
+        broker.dispose();
+      }
+    } finally {
+      reaper.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
