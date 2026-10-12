@@ -28,7 +28,7 @@ import type {
   SandboxBackendHandle,
   SandboxBackendManager,
 } from "openclaw/plugin-sdk/sandbox";
-import { shellEscape } from "openclaw/plugin-sdk/sandbox";
+import { SANDBOX_COMMAND_MAX_BUFFER_BYTES, shellEscape } from "openclaw/plugin-sdk/sandbox";
 import type { ResolvedSrtPluginConfig } from "./config.js";
 import { assertSrtSandboxAvailable } from "./dependency-probe.js";
 import { ExecCustody } from "./exec-custody.js";
@@ -385,6 +385,7 @@ class SrtSandboxBackend {
         stdin: params.stdin,
         timeoutMs: this.deps.pluginConfig.commandTimeoutMs,
         signal: params.signal,
+        maxBufferBytes: SANDBOX_COMMAND_MAX_BUFFER_BYTES,
       },
     );
     if (!params.allowFailure && result.code !== 0) {
