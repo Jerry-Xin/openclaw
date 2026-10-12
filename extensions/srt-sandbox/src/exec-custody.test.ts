@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { resolvePreferredOpenClawTmpDir, tempWorkspaceSync } from "openclaw/plugin-sdk/temp-path";
 import { describe, expect, it } from "vitest";
@@ -202,6 +202,97 @@ describe.skipIf(process.platform === "win32")("normal exec lifecycle custody", (
         await exited;
       }
     }
+  });
+
+  describe("output capture limit", () => {
+    const limit = 64 * 1024;
+
+    async function expectFloodTerminated(stream: "stdout" | "stderr") {
+      const workspace = tempWorkspaceSync({
+        rootDir: resolvePreferredOpenClawTmpDir(),
+        prefix: "srt-flood-",
+      });
+      const pidFile = workspace.path("pid");
+      const custody = new ExecCustody();
+      let pid = 0;
+      try {
+        const redirect = stream === "stderr" ? " >&2" : "";
+        await expect(
+          custody.run(
+            {
+              argv: ["/bin/sh", "-c", `echo small; echo $$ > '${pidFile}'; exec yes${redirect}`],
+              env: {},
+              stdinMode: "pipe-open",
+            },
+            { timeoutMs: 30_000, maxBufferBytes: limit },
+          ),
+        ).rejects.toThrow(`srt-sandbox command ${stream} exceeded ${limit} bytes`);
+        pid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+        await expect.poll(() => alive(pid), { timeout: 2000 }).toBe(false);
+      } finally {
+        if (pid && alive(pid)) {
+          process.kill(pid, "SIGKILL");
+        }
+        custody.dispose();
+        workspace.cleanup();
+      }
+    }
+
+    it("terminates a command whose stdout exceeds the limit", async () => {
+      await expectFloodTerminated("stdout");
+    });
+
+    it("attributes an stderr flood to stderr while stdout stays small", async () => {
+      await expectFloodTerminated("stderr");
+    });
+
+    it("leaves small output unchanged", async () => {
+      const custody = new ExecCustody();
+      try {
+        const result = await custody.run(
+          {
+            argv: [
+              process.execPath,
+              "-e",
+              "process.stdout.write('out'); process.stderr.write('err')",
+            ],
+            env: {},
+            stdinMode: "pipe-open",
+          },
+          { timeoutMs: 10_000, maxBufferBytes: limit },
+        );
+        expect(result).toMatchObject({ code: 0, timedOut: false });
+        expect(result.stdout.toString()).toBe("out");
+        expect(result.stderr.toString()).toBe("err");
+      } finally {
+        custody.dispose();
+      }
+    });
+
+    it("counts each stream against the limit separately", async () => {
+      const custody = new ExecCustody();
+      const size = limit - 1024;
+      try {
+        // Combined output exceeds the limit; neither stream does on its own.
+        const result = await custody.run(
+          {
+            argv: [
+              process.execPath,
+              "-e",
+              `process.stdout.write('o'.repeat(${size})); process.stderr.write('e'.repeat(${size}))`,
+            ],
+            env: {},
+            stdinMode: "pipe-open",
+          },
+          { timeoutMs: 10_000, maxBufferBytes: limit },
+        );
+        expect(result.code).toBe(0);
+        expect(result.stdout.toString()).toBe("o".repeat(size));
+        expect(result.stderr.toString()).toBe("e".repeat(size));
+      } finally {
+        custody.dispose();
+      }
+    });
   });
 
   it("closes the cancellation-before-native-spawn race", async () => {

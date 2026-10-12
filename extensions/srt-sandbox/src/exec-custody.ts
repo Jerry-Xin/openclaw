@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
-import type { SandboxBackendExecSpec } from "openclaw/plugin-sdk/sandbox";
+import {
+  SANDBOX_COMMAND_MAX_BUFFER_BYTES,
+  type SandboxBackendExecSpec,
+} from "openclaw/plugin-sdk/sandbox";
 import { resolvePreferredOpenClawTmpDir, tempWorkspaceSync } from "openclaw/plugin-sdk/temp-path";
 
 const SOCKET_ENV = "SRT_CUSTODY_SOCKET";
@@ -115,6 +118,7 @@ export class ExecCustody {
       timeoutMs: number;
       signal?: AbortSignal;
       cleanup?: () => void;
+      maxBufferBytes?: number;
     },
   ): Promise<{ stdout: Buffer; stderr: Buffer; code: number; timedOut: boolean }> {
     options.signal?.throwIfAborted();
@@ -130,15 +134,33 @@ export class ExecCustody {
       cwd: wrapped.cwd,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.stdin.on("error", () => {});
-    let timedOut = false;
     const abort = () => {
       void prepared.terminate();
     };
+    // Same per-stream capture limit as the container and remote-shell
+    // transports: an overflowing stream kills the command and fails the run.
+    const maxBufferBytes = options.maxBufferBytes ?? SANDBOX_COMMAND_MAX_BUFFER_BYTES;
+    let overflowed: "stdout" | "stderr" | undefined;
+    const collect = (stream: "stdout" | "stderr") => {
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      child[stream].on("data", (chunk: Buffer) => {
+        bytes += chunk.byteLength;
+        if (bytes > maxBufferBytes) {
+          if (!overflowed) {
+            overflowed = stream;
+            abort();
+          }
+          return;
+        }
+        chunks.push(chunk);
+      });
+      return chunks;
+    };
+    const stdout = collect("stdout");
+    const stderr = collect("stderr");
+    child.stdin.on("error", () => {});
+    let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       abort();
@@ -154,6 +176,9 @@ export class ExecCustody {
         child.stdin.end(options.stdin);
       });
       options.signal?.throwIfAborted();
+      if (overflowed) {
+        throw new Error(`srt-sandbox command ${overflowed} exceeded ${maxBufferBytes} bytes`);
+      }
       return {
         stdout: Buffer.concat(stdout),
         stderr: Buffer.concat(stderr),
