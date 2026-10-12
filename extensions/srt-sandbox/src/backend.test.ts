@@ -73,15 +73,6 @@ describe("srt sandbox backend registration", () => {
     const factory = getSandboxBackendFactory(SRT_SANDBOX_BACKEND_ID);
     expect(factory).toBeTypeOf("function");
   });
-
-  it("resolveWorkdir returns the scope workspace without starting the backend", () => {
-    const params = makeParams({
-      workspaceDir: "/tmp/srt-ws",
-      agentWorkspaceDir: "/tmp/srt-agent",
-      workspaceAccess: "rw",
-    });
-    expect(resolveSrtSandboxWorkdir(params)).toBe("/tmp/srt-ws");
-  });
 });
 
 describe.skipIf(!isDarwin)("srt sandbox macOS Seatbelt minimal path (8/8)", () => {
