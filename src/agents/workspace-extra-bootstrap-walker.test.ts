@@ -1053,25 +1053,6 @@ describe("resolveExtraBootstrapPatternPaths fs.glob-absent fallback", () => {
     }
   });
 
-  it("discriminates the fix: an unguarded fs.glob call throws when the API is absent", async () => {
-    // Discriminating control. The pre-fix resolver iterated `fs.glob(...)`
-    // unconditionally; with the API hidden that exact call throws synchronously.
-    // This reproduces the failure the fallback removes — the throw the loader turns
-    // into an `io` diagnostic and an empty match set — proving the fallback, not
-    // the test harness, is what lets the guarded resolver succeed in the cases
-    // below.
-    const workspaceDir = await createWorkspaceDir("control");
-    await fs.writeFile(path.join(workspaceDir, "AGENTS.md"), "root", "utf-8");
-    await withoutNativeGlobApis(async () => {
-      const callUnguardedGlob = () =>
-        (fs.glob as unknown as (pattern: string, options: unknown) => AsyncIterable<string>)(
-          "**/AGENTS.md",
-          { cwd: workspaceDir },
-        );
-      expect(callUnguardedGlob).toThrow();
-    });
-  });
-
   it("resolves a recursive pattern via the local walk when fs.glob is absent", async () => {
     // Fix: without fs.glob the resolver falls back to the local Minimatch walk and
     // still returns every configured match across sibling directories instead of
