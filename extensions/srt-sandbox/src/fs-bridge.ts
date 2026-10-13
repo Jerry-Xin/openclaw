@@ -374,8 +374,15 @@ class SrtSandboxFsBridge implements SandboxFsBridge {
         clearTimeout(held.timer);
       }
       this.heldPins.delete(plan.pinnedPath);
-      const { result } = await this.client.mutate(held.opId, mutation);
-      return result;
+      try {
+        const { result } = await this.client.mutate(held.opId, mutation);
+        return result;
+      } catch (error) {
+        // The binding is consumed either way. A guarded rejection (e.g. revoked
+        // runtime authority) never reached the owner, so drop its held fds here.
+        await this.client.release(held.opId).catch(() => {});
+        throw error;
+      }
     }
     // Fresh atomic hold+mutate (the production path — no prior resolve). The
     // fds live only for the duration of this single mutation.
