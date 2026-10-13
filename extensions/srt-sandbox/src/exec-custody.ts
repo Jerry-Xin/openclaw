@@ -104,9 +104,16 @@ type Lease = {
   workspace: ReturnType<typeof tempWorkspaceSync>;
 };
 
+export type ExecCustodyDeps = {
+  /** Host runtime authority; throws once the host revokes this runtime. */
+  assertRuntimeCurrent?: () => void;
+};
+
 export class ExecCustody {
   private readonly leases = new Set<Lease>();
   private disposed = false;
+
+  constructor(private readonly deps: ExecCustodyDeps = {}) {}
 
   async run(
     spec: SandboxBackendExecSpec,
@@ -190,10 +197,18 @@ export class ExecCustody {
     }
   }
 
+  /**
+   * Admit a new effect: the scope is live and the host still owns the runtime.
+   * The host's own error propagates unchanged; any throw fails closed. This
+   * only blocks new launches — a command already running when the host revokes
+   * keeps running until the core cancel path or scope disposal terminates it.
+   * Termination, finalization, and disposal never consult it.
+   */
   assertCurrent(): void {
     if (this.disposed) {
       throw new Error("srt-sandbox scope has been torn down; prepared command is stale.");
     }
+    this.deps.assertRuntimeCurrent?.();
   }
 
   prepare(env: Record<string, string>) {
@@ -290,7 +305,11 @@ export class ExecCustody {
       },
       cwd: spec.cwd,
       stdinMode: spec.stdinMode,
-      assertCurrent: () => this.assertCurrent(),
+      // Keep the caller's own admission check alongside the scope authority.
+      assertCurrent: () => {
+        spec.assertCurrent?.();
+        this.assertCurrent();
+      },
       finalizeToken: lease,
     };
   }
