@@ -500,6 +500,37 @@ describe.skipIf(process.platform === "win32")("exec custody runtime authority", 
     }
   });
 
+  it("releases only a lease it opened when a spec build is abandoned", async () => {
+    let current = true;
+    const custody = new ExecCustody({
+      assertRuntimeCurrent: () => {
+        if (!current) {
+          throw new Error("runtime authority revoked");
+        }
+      },
+    });
+    try {
+      const callerEnv = custody.prepare({}).env;
+      const reused = custody.ensurePreparedEnv(callerEnv);
+      const opened = custody.ensurePreparedEnv({});
+      expect(reused.env).toBe(callerEnv);
+      expect(existsSync(opened.env.SRT_CUSTODY_SOCKET!)).toBe(true);
+
+      current = false;
+      await reused.release();
+      await opened.release();
+      expect(existsSync(opened.env.SRT_CUSTODY_SOCKET!)).toBe(false);
+      expect(existsSync(callerEnv.SRT_CUSTODY_SOCKET!)).toBe(true);
+      current = true;
+      // The caller's lease is still live for its own spec.
+      expect(() =>
+        custody.wrap({ argv: ["/bin/true"], env: callerEnv, stdinMode: "pipe-open" }, callerEnv),
+      ).not.toThrow();
+    } finally {
+      custody.dispose();
+    }
+  });
+
   it("keeps terminate, finalize, and dispose working after revocation", async () => {
     let current = true;
     const custody = new ExecCustody({
