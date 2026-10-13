@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import path from "node:path";
 import { resolvePreferredOpenClawTmpDir, tempWorkspaceSync } from "openclaw/plugin-sdk/temp-path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ExecCustody } from "./exec-custody.js";
 
 describe.skipIf(process.platform === "win32")("normal exec lifecycle custody", () => {
@@ -311,6 +312,212 @@ describe.skipIf(process.platform === "win32")("normal exec lifecycle custody", (
     const [code] = (await once(child, "exit")) as [number];
     expect(code).toBe(1);
     await custody.finalize(spec.finalizeToken);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("exec custody runtime authority", () => {
+  /** Authority that throws `revoked` once `calls` checks have passed. */
+  function authorityRevokedAfter(calls: number) {
+    const revoked = new Error("runtime authority revoked");
+    let seen = 0;
+    return {
+      revoked,
+      assertRuntimeCurrent: () => {
+        seen += 1;
+        if (seen > calls) {
+          throw revoked;
+        }
+      },
+    };
+  }
+
+  it("rethrows the host's original error at prepare and wrap", () => {
+    const authority = authorityRevokedAfter(1);
+    const custody = new ExecCustody(authority);
+    try {
+      const env = custody.prepare({}).env;
+      let thrown: unknown;
+      try {
+        custody.wrap({ argv: ["/bin/true"], env, stdinMode: "pipe-open" }, env);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBe(authority.revoked);
+      expect(() => custody.prepare({})).toThrow(authority.revoked);
+    } finally {
+      custody.dispose();
+    }
+  });
+
+  it("fails closed when the authority check throws an unexpected value", async () => {
+    const custody = new ExecCustody({
+      assertRuntimeCurrent: () => {
+        throw new TypeError("authority store unavailable");
+      },
+    });
+    try {
+      await expect(
+        custody.run(
+          { argv: ["/bin/true"], env: {}, stdinMode: "pipe-open" },
+          { timeoutMs: 10_000, maxBufferBytes: 1024 },
+        ),
+      ).rejects.toThrow(TypeError);
+    } finally {
+      custody.dispose();
+    }
+  });
+
+  it("runs both the incoming spec check and the scope authority at deferred admission", () => {
+    let current = true;
+    const revoked = new Error("runtime authority revoked");
+    const custody = new ExecCustody({
+      assertRuntimeCurrent: () => {
+        if (!current) {
+          throw revoked;
+        }
+      },
+    });
+    const callerStale = new Error("caller generation is stale");
+    let callerCurrent = true;
+    const callerCheck = vi.fn(() => {
+      if (!callerCurrent) {
+        throw callerStale;
+      }
+    });
+    const env = custody.prepare({}).env;
+    const spec = custody.wrap(
+      { argv: ["/bin/true"], env, stdinMode: "pipe-open", assertCurrent: callerCheck },
+      env,
+    );
+    try {
+      spec.assertCurrent!();
+      expect(callerCheck).toHaveBeenCalledTimes(1);
+      current = false;
+      expect(() => spec.assertCurrent!()).toThrow(revoked);
+      expect(callerCheck).toHaveBeenCalledTimes(2);
+      current = true;
+      callerCurrent = false;
+      expect(() => spec.assertCurrent!()).toThrow(callerStale);
+    } finally {
+      custody.dispose();
+    }
+  });
+
+  it("rejects at the launch handshake with the original error before the command runs", async () => {
+    const workspace = tempWorkspaceSync({
+      rootDir: resolvePreferredOpenClawTmpDir(),
+      prefix: "srt-authority-handshake-",
+    });
+    const marker = workspace.path("ran");
+    // prepare + wrap admit; the launcher handshake is the first rejected check.
+    const authority = authorityRevokedAfter(2);
+    const custody = new ExecCustody(authority);
+    try {
+      const started = performance.now();
+      let thrown: unknown;
+      try {
+        await custody.run(
+          { argv: ["/bin/sh", "-c", `touch '${marker}'`], env: {}, stdinMode: "pipe-open" },
+          { timeoutMs: 30_000, maxBufferBytes: 1024 },
+        );
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBe(authority.revoked);
+      // Immediate rejection, not a timeout-driven one.
+      expect(performance.now() - started).toBeLessThan(5_000);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      custody.dispose();
+      workspace.cleanup();
+    }
+  });
+
+  it("cancels the lease and closes the launcher socket on handshake rejection", async () => {
+    let current = true;
+    const custody = new ExecCustody({
+      assertRuntimeCurrent: () => {
+        if (!current) {
+          throw new Error("runtime authority revoked");
+        }
+      },
+    });
+    const prepared = custody.prepare({});
+    const spec = custody.wrap(
+      {
+        argv: [process.execPath, "-e", "process.exit(0)"],
+        env: prepared.env,
+        stdinMode: "pipe-open",
+      },
+      prepared.env,
+    );
+    current = false;
+    try {
+      const child = spawn(spec.argv[0]!, spec.argv.slice(1), { env: spec.env, stdio: "ignore" });
+      const [code] = (await once(child, "exit")) as [number];
+      expect(code).toBe(1);
+      // A replayed handshake on the cancelled lease is closed without "ready",
+      // even once authority is restored.
+      current = true;
+      const socket = createConnection(spec.env.SRT_CUSTODY_SOCKET!);
+      let received = "";
+      socket.on("data", (chunk) => {
+        received += chunk.toString();
+      });
+      socket.on("error", () => {});
+      socket.once("connect", () => socket.write(`${spec.env.SRT_CUSTODY_TOKEN}\n`));
+      await once(socket, "close");
+      expect(received).toBe("");
+    } finally {
+      custody.dispose();
+      await custody.finalize(spec.finalizeToken);
+    }
+  });
+
+  it("still terminates an overflowing command after authority is revoked mid-run", async () => {
+    // prepare + wrap + handshake admit; the run is in flight when authority goes.
+    const authority = authorityRevokedAfter(3);
+    const limit = 1024;
+    const custody = new ExecCustody(authority);
+    try {
+      await expect(
+        custody.run(
+          {
+            argv: [
+              process.execPath,
+              "-e",
+              "setTimeout(()=>process.stdout.write('x'.repeat(65536)),50); setInterval(()=>{},1000)",
+            ],
+            env: {},
+            stdinMode: "pipe-open",
+          },
+          { timeoutMs: 30_000, maxBufferBytes: limit },
+        ),
+      ).rejects.toThrow(`srt-sandbox command stdout exceeded ${limit} bytes`);
+      expect(() => custody.assertCurrent()).toThrow(authority.revoked);
+    } finally {
+      custody.dispose();
+    }
+  });
+
+  it("keeps terminate, finalize, and dispose working after revocation", async () => {
+    let current = true;
+    const custody = new ExecCustody({
+      assertRuntimeCurrent: () => {
+        if (!current) {
+          throw new Error("runtime authority revoked");
+        }
+      },
+    });
+    const prepared = custody.prepare({});
+    const spec = custody.wrap(
+      { argv: ["/bin/true"], env: prepared.env, stdinMode: "pipe-open" },
+      prepared.env,
+    );
+    current = false;
+    await expect(prepared.terminate()).resolves.toBeUndefined();
+    await expect(custody.finalize(spec.finalizeToken)).resolves.toBeUndefined();
+    expect(() => custody.dispose()).not.toThrow();
   });
 });
 

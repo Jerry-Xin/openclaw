@@ -156,6 +156,57 @@ describe("session broker fail-closed + parentProxy guard", () => {
   });
 });
 
+describe("session broker runtime authority", () => {
+  const reapers: ScopeChildReaper[] = [];
+  const brokers: SessionBroker[] = [];
+  afterEach(() => {
+    vi.restoreAllMocks();
+    while (brokers.length) {
+      brokers.pop()?.dispose();
+    }
+    while (reapers.length) {
+      reapers.pop()?.dispose();
+    }
+  });
+
+  function makeRevokedBroker() {
+    const revoked = new Error("runtime authority revoked");
+    const reaper = new ScopeChildReaper();
+    reapers.push(reaper);
+    const spawnBroker = vi.spyOn(reaper, "spawnBroker");
+    const broker = new SessionBroker({
+      reaper,
+      writableRoots: [],
+      policy: { allowedDomains: ["a.example"] },
+      cwd: process.cwd(),
+      binShell: "/bin/bash",
+      rpcTimeoutMs: 5_000,
+      srtCliPath: "/nonexistent/srt-cli-does-not-exist.js",
+      assertRuntimeCurrent: () => {
+        throw revoked;
+      },
+    });
+    brokers.push(broker);
+    return { broker, revoked, spawnBroker };
+  }
+
+  it("rejects startup, health, policy, and command writes with the host's original error", async () => {
+    const { broker, revoked, spawnBroker } = makeRevokedBroker();
+    await expect(broker.exec({ script: "echo hi" })).rejects.toBe(revoked);
+    await expect(broker.ping()).rejects.toBe(revoked);
+    await expect(broker.setAllowedDomains(["b.example"])).rejects.toBe(revoked);
+    expect(() => broker.prepareCommand("echo hi", {})).toThrow(revoked);
+    expect(spawnBroker).not.toHaveBeenCalled();
+    expect(broker.currentAllowedDomains).toEqual(["a.example"]);
+  });
+
+  it("keeps dispose working after revocation", () => {
+    const { broker } = makeRevokedBroker();
+    expect(() => broker.dispose()).not.toThrow();
+    expect(broker.isRunning).toBe(false);
+  });
+});
+
 describe.skipIf(process.platform === "win32")("session broker Linux command shell", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -485,6 +536,53 @@ describe.skipIf(!isLive)("session broker — live per-session network isolation 
       expect(settled.procs).toBeLessThanOrEqual(baseline.procs);
       expect(settled.socat).toBeLessThanOrEqual(baseline.socat);
       expect(settled.bwrap).toBeLessThanOrEqual(baseline.bwrap);
+    },
+    LIVE_TIMEOUT,
+  );
+});
+
+describe.skipIf(!isLive)("session broker — live runtime authority", () => {
+  it(
+    "rechecks authority after broker startup before running the command",
+    async () => {
+      const writable = mkdtempSync(path.join(tmpdir(), "srt-broker-authority-"));
+      const marker = path.join(writable, "ran");
+      const revoked = new Error("runtime authority revoked");
+      let current = true;
+      const reaper = new ScopeChildReaper();
+      const broker = new SessionBroker({
+        reaper,
+        writableRoots: [writable],
+        policy: { allowedDomains: [] },
+        cwd: process.cwd(),
+        binShell: "/bin/bash",
+        rpcTimeoutMs: 30_000,
+        readyTimeoutMs: 20_000,
+        assertRuntimeCurrent: () => {
+          if (!current) {
+            throw revoked;
+          }
+        },
+      });
+      try {
+        const running = broker.exec({ script: `touch ${JSON.stringify(marker)}` });
+        // Revoke while the broker's startup health-check is still awaited.
+        current = false;
+        await expect(running).rejects.toBe(revoked);
+        expect(existsSync(marker)).toBe(false);
+        expect(broker.isRunning).toBe(true);
+        current = true;
+        const pong = await broker.ping();
+        expect(pong.pid).toBeGreaterThan(0);
+        current = false;
+        await expect(broker.ping()).rejects.toBe(revoked);
+        await expect(broker.setAllowedDomains(["b.example"])).rejects.toBe(revoked);
+        expect(broker.currentAllowedDomains).toEqual([]);
+      } finally {
+        broker.dispose();
+        reaper.dispose();
+        rmSync(writable, { recursive: true, force: true });
+      }
     },
     LIVE_TIMEOUT,
   );
