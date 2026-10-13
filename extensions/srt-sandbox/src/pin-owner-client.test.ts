@@ -6,7 +6,7 @@
 // end-to-end enforcement in backend.bridge.test.ts.
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PinOwnerClient, PinOwnerDeadError, PinOwnerError } from "./pin-owner-client.js";
 import { PIN_OWNER_PYTHON } from "./pin-owner-source.js";
 import type { PersistentChildHandle } from "./scope-reaper.js";
@@ -128,5 +128,91 @@ describe("PinOwnerClient transport", () => {
     await client.ping();
     client.dispose();
     await expect(client.ping()).rejects.toBeInstanceOf(PinOwnerDeadError);
+  });
+});
+
+describe("PinOwnerClient runtime authority", () => {
+  let client: PinOwnerClient | undefined;
+
+  afterEach(() => {
+    client?.dispose();
+    client = undefined;
+  });
+
+  function ownerWrites(owner: FakeOwner): string[] {
+    return (owner.handle.stdin as unknown as { writes: string[] }).writes;
+  }
+
+  it("rejects a guarded RPC with the host's original error before spawning or writing", async () => {
+    const revoked = new Error("runtime authority revoked");
+    const fake = spawnFakeOwner();
+    const spawnOwner = vi.fn(() => Promise.resolve(fake.handle));
+    client = new PinOwnerClient({
+      spawnOwner,
+      rpcTimeoutMs: 5000,
+      assertRuntimeCurrent: () => {
+        throw revoked;
+      },
+    });
+    await expect(client.mutate(1, { kind: "write", data: Buffer.from("x") })).rejects.toBe(revoked);
+    expect(spawnOwner).not.toHaveBeenCalled();
+    expect(ownerWrites(fake)).toEqual([]);
+  });
+
+  it("rechecks authority after awaiting owner preparation", async () => {
+    const revoked = new Error("runtime authority revoked");
+    let current = true;
+    const fake = spawnFakeOwner();
+    client = new PinOwnerClient({
+      spawnOwner: async () => {
+        // The host revokes while the owner is being prepared.
+        current = false;
+        return fake.handle;
+      },
+      rpcTimeoutMs: 5000,
+      assertRuntimeCurrent: () => {
+        if (!current) {
+          throw revoked;
+        }
+      },
+    });
+    const started = performance.now();
+    await expect(
+      client.resolvePin(1, { root: "/ws", rel: "", leaf: "f", mode: "file" }),
+    ).rejects.toBe(revoked);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(ownerWrites(fake)).toEqual([]);
+  });
+
+  it("still releases held pins after revocation, without spawning an owner for it", async () => {
+    let current = true;
+    const fake = spawnFakeOwner();
+    const spawnOwner = vi.fn(() => Promise.resolve(fake.handle));
+    client = new PinOwnerClient({
+      spawnOwner,
+      rpcTimeoutMs: 5000,
+      assertRuntimeCurrent: () => {
+        if (!current) {
+          throw new Error("runtime authority revoked");
+        }
+      },
+    });
+    // No owner yet: nothing is held, so release is a no-op rather than a spawn.
+    current = false;
+    await client.release(7);
+    expect(spawnOwner).not.toHaveBeenCalled();
+
+    current = true;
+    const pinned = client.resolvePin(7, { root: "/ws", rel: "", leaf: "f", mode: "file" });
+    await vi.waitFor(() => expect(ownerWrites(fake)).toHaveLength(1));
+    fake.handle.stdout.emit("data", `${JSON.stringify({ id: 1, ok: true, depth: 1 })}\n`);
+    await pinned;
+
+    current = false;
+    const released = client.release(7);
+    await vi.waitFor(() => expect(ownerWrites(fake)).toHaveLength(2));
+    expect(JSON.parse(ownerWrites(fake)[1]!)).toMatchObject({ op: "release", opId: 7 });
+    fake.handle.stdout.emit("data", `${JSON.stringify({ id: 2, ok: true })}\n`);
+    await expect(released).resolves.toBeUndefined();
   });
 });

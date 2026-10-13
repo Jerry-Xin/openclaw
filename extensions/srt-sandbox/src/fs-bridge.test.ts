@@ -58,7 +58,7 @@ function makeContext(ws: string, agent: string): SandboxFsBridgeContext {
   } as SandboxFsBridgeContext;
 }
 
-function makeFixture(limits = {}): Fixture {
+function makeFixture(limits = {}, assertRuntimeCurrent?: () => void): Fixture {
   const ws = mkdtempSync(path.join(tmpdir(), "srt-bridge-ws-"));
   const agent = mkdtempSync(path.join(tmpdir(), "srt-bridge-agent-"));
   const client = new PinOwnerClient({
@@ -67,6 +67,7 @@ function makeFixture(limits = {}): Fixture {
       return Promise.resolve({ child, stdin: child.stdin, stdout: child.stdout });
     },
     rpcTimeoutMs: 10_000,
+    assertRuntimeCurrent,
   });
   const bridge = createSrtFsBridge({
     sandbox: makeContext(ws, agent),
@@ -78,8 +79,8 @@ function makeFixture(limits = {}): Fixture {
 }
 
 const fixtures: Fixture[] = [];
-function make(limits = {}): Fixture {
-  const fixture = makeFixture(limits);
+function make(limits = {}, assertRuntimeCurrent?: () => void): Fixture {
+  const fixture = makeFixture(limits, assertRuntimeCurrent);
   fixtures.push(fixture);
   return fixture;
 }
@@ -472,5 +473,53 @@ describe("srt fs bridge — held-pin lifecycle (no fd leak on any path)", () => 
     const f = make();
     f.bridge.dispose();
     await expect(f.bridge.writeFile({ filePath: "x.txt", data: "x" })).rejects.toThrow();
+  });
+});
+
+describe("srt fs bridge — runtime authority", () => {
+  function revocable() {
+    const authority = {
+      current: true,
+      revoked: new Error("runtime authority revoked"),
+      assertRuntimeCurrent: () => {
+        if (!authority.current) {
+          throw authority.revoked;
+        }
+      },
+    };
+    return authority;
+  }
+
+  it("rejects a fresh resolve->mutate with the host's original error after revocation", async () => {
+    const authority = revocable();
+    const f = make({}, authority.assertRuntimeCurrent);
+    await f.bridge.writeFile({ filePath: "allowed.txt", data: "ok" });
+    expect(readFileSync(path.join(f.ws, "allowed.txt"), "utf8")).toBe("ok");
+    authority.current = false;
+    await expect(f.bridge.writeFile({ filePath: "denied.txt", data: "x" })).rejects.toBe(
+      authority.revoked,
+    );
+    expect(existsSync(path.join(f.ws, "denied.txt"))).toBe(false);
+  });
+
+  it("releases the held pin when a pinned mutation is rejected by authority", async () => {
+    const authority = revocable();
+    const f = make({}, authority.assertRuntimeCurrent);
+    const pin = await f.bridge.resolvePinnedMutationTarget!({
+      filePath: "pinned.txt",
+      action: "write",
+    });
+    expect((await f.client.ping()).held).toBe(1);
+    authority.current = false;
+    await expect(
+      f.bridge.writeFile({ filePath: "pinned.txt", data: "x", pinnedPath: pin.pinnedPath }),
+    ).rejects.toBe(authority.revoked);
+    expect(existsSync(path.join(f.ws, "pinned.txt"))).toBe(false);
+    authority.current = true;
+    expect((await f.client.ping()).held).toBe(0);
+    // The consumed binding is gone; a fresh resolve of the same path is admitted.
+    await expect(
+      f.bridge.resolvePinnedMutationTarget!({ filePath: "pinned.txt", action: "write" }),
+    ).resolves.toMatchObject({ pinnedPath: pin.pinnedPath });
   });
 });
