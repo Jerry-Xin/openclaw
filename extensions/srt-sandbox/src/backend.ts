@@ -73,6 +73,9 @@ type DisposableScopeBackend = {
  */
 const liveScopeBackends = new Set<DisposableScopeBackend>();
 
+// Later Windows callers reuse the first creator's handle, which keeps that
+// creator's assertRuntimeCurrent. Harmless while Windows execution is rejected;
+// follow-up needed (per-caller authority) before Windows execution ships.
 let windowsScopeOwner:
   | {
       generation: number;
@@ -243,7 +246,12 @@ class SrtSandboxBackend {
   private readonly runtimeConfig: SandboxRuntimeConfig;
   /** Per-scope process-group reaper (S2). Owns every sandbox child's lifecycle. */
   private readonly reaper = new ScopeChildReaper();
-  private readonly execCustody = new ExecCustody();
+  /**
+   * Host runtime authority, retained for the handle's whole life: every new
+   * command launch, owner spawn, owner RPC, and broker write re-admits against
+   * it (after each await, right before the effect). Cleanup paths never do.
+   */
+  private readonly execCustody: ExecCustody;
   /** Per-scope AC4 pin owner RPC client (S3). Lazily spawns the owner process. */
   private readonly pinOwnerClient: PinOwnerClient;
   private fsBridge: ReturnType<typeof createSrtFsBridge> | undefined;
@@ -260,9 +268,11 @@ class SrtSandboxBackend {
     private readonly deps: SrtBackendDependencies,
   ) {
     this.runtimeConfig = buildSrtRuntimeConfig(scopePolicyFromParams(params), deps.pluginConfig);
+    this.execCustody = new ExecCustody({ assertRuntimeCurrent: params.assertRuntimeCurrent });
     this.pinOwnerClient = new PinOwnerClient({
       spawnOwner: () => this.spawnPinOwner(),
       rpcTimeoutMs: deps.pluginConfig.commandTimeoutMs,
+      assertRuntimeCurrent: params.assertRuntimeCurrent,
     });
   }
 
@@ -315,6 +325,7 @@ class SrtSandboxBackend {
         cwd: this.params.workspaceDir,
         binShell: this.deps.pluginConfig.binShell,
         rpcTimeoutMs: this.deps.pluginConfig.commandTimeoutMs,
+        assertRuntimeCurrent: this.params.assertRuntimeCurrent,
       });
     }
     return this.sessionBroker;
@@ -328,6 +339,7 @@ class SrtSandboxBackend {
    * The reaper tracks it, so scope teardown / host death group-kills it.
    */
   private async spawnPinOwner() {
+    this.execCustody.assertCurrent();
     const ownerCommand = buildPinOwnerCommand();
     const wrapped = await SandboxManager.wrapWithSandboxArgv(
       ownerCommand,
@@ -336,6 +348,7 @@ class SrtSandboxBackend {
       undefined,
       this.params.workspaceDir,
     );
+    this.execCustody.assertCurrent();
     return this.reaper.spawnPersistent({
       argv: wrapped.argv,
       env: wrapped.env ?? {},
@@ -345,6 +358,7 @@ class SrtSandboxBackend {
 
   /** Wrap a command string with the scope's Seatbelt profile. */
   private async wrap(command: string, signal?: AbortSignal) {
+    this.execCustody.assertCurrent();
     const wrapped = await SandboxManager.wrapWithSandboxArgv(
       command,
       this.deps.pluginConfig.binShell,
@@ -352,6 +366,8 @@ class SrtSandboxBackend {
       signal,
       this.params.workspaceDir,
     );
+    // Authority may have been revoked while wrapping was awaited.
+    this.execCustody.assertCurrent();
     return { ...wrapped, argv: restrictMacosSandboxArgv(wrapped.argv) };
   }
 
@@ -359,6 +375,9 @@ class SrtSandboxBackend {
     params: SandboxBackendCommandParams,
   ): Promise<SandboxBackendCommandResult> {
     params.signal?.throwIfAborted();
+    // Authority failures propagate unchanged, even with allowFailure: that flag
+    // only tolerates a non-zero exit of a command that was admitted to run.
+    this.execCustody.assertCurrent();
     const script = withPositionalArgs(params.script, params.args);
     // The session policy controls a fresh SRT sandbox for each command. Host
     // custody remains outside the guest's process-signal permissions; a failed

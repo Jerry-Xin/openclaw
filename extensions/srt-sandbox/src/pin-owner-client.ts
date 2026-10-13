@@ -52,6 +52,8 @@ export type PinOwnerClientDeps = {
   spawnOwner: () => Promise<PersistentChildHandle>;
   /** Per-request timeout; a slow/wedged owner fails the call closed. */
   rpcTimeoutMs: number;
+  /** Host runtime authority; throws once the host revokes this runtime. */
+  assertRuntimeCurrent?: () => void;
 };
 
 /** File-backed resolve target: parent chain to hold + leaf to mutate. */
@@ -184,8 +186,20 @@ export class PinOwnerClient {
     this.pending.clear();
   }
 
-  private async request(payload: Record<string, unknown>): Promise<OwnerResponse> {
+  private async request(
+    payload: Record<string, unknown>,
+    admission: "guarded" | "cleanup" = "guarded",
+  ): Promise<OwnerResponse> {
+    // Every owner RPC acts on the scope's files, so admit it against the host
+    // authority before and after the (possibly spawning) owner wait. Cleanup
+    // RPCs skip the check so held fds can still be dropped after revocation.
+    if (admission === "guarded") {
+      this.deps.assertRuntimeCurrent?.();
+    }
     const proc = await this.ensureOwner();
+    if (admission === "guarded") {
+      this.deps.assertRuntimeCurrent?.();
+    }
     const id = this.nextRequestId++;
     return new Promise<OwnerResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -226,7 +240,7 @@ export class PinOwnerClient {
   /** Drop a held pin without mutating (denied authorization / idle timeout). */
   async release(opId: number): Promise<void> {
     try {
-      await this.request({ op: "release", opId });
+      await this.request({ op: "release", opId }, "cleanup");
     } catch (error) {
       // A dead owner already released every fd by dying; a release RPC failure
       // is therefore never fatal.

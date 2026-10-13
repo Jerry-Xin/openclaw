@@ -81,6 +81,8 @@ export type SessionBrokerDeps = {
   srtCliPath?: string;
   /** Override the node executable (tests); defaults to process.execPath. */
   nodePath?: string;
+  /** Host runtime authority; throws once the host revokes this runtime. */
+  assertRuntimeCurrent?: () => void;
 };
 
 type BrokerResponse = {
@@ -134,7 +136,7 @@ const { pathToFileURL } = require("node:url");
 `;
 
 export class SessionBroker {
-  private readonly custody = new ExecCustody();
+  private readonly custody: ExecCustody;
   private proc: BrokerChildHandle | undefined;
   private spawning: Promise<BrokerChildHandle> | undefined;
   private nextRequestId = 1;
@@ -158,6 +160,15 @@ export class SessionBroker {
     this.srtCliPath = deps.srtCliPath ?? resolveSrtCliPath();
     this.nodePath = deps.nodePath ?? process.execPath;
     this.readyTimeoutMs = deps.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
+    this.custody = new ExecCustody({ assertRuntimeCurrent: deps.assertRuntimeCurrent });
+  }
+
+  /** Admit a new broker effect: not disposed and the host still owns the runtime. */
+  private assertCurrent(): void {
+    if (this.disposed) {
+      throw new SessionBrokerDeadError("session broker has been disposed");
+    }
+    this.deps.assertRuntimeCurrent?.();
   }
 
   /** True while a live broker process is attached (test/introspection aid). */
@@ -228,9 +239,7 @@ export class SessionBroker {
     cwd: string;
     cleanup: () => void;
   } {
-    if (this.disposed) {
-      throw new SessionBrokerDeadError("session broker has been disposed");
-    }
+    this.assertCurrent();
     const dir = mkdtempSync(path.join(resolvePreferredOpenClawTmpDir(), "srt-exec-"));
     const settingsPath = path.join(dir, "settings.json");
     writeFileSync(settingsPath, this.buildRuntimeConfigJson(), { mode: 0o600 });
@@ -270,22 +279,22 @@ export class SessionBroker {
     };
   }
 
+  /** Attach (or start) the health-checked broker, then re-admit before the caller's effect. */
   private async ensureBroker(): Promise<BrokerChildHandle> {
-    if (this.disposed) {
-      throw new SessionBrokerDeadError("session broker has been disposed");
-    }
-    if (this.proc) {
-      return this.proc;
-    }
-    if (!this.spawning) {
+    this.assertCurrent();
+    if (!this.proc && !this.spawning) {
       this.spawning = this.spawnBroker().finally(() => {
         this.spawning = undefined;
       });
     }
-    return this.spawning;
+    // spawnBroker() attaches proc before its ready handshake; wait on the spawn.
+    const proc = this.spawning ? await this.spawning : this.proc!;
+    this.assertCurrent();
+    return proc;
   }
 
   private async spawnBroker(): Promise<BrokerChildHandle> {
+    this.assertCurrent();
     const dir = mkdtempSync(path.join(resolvePreferredOpenClawTmpDir(), "srt-broker-"));
     const settingsPath = path.join(dir, "settings.json");
     writeFileSync(settingsPath, this.buildRuntimeConfigJson(), { mode: 0o600 });
@@ -561,6 +570,8 @@ export class SessionBroker {
       );
     }
     const proc = await this.ensureBroker();
+    // ensureBroker() re-admitted authority after its await; nothing awaits between
+    // here and the control-fd write.
     this.allowedDomains = [...policy.allowedDomains];
     const line = `${this.buildRuntimeConfigJson()}\n`;
     try {
