@@ -50,7 +50,7 @@ Each entry lists the package, distribution route, and description.
 
 ## Core npm package
 
-68 plugins
+67 plugins
 
 - **[a2a](/plugins/reference/a2a)** (`@openclaw/a2a`) - included in OpenClaw. A2A v1.0 Agent-to-Agent protocol channel plugin.
 
@@ -168,8 +168,6 @@ Each entry lists the package, distribution route, and description.
 
 - **[sglang](/plugins/reference/sglang)** (`@openclaw/sglang-provider`) - included in OpenClaw. Adds SGLang model provider support to OpenClaw.
 
-- **[srt-sandbox](/plugins/reference/srt-sandbox)** (`@openclaw/srt-sandbox`) - included in OpenClaw. Docker-free local sandbox backend for OpenClaw built on the Anthropic Sandbox Runtime (macOS Seatbelt).
-
 - **[talk-voice](/plugins/reference/talk-voice)** (`openclaw`) - included in OpenClaw. Manage Talk voice selection (list/set).
 
 - **[telegram](/plugins/reference/telegram)** (`@openclaw/telegram`) - included in OpenClaw. OpenClaw Telegram channel plugin.
@@ -192,7 +190,7 @@ Each entry lists the package, distribution route, and description.
 
 ## Official external packages
 
-97 plugins
+98 plugins
 
 - **[acpx](/plugins/reference/acpx)** (`@openclaw/acpx`) - npm or ClawHub: `clawhub:@openclaw/acpx`. OpenClaw ACP runtime backend with plugin-owned session and transport management.
 
@@ -341,6 +339,8 @@ Each entry lists the package, distribution route, and description.
 - **[slack-huddles](/plugins/reference/slack-huddles)** (`@openclaw/slack-huddles`) - npm or ClawHub: `clawhub:@openclaw/slack-huddles`. Join Slack huddles through a dedicated Slack user in Chrome.
 
 - **[sms](/plugins/reference/sms)** (`@openclaw/sms`) - npm or ClawHub: `clawhub:@openclaw/sms`. Twilio SMS/MMS channel plugin for OpenClaw messages.
+
+- **[srt-sandbox](/plugins/reference/srt-sandbox)** (`@openclaw/srt-sandbox`) - npm or ClawHub: `clawhub:@openclaw/srt-sandbox`. Docker-free local sandbox backend for OpenClaw built on the Anthropic Sandbox Runtime (macOS Seatbelt).
 
 - **[stepfun](/plugins/reference/stepfun)** (`@openclaw/stepfun-provider`) - npm or ClawHub: `clawhub:@openclaw/stepfun-provider`. Adds StepFun, StepFun Plan model provider support to OpenClaw.
 
