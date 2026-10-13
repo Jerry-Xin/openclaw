@@ -1020,6 +1020,7 @@ export async function runMemoryFlushIfNeeded(params: {
           transcriptPrompt: "",
           extraSystemPrompt: flushSystemPrompt,
           isFinalFallbackAttempt: runOptions.isFinalFallbackAttempt,
+          onDeferredTurnSendLedgerScope: runOptions.onDeferredTurnSendLedgerScope,
           resolvedModelSelection: runOptions.resolvedModelSelection,
           modelFallbacksOverride: runOptions.modelFallbacksOverride,
           bootstrapPromptWarningSignaturesSeen,
