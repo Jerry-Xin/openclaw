@@ -279,7 +279,10 @@ export class SessionBroker {
     };
   }
 
-  /** Attach (or start) the health-checked broker, then re-admit before the caller's effect. */
+  /**
+   * Attach (or start) the health-checked broker. Callers resume after another
+   * microtask, so each must re-admit with assertCurrent() before its effect.
+   */
   private async ensureBroker(): Promise<BrokerChildHandle> {
     this.assertCurrent();
     if (!this.proc && !this.spawning) {
@@ -517,6 +520,7 @@ export class SessionBroker {
   async exec(params: BrokerExecParams): Promise<BrokerExecResult> {
     params.signal?.throwIfAborted();
     await this.ensureBroker();
+    // prepareCommand() re-admits authority before any command effect.
     const timeoutMs = params.timeoutMs ?? this.deps.rpcTimeoutMs;
     // Each command gets the current session policy in a fresh sandbox. Its
     // guardian stays outside that sandbox, so guest signals cannot revoke the
@@ -550,6 +554,7 @@ export class SessionBroker {
   /** Health probe over the RPC channel. Returns the broker pid + exec count. */
   async ping(): Promise<{ pid: number; executed: number }> {
     const proc = await this.ensureBroker();
+    this.assertCurrent();
     const response = await this.request(proc, { op: "ping" }, this.deps.rpcTimeoutMs, "ping");
     return {
       pid: typeof response.pid === "number" ? response.pid : -1,
@@ -570,8 +575,9 @@ export class SessionBroker {
       );
     }
     const proc = await this.ensureBroker();
-    // ensureBroker() re-admitted authority after its await; nothing awaits between
-    // here and the control-fd write.
+    // ensureBroker()'s own check ran before this continuation resumed; a host
+    // revocation can land in between, so re-admit right before the write.
+    this.assertCurrent();
     this.allowedDomains = [...policy.allowedDomains];
     const line = `${this.buildRuntimeConfigJson()}\n`;
     try {

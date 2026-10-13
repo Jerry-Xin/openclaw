@@ -1,4 +1,5 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 // Tests for the per-session network broker (Stage S4-P1).
@@ -22,6 +23,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { buildBrokerRuntimeConfig, sameParentProxy } from "./broker-config.js";
 import { findLinuxProcessByArgv0 } from "./process-proof.test-helpers.js";
@@ -197,6 +199,53 @@ describe("session broker runtime authority", () => {
     await expect(broker.setAllowedDomains(["b.example"])).rejects.toBe(revoked);
     expect(() => broker.prepareCommand("echo hi", {})).toThrow(revoked);
     expect(spawnBroker).not.toHaveBeenCalled();
+    expect(broker.currentAllowedDomains).toEqual(["a.example"]);
+  });
+
+  it("rechecks authority after awaiting the broker before writing a policy update", async () => {
+    const revoked = new Error("runtime authority revoked");
+    const reaper = new ScopeChildReaper();
+    reapers.push(reaper);
+    const fake = {
+      child: new EventEmitter() as ChildProcess,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      control: new PassThrough(),
+    };
+    vi.spyOn(reaper, "spawnBroker").mockReturnValue(fake);
+    const controlWrite = vi.spyOn(fake.control, "write");
+    let current = true;
+    let revokeAfterNextCheck = false;
+    const broker = new SessionBroker({
+      reaper,
+      writableRoots: [],
+      policy: { allowedDomains: ["a.example"] },
+      cwd: process.cwd(),
+      binShell: "/bin/bash",
+      rpcTimeoutMs: 5_000,
+      srtCliPath: "/nonexistent/srt-cli-does-not-exist.js",
+      assertRuntimeCurrent: () => {
+        if (!current) {
+          throw revoked;
+        }
+        if (revokeAfterNextCheck) {
+          // The host revokes after ensureBroker()'s own check passes but before
+          // the awaiting caller resumes.
+          revokeAfterNextCheck = false;
+          queueMicrotask(() => {
+            current = false;
+          });
+        }
+      },
+    });
+    brokers.push(broker);
+
+    const updating = broker.setAllowedDomains(["b.example"]);
+    revokeAfterNextCheck = true;
+    fake.stdout.emit("data", `${JSON.stringify({ ready: true })}\n`);
+
+    await expect(updating).rejects.toBe(revoked);
+    expect(controlWrite).not.toHaveBeenCalled();
     expect(broker.currentAllowedDomains).toEqual(["a.example"]);
   });
 
