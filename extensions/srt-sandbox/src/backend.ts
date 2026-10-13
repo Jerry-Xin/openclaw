@@ -431,32 +431,44 @@ class SrtSandboxBackend {
       prepareProcessCleanup: (env) => this.execCustody.prepare(env),
       buildExecSpec: async ({ command, workdir, env }) => {
         this.execCustody.assertCurrent();
-        const preparedEnv = this.execCustody.ensurePreparedEnv(env);
-        if (this.perSessionNetworkEnabled) {
-          const prepared = this.ensureSessionBroker().prepareCommand(command, preparedEnv);
+        const custody = this.execCustody.ensurePreparedEnv(env);
+        const preparedEnv = custody.env;
+        try {
+          if (this.perSessionNetworkEnabled) {
+            const prepared = this.ensureSessionBroker().prepareCommand(command, preparedEnv);
+            return this.execCustody.wrap(
+              {
+                argv: prepared.argv,
+                env: prepared.env,
+                cwd: workdir ?? prepared.cwd,
+                stdinMode: "pipe-open",
+              },
+              preparedEnv,
+              prepared.cleanup,
+            );
+          }
+          const { argv } = await this.wrap(command);
           return this.execCustody.wrap(
             {
-              argv: prepared.argv,
-              env: prepared.env,
-              cwd: workdir ?? prepared.cwd,
+              argv,
+              // Spawn with the command's resolved environment; deny-all network
+              // means no proxy env is required from the wrapper.
+              env,
+              cwd: workdir ?? this.params.workspaceDir,
               stdinMode: "pipe-open",
             },
             preparedEnv,
-            prepared.cleanup,
           );
+        } catch (error) {
+          // No spec was returned, so nobody will finalize a lease opened by
+          // this call (e.g. authority revoked while wrapping was awaited).
+          try {
+            await custody.release();
+          } catch {
+            // Temp-dir cleanup failure must not replace the original error.
+          }
+          throw error;
         }
-        const { argv } = await this.wrap(command);
-        return this.execCustody.wrap(
-          {
-            argv,
-            // Spawn with the command's resolved environment; deny-all network
-            // means no proxy env is required from the wrapper.
-            env,
-            cwd: workdir ?? this.params.workspaceDir,
-            stdinMode: "pipe-open",
-          },
-          preparedEnv,
-        );
       },
       finalizeExec: ({ token }) => this.execCustody.finalize(token),
       runShellCommand,
@@ -539,14 +551,25 @@ export function createSrtSandboxBackendFactory(
 
     await assertSrtSandboxAvailable();
     assertSrtSandboxAdmission(requestGeneration);
+    // The host may revoke authority while discovery is awaited.
+    params.assertRuntimeCurrent?.();
     const backend = new SrtSandboxBackend(params, deps);
     try {
       await backend.initialize();
       assertSrtSandboxAdmission(requestGeneration);
+      // Recheck before publishing: the registry drops a rejected handle without
+      // disposing it, so a late revocation must release the runtime lease here.
+      params.assertRuntimeCurrent?.();
       liveScopeBackends.add(backend);
       return backend.asHandle();
     } catch (error) {
-      await backend.dispose();
+      try {
+        await backend.dispose();
+      } catch {
+        // Keep the caller's original error. A failed final reset stays
+        // observable: the runtime coordinator records it as faulted and
+        // rejects later admissions until shutdown succeeds.
+      }
       throw error;
     }
   };
