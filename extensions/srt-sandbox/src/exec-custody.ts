@@ -100,6 +100,8 @@ type Lease = {
   sockets: Set<Socket>;
   cancelled: boolean;
   claimed: boolean;
+  /** Host authority rejection observed at the launch handshake. */
+  rejection?: { error: unknown };
   cleanup?: () => void;
   workspace: ReturnType<typeof tempWorkspaceSync>;
 };
@@ -180,6 +182,10 @@ export class ExecCustody {
         child.on("close", (exitCode) => resolve(exitCode ?? 1));
         child.stdin.end(options.stdin);
       });
+      const rejection = this.leaseFor(wrapped.finalizeToken)?.rejection;
+      if (rejection) {
+        throw rejection.error;
+      }
       options.signal?.throwIfAborted();
       if (overflowed) {
         throw new Error(`srt-sandbox command ${overflowed} exceeded ${maxBufferBytes} bytes`);
@@ -251,6 +257,16 @@ export class ExecCustody {
           socket.destroy();
           return;
         }
+        // Final admission before the guest command starts. A throw here must
+        // not escape the socket handler: cancel the lease and drop the launcher.
+        try {
+          this.assertCurrent();
+        } catch (error) {
+          lease.rejection = { error };
+          this.cancel(lease);
+          socket.destroy();
+          return;
+        }
         lease.claimed = true;
         lease.sockets.add(socket);
         socket.write("ready\n");
@@ -314,8 +330,12 @@ export class ExecCustody {
     };
   }
 
+  private leaseFor(token: unknown): Lease | undefined {
+    return [...this.leases].find((candidate) => candidate === token);
+  }
+
   async finalize(token: unknown): Promise<void> {
-    const lease = [...this.leases].find((candidate) => candidate === token);
+    const lease = this.leaseFor(token);
     if (!lease || !this.leases.delete(lease)) {
       return;
     }

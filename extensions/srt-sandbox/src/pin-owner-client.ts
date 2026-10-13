@@ -239,6 +239,11 @@ export class PinOwnerClient {
 
   /** Drop a held pin without mutating (denied authorization / idle timeout). */
   async release(opId: number): Promise<void> {
+    // No attached owner holds no pins (a dead owner released them by dying), so
+    // never spawn one just to release, e.g. after the host revoked authority.
+    if (!this.proc) {
+      return;
+    }
     try {
       await this.request({ op: "release", opId }, "cleanup");
     } catch (error) {
