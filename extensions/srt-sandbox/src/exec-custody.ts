@@ -292,8 +292,21 @@ export class ExecCustody {
     }
   }
 
-  ensurePreparedEnv(env: Record<string, string>): Record<string, string> {
-    return env[SOCKET_ENV] ? env : this.prepare(env).env;
+  /**
+   * Reuse the caller's custody lease, or open one for this call. `release`
+   * closes only a lease opened here, so a spec build that fails afterwards does
+   * not hold it until scope teardown; a caller's lease stays with the caller.
+   */
+  ensurePreparedEnv(env: Record<string, string>): {
+    env: Record<string, string>;
+    release: () => Promise<void>;
+  } {
+    if (env[SOCKET_ENV]) {
+      return { env, release: async () => {} };
+    }
+    const prepared = this.prepare(env).env;
+    const lease = this.leaseForEnv(prepared);
+    return { env: prepared, release: () => this.finalize(lease) };
   }
 
   wrap(
@@ -303,9 +316,7 @@ export class ExecCustody {
   ): SandboxBackendExecSpec {
     this.assertCurrent();
     assertSafeHostStartupEnvironment(spec.env ?? {});
-    const lease = [...this.leases].find(
-      (candidate) => candidate.socketPath === env[SOCKET_ENV] && candidate.nonce === env[TOKEN_ENV],
-    );
+    const lease = this.leaseForEnv(env);
     if (!lease) {
       throw new Error("srt-sandbox exec cleanup custody is stale.");
     }
@@ -328,6 +339,12 @@ export class ExecCustody {
       },
       finalizeToken: lease,
     };
+  }
+
+  private leaseForEnv(env: Record<string, string>): Lease | undefined {
+    return [...this.leases].find(
+      (candidate) => candidate.socketPath === env[SOCKET_ENV] && candidate.nonce === env[TOKEN_ENV],
+    );
   }
 
   private leaseFor(token: unknown): Lease | undefined {
