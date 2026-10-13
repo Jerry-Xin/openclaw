@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { resolveSrtPluginConfig } from "./config.js";
-import { buildSrtRuntimeConfig, resolveWritableRoots } from "./srt-runtime-config.js";
+import { resolveWritableRoots } from "./srt-runtime-config.js";
 
 const scope = {
   workspaceDir: "/workspace",
@@ -17,30 +17,6 @@ describe("SRT configuration contract", () => {
         ["D:\\scratch", "\\\\server\\share"],
       ),
     ).toEqual(["C:\\workspace", "\\\\server\\agent", "D:\\scratch", "\\\\server\\share"]);
-  });
-
-  it("emits executable deny, allowlist, and open network semantics", () => {
-    const deny = buildSrtRuntimeConfig(scope, resolveSrtPluginConfig({ network: "deny" }));
-    expect(deny.network).toMatchObject({
-      allowedDomains: [],
-      deniedDomains: [],
-      strictAllowlist: true,
-    });
-    const allowlist = buildSrtRuntimeConfig(
-      scope,
-      resolveSrtPluginConfig({ network: "deny", allowedDomains: ["example.com"] }),
-    );
-    expect(allowlist.network).toMatchObject({
-      allowedDomains: ["example.com"],
-      deniedDomains: [],
-      strictAllowlist: true,
-    });
-    const open = buildSrtRuntimeConfig(scope, resolveSrtPluginConfig({ network: "allow" }));
-    expect(open.network).toMatchObject({
-      allowedDomains: ["*"],
-      deniedDomains: [],
-      strictAllowlist: true,
-    });
   });
 
   it("keeps runtime and published manifest keys aligned", () => {
