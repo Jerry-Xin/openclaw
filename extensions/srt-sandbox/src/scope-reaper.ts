@@ -138,16 +138,44 @@ export function wrapWithLivenessLauncher(outerCommand: string): string {
   ].join("\n");
 }
 
-/** Send `signal` to the whole process group led by `pid`; ignore already-gone. */
-function killGroup(pid: number | undefined, signal: NodeJS.Signals): void {
+/**
+ * Send `signal` to the process group led by `child`, but only while Node still
+ * owns the leader's pid: no exit or signal recorded and no prior kill. Node
+ * records exitCode/signalCode in the same callback that reaps the leader, so
+ * an unreaped leader still pins its pid (and pgid) against reuse; once reaped,
+ * the numeric group could belong to an unrelated process and is never signaled.
+ */
+function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (
+    child.pid === undefined ||
+    child.exitCode !== null ||
+    child.signalCode !== null ||
+    child.killed
+  ) {
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+  } catch (err) {
+    // ESRCH = group already gone; EPERM = nothing we can do — both are terminal.
+    void err;
+  }
+}
+
+/**
+ * Sweep descendants left in the group of a leader whose "exit" is being
+ * dispatched right now. Runs synchronously inside the callback that reaped the
+ * leader; any surviving member keeps the pgid reserved, so the signal reaches
+ * only this command's descendants (or nothing, with ESRCH).
+ */
+function sweepExitedGroup(pid: number | undefined): void {
   if (pid === undefined) {
     return;
   }
   try {
-    process.kill(-pid, signal);
-  } catch (err) {
-    // ESRCH = group already gone; EPERM = nothing we can do — both are terminal.
-    void err;
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // ESRCH: no descendant survived the leader.
   }
 }
 
@@ -217,10 +245,10 @@ export class ScopeChildReaper {
       let settled = false;
 
       const timer = setTimeout(() => {
-        killGroup(child.pid, "SIGKILL");
+        this.terminate(child);
       }, params.timeoutMs);
 
-      const onAbort = () => killGroup(child.pid, "SIGKILL");
+      const onAbort = () => this.terminate(child);
       params.signal?.addEventListener("abort", onAbort, { once: true });
 
       const cleanup = () => {
@@ -249,7 +277,7 @@ export class ScopeChildReaper {
       // survivor outlives the buffered command.
       child.on("exit", (code) => {
         exitCode = code;
-        killGroup(child.pid, "SIGKILL");
+        sweepExitedGroup(child.pid);
       });
 
       child.on("close", () => {
@@ -320,14 +348,14 @@ export class ScopeChildReaper {
     // Sweep any descendant the helper spawned and drop it from the registry the
     // instant it exits, so no survivor lingers and dispose() has nothing stale.
     child.on("exit", () => {
-      killGroup(child.pid, "SIGKILL");
+      sweepExitedGroup(child.pid);
       forget();
     });
     child.on("error", forget);
 
     this.live.add(child);
     if (!child.stdin || !child.stdout) {
-      killGroup(child.pid, "SIGKILL");
+      this.terminate(child);
       forget();
       throw new Error("srt-sandbox pin owner is missing its stdio channels.");
     }
@@ -382,14 +410,14 @@ export class ScopeChildReaper {
       controlEnd?.destroy();
     };
     child.on("exit", () => {
-      killGroup(child.pid, "SIGKILL");
+      sweepExitedGroup(child.pid);
       forget();
     });
     child.on("error", forget);
 
     this.live.add(child);
     if (!child.stdin || !child.stdout || !controlEnd || typeof controlEnd === "number") {
-      killGroup(child.pid, "SIGKILL");
+      this.terminate(child);
       forget();
       throw new Error("srt-sandbox broker is missing its stdio/control channels.");
     }
@@ -403,18 +431,32 @@ export class ScopeChildReaper {
   }
 
   /**
-   * Tear the scope down: SIGKILL every tracked process group and refuse further
+   * Kill one tracked child's whole process group. Closing the liveness write
+   * end makes the in-group watcher run `kill -KILL -- -$$`, which cannot hit a
+   * reused pid; the numeric group kill is the fallback for a watcher that is
+   * already gone and only fires while {@link killGroup}'s ownership checks
+   * hold. Children this reaper does not track are never signaled.
+   */
+  terminate(child: ChildProcess): void {
+    if (!this.live.has(child)) {
+      return;
+    }
+    child.stdio[LIVENESS_FD]?.destroy();
+    // Brokers (S4-P1) also hold a control pipe on CONTROL_FD; other children
+    // spawn with a 4-element stdio array so this index is simply undefined.
+    child.stdio[CONTROL_FD]?.destroy();
+    killGroup(child, "SIGKILL");
+  }
+
+  /**
+   * Tear the scope down: kill every tracked process group and refuse further
    * work. Idempotent. After this returns, no sandbox process spawned by this
    * scope survives, including background descendants.
    */
   dispose(): void {
     this.disposed = true;
     for (const child of this.live) {
-      killGroup(child.pid, "SIGKILL");
-      child.stdio[LIVENESS_FD]?.destroy();
-      // Brokers (S4-P1) also hold a control pipe on CONTROL_FD; other children
-      // spawn with a 4-element stdio array so this index is simply undefined.
-      child.stdio[CONTROL_FD]?.destroy();
+      this.terminate(child);
     }
     // Registry entries are removed by each command's own "close"/"error" path
     // once the kill lands; nothing else to release here.
