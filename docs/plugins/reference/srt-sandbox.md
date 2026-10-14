@@ -15,7 +15,7 @@ Docker-free local sandbox backend for OpenClaw built on the Anthropic Sandbox Ru
 ## Distribution
 
 - Package: `@openclaw/srt-sandbox`
-- Install route: npm or ClawHub: `clawhub:@openclaw/srt-sandbox`
+- Install route: npm or ClawHub: `@openclaw/srt-sandbox`
 
 ## Surface
 

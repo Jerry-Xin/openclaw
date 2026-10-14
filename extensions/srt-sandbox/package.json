@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/srt-sandbox",
-  "version": "2026.9.4",
+  "version": "2026.10.3",
   "description": "Docker-free local sandbox backend for OpenClaw built on the Anthropic Sandbox Runtime (macOS Seatbelt).",
   "repository": {
     "type": "git",
@@ -23,13 +23,13 @@
       "clawhubSpec": "clawhub:@openclaw/srt-sandbox",
       "npmSpec": "@openclaw/srt-sandbox",
       "defaultChoice": "npm",
-      "minHostVersion": ">=2026.9.4"
+      "minHostVersion": ">=2026.9.6"
     },
     "compat": {
-      "pluginApi": ">=2026.9.4"
+      "pluginApi": ">=2026.10.3"
     },
     "build": {
-      "openclawVersion": "2026.9.4",
+      "openclawVersion": "2026.10.3",
       "bundledDist": false
     },
     "release": {
