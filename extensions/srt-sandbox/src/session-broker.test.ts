@@ -31,6 +31,7 @@ import { isSrtSandboxAvailable } from "./sandbox-availability.test-helpers.js";
 import { ScopeChildReaper } from "./scope-reaper.js";
 import {
   SessionBroker,
+  SessionBrokerDeadError,
   SessionBrokerParentProxyError,
   SessionBrokerUnavailableError,
 } from "./session-broker.js";
@@ -247,6 +248,45 @@ describe("session broker runtime authority", () => {
     await expect(updating).rejects.toBe(revoked);
     expect(controlWrite).not.toHaveBeenCalled();
     expect(broker.currentAllowedDomains).toEqual(["a.example"]);
+  });
+
+  it("routes an RPC-timeout kill through the reaper, never by numeric pid", async () => {
+    vi.useFakeTimers();
+    try {
+      const reaper = new ScopeChildReaper();
+      reapers.push(reaper);
+      const fake = {
+        child: Object.assign(new EventEmitter(), { pid: 424242 }) as unknown as ChildProcess,
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        control: new PassThrough(),
+      };
+      vi.spyOn(reaper, "spawnBroker").mockReturnValue(fake);
+      const terminate = vi.spyOn(reaper, "terminate");
+      const kill = vi.spyOn(process, "kill");
+      const broker = new SessionBroker({
+        reaper,
+        writableRoots: [],
+        policy: { allowedDomains: ["a.example"] },
+        cwd: process.cwd(),
+        binShell: "/bin/bash",
+        rpcTimeoutMs: 1_000,
+        srtCliPath: "/nonexistent/srt-cli-does-not-exist.js",
+      });
+      brokers.push(broker);
+
+      const pinging = broker.ping();
+      fake.stdout.emit("data", `${JSON.stringify({ ready: true })}\n`);
+      const settled = expect(pinging).rejects.toBeInstanceOf(SessionBrokerDeadError);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await settled;
+
+      expect(terminate).toHaveBeenCalledExactlyOnceWith(fake.child);
+      expect(kill).not.toHaveBeenCalled();
+      expect(broker.isRunning).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps dispose working after revocation", () => {

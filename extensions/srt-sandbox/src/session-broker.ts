@@ -455,13 +455,8 @@ export class SessionBroker {
     if (!proc) {
       return;
     }
-    try {
-      if (proc.child.pid !== undefined) {
-        process.kill(-proc.child.pid, "SIGKILL");
-      }
-    } catch {
-      // The process group is already gone.
-    }
+    // The reaper owns the broker's process group and its liveness custody.
+    this.deps.reaper.terminate(proc.child);
     this.onBrokerGone(proc, reason);
   }
 
