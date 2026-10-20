@@ -30,4 +30,4 @@ Platform support, network modes and workspace access rules:
 
 - Plugin id: `srt-sandbox`
 - Package: `@openclaw/srt-sandbox`
-- Minimum OpenClaw host: `2026.9.6`
+- Minimum OpenClaw host: `2026.10.3` (required by `openclaw.compat.pluginApi`)
