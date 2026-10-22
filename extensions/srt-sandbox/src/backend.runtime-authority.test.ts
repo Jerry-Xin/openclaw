@@ -312,14 +312,15 @@ describe.skipIf(!isLive)("srt sandbox backend — live runtime authority", () =>
       // Observe the lease that buildExecSpec opens for a caller without its own
       // custody env, then revoke before the spec can be wrapped and returned.
       const lease: { socket?: string; existed?: boolean } = {};
-      const prepareCommand = SessionBroker.prototype.prepareCommand;
-      vi.spyOn(SessionBroker.prototype, "prepareCommand").mockImplementationOnce(function (
+      const prepareCommandSpy = vi.spyOn(SessionBroker.prototype, "prepareCommand");
+      prepareCommandSpy.mockImplementationOnce(function (
         this: SessionBroker,
         ...args: Parameters<SessionBroker["prepareCommand"]>
       ) {
         lease.socket = args[1].SRT_CUSTODY_SOCKET;
         lease.existed = lease.socket !== undefined && existsSync(lease.socket);
-        const prepared = prepareCommand.apply(this, args);
+        prepareCommandSpy.mockRestore();
+        const prepared = this.prepareCommand(...args);
         authority.current = false;
         return prepared;
       });
