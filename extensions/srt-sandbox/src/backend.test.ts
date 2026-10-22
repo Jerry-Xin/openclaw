@@ -1,18 +1,24 @@
 // Tests for the SRT sandbox backend (S1).
 //
-// Two concerns:
+// Three concerns:
 //  1. Registration self-verify — the backend registers via
 //     registerSandboxBackend() and resolves through getSandboxBackendFactory().
 //  2. macOS Seatbelt minimal path — reproduces the eight-case permission matrix
 //     (specified directory writable, everything else read-only). Gated to
 //     darwin; on other platforms the backend fails closed by design.
-import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+//  3. Deferred exec specs — the spec returned by buildExecSpec is launched the
+//     way the core exec runtime launches it, and its effects are checked on
+//     disk (darwin and Linux hosts with the sandbox toolchain).
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   getSandboxBackendFactory,
   registerSandboxBackend,
   type CreateSandboxBackendParams,
+  type SandboxBackendHandle,
 } from "openclaw/plugin-sdk/sandbox";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -23,8 +29,10 @@ import {
   SRT_SANDBOX_BACKEND_ID,
 } from "./backend.js";
 import { resolveSrtPluginConfig } from "./config.js";
+import { isSrtSandboxAvailable } from "./sandbox-availability.test-helpers.js";
 
 const isDarwin = process.platform === "darwin";
+const isLive = (isDarwin || process.platform === "linux") && (await isSrtSandboxAvailable());
 
 function makeParams(overrides: {
   workspaceDir: string;
@@ -51,6 +59,30 @@ function makeParams(overrides: {
     agentWorkspaceDir: overrides.agentWorkspaceDir,
     cfg,
   };
+}
+
+/** Launch a deferred exec spec as the core exec runtime does, then finalize it. */
+async function launchExecSpec(
+  handle: SandboxBackendHandle,
+  command: string,
+): Promise<{ code: number | null }> {
+  const cleanup = handle.prepareProcessCleanup!({ PATH: process.env.PATH ?? "" });
+  const spec = await handle.buildExecSpec({ command, env: cleanup.env, usePty: false });
+  expect(() => spec.assertCurrent?.()).not.toThrow();
+  const child = spawn(spec.argv[0]!, spec.argv.slice(1), {
+    env: spec.env,
+    cwd: spec.cwd,
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+  child.stdin.end();
+  const [code] = (await once(child, "exit")) as [number | null];
+  await handle.finalizeExec?.({
+    status: code === 0 ? "completed" : "failed",
+    exitCode: code,
+    timedOut: false,
+    token: spec.finalizeToken,
+  });
+  return { code };
 }
 
 describe("srt sandbox backend registration", () => {
@@ -132,28 +164,33 @@ describe.skipIf(!isDarwin)("srt sandbox macOS Seatbelt minimal path (8/8)", () =
     expect(h.code).not.toBe(0);
     expect(existsSync(path.join(roZone, "seed.txt"))).toBe(true);
   });
+});
 
-  it("buildExecSpec produces a sandbox-wrapped argv that enforces the write boundary", async () => {
+describe.skipIf(!isLive)("srt sandbox deferred exec spec enforcement", () => {
+  afterEach(shutdownSrtSandboxRuntime);
+
+  it("launches a built exec spec inside the scope's write boundary", async () => {
     const rwZone = mkdtempSync(path.join(tmpdir(), "srt-rw-exec-"));
+    const roZone = mkdtempSync(path.join(tmpdir(), "srt-ro-exec-"));
     const agentDir = mkdtempSync(path.join(tmpdir(), "srt-agent-exec-"));
-    mkdirSync(rwZone, { recursive: true });
-    const pluginConfig = resolveSrtPluginConfig(undefined);
-    const factory = createSrtSandboxBackendFactory({ pluginConfig });
+    writeFileSync(path.join(roZone, "seed.txt"), "seed-ro");
+    const factory = createSrtSandboxBackendFactory({
+      pluginConfig: resolveSrtPluginConfig(undefined),
+    });
     const handle = await factory(
       makeParams({ workspaceDir: rwZone, agentWorkspaceDir: agentDir, workspaceAccess: "rw" }),
     );
-    const spec = await handle.buildExecSpec({
-      command: "true",
-      env: { PATH: process.env.PATH ?? "" },
-      usePty: false,
-    });
-    // Normal exec is launched through backend-owned custody. The encoded inner
-    // argv remains the Seatbelt sandbox wrapper.
-    expect(spec.argv.slice(0, 2)).toEqual([process.execPath, "-e"]);
-    const encoded = spec.env.SRT_CUSTODY_ARGV;
-    expect(encoded).toBeTruthy();
-    expect(Buffer.from(encoded!, "base64").toString("utf8")).toContain("sandbox-exec");
-    expect(spec.stdinMode).toBe("pipe-open");
-    expect(spec.cwd).toBe(rwZone);
+
+    const allowed = await launchExecSpec(handle, `printf allowed > '${rwZone}/w.txt'`);
+    expect(allowed.code).toBe(0);
+    expect(readFileSync(path.join(rwZone, "w.txt"), "utf8")).toBe("allowed");
+
+    const overwrite = await launchExecSpec(handle, `printf denied > '${roZone}/seed.txt'`);
+    expect(overwrite.code).not.toBe(0);
+    expect(readFileSync(path.join(roZone, "seed.txt"), "utf8")).toBe("seed-ro");
+
+    const create = await launchExecSpec(handle, `printf denied > '${roZone}/created.txt'`);
+    expect(create.code).not.toBe(0);
+    expect(existsSync(path.join(roZone, "created.txt"))).toBe(false);
   });
 });
