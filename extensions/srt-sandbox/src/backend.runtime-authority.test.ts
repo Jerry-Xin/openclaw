@@ -28,6 +28,7 @@ import {
 } from "./backend.js";
 import { resolveSrtPluginConfig } from "./config.js";
 import { isSrtSandboxAvailable } from "./sandbox-availability.test-helpers.js";
+import { SessionBroker } from "./session-broker.js";
 
 const isLive =
   (process.platform === "darwin" || process.platform === "linux") &&
@@ -298,6 +299,35 @@ describe.skipIf(!isLive)("srt sandbox backend — live runtime authority", () =>
       await expect(
         handle.buildExecSpec({ command: `touch '${marker}'`, env: {}, usePty: false }),
       ).rejects.toBe(authority.revoked);
+      expect(existsSync(marker)).toBe(false);
+    },
+    LIVE_TIMEOUT,
+  );
+
+  it(
+    "releases the custody lease it opened when buildExecSpec fails after opening it",
+    async () => {
+      const { ws, authority, handle } = await setup({ perSessionNetwork: true });
+      const marker = path.join(ws, "ran");
+      // Observe the lease that buildExecSpec opens for a caller without its own
+      // custody env, then revoke before the spec can be wrapped and returned.
+      const lease: { socket?: string; existed?: boolean } = {};
+      const prepareCommand = SessionBroker.prototype.prepareCommand;
+      vi.spyOn(SessionBroker.prototype, "prepareCommand").mockImplementationOnce(function (
+        this: SessionBroker,
+        ...args: Parameters<SessionBroker["prepareCommand"]>
+      ) {
+        lease.socket = args[1].SRT_CUSTODY_SOCKET;
+        lease.existed = lease.socket !== undefined && existsSync(lease.socket);
+        const prepared = prepareCommand.apply(this, args);
+        authority.current = false;
+        return prepared;
+      });
+      await expect(
+        handle.buildExecSpec({ command: `touch '${marker}'`, env: {}, usePty: false }),
+      ).rejects.toBe(authority.revoked);
+      expect(lease.existed).toBe(true);
+      expect(existsSync(path.dirname(lease.socket!))).toBe(false);
       expect(existsSync(marker)).toBe(false);
     },
     LIVE_TIMEOUT,
