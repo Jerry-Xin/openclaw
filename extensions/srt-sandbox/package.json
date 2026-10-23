@@ -9,7 +9,7 @@
   "type": "module",
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.76",
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@openclaw/plugin-sdk": "workspace:*",
