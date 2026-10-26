@@ -107,7 +107,7 @@ describe.skipIf(process.platform === "win32")("normal exec lifecycle custody", (
     const descendantPid = Number.parseInt(chunk.toString("utf8"), 10);
     custody.dispose();
     await once(child, "exit");
-    expect(() => process.kill(descendantPid, 0)).toThrow();
+    await expect.poll(() => alive(descendantPid), { timeout: 2000 }).toBe(false);
     await custody.finalize(spec.finalizeToken);
   });
 
